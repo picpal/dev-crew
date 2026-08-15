@@ -2,8 +2,9 @@
 
 > Status: Source of Truth  
 > Project: dev-crew  
-> Version: 0.4.1  
-> Updated: 2026-08-14  
+> Version: 0.5.0  
+> Updated: 2026-08-15  
+> Decisions: [Wayfinder Map #1](https://github.com/picpal/dev-crew/issues/1) — 결정의 정본은 각 티켓의 resolution 코멘트, 이 문서는 결과만 반영  
 > Scope: Slack 기반 사용자 요청을 Claude Code 및 Codex Agent로 분해·실행·검증하고, 실행 결과를 GitHub와 외부 HTML Report로 제공하는 로컬 우선 Engineering Harness
 
 ## 1. 문서 목적
@@ -120,6 +121,13 @@ Role: DEVELOPER
 | Security | filesystem read, security analysis/tools | 승인 없는 source write |
 | Reviewer | filesystem read, diff, review, verification | feature implementation |
 | QA | build, test, runtime verification | 기능 설계 변경 |
+
+강제 메커니즘은 harness가 소유한 선언적 role policy를 Adapter가 spawn 시점에 provider 네이티브 수단으로 변환한다([#13](https://github.com/picpal/dev-crew/issues/13)).
+
+- Claude Code 계열 role: `allowed_tools`/`disallowed_tools` allowlist + harness 소유 `can_use_tool` 콜백(allowlist 밖 호출 거부 및 trace 기록) + `cwd`·경로 스코프 permission rule로 worktree 격리
+- Codex Reviewer: OS 수준 `Sandbox.read_only` + `cwd`=검토 대상 worktree
+- Orchestrator: repo tool을 일절 부여하지 않고 harness의 orchestration MCP tool만 노출
+- 감사는 hook이 아니라 SDK 메시지 스트림의 tool_use 블록을 ToolCallEvent로 수집 — 경계(콜백)와 관측(스트림)을 분리
 
 ### 3.5 정적 템플릿으로 시작하고 동적 그래프로 확장한다
 
@@ -258,8 +266,8 @@ AgentInstance:
   provider: CLAUDE_CODE | CODEX
   adapter: string
   model: string
-  effortLevel: LOW | MEDIUM | HIGH | MAX
-  reasoningLevel: LOW | MEDIUM | HIGH | MAX
+  effortLevel: LOW | MEDIUM | HIGH | XHIGH | MAX
+  reasoningLevel: LOW | MEDIUM | HIGH | XHIGH | MAX
   routingPolicyVersion: string
   routingReason: string
 
@@ -284,7 +292,7 @@ AgentInstance:
   completedAt: timestamp | null
 ```
 
-`effortLevel`은 provider 공통 정책 표현이다. Adapter는 이를 provider가 지원하는 실제 reasoning/effort 옵션으로 변환한다. `reasoningLevel`은 실제 요청에 적용된 정규화 값으로 기록해 provider 간 비교에 사용한다. 지원하지 않는 조합은 Adapter가 조용히 변경하지 않고 routing validation error로 반환해야 한다.
+`effortLevel`은 provider 공통 정책 표현이다. 5단계는 양 provider의 실제 옵션에 1:1 대응한다([#12](https://github.com/picpal/dev-crew/issues/12) — 조사 결과 양쪽 모두 5단계이며 4단계 정규화는 정보 손실). Adapter는 이를 provider가 지원하는 실제 reasoning/effort 옵션으로 변환한다. `reasoningLevel`은 실제 요청에 적용된 정규화 값으로 기록해 provider 간 비교에 사용한다. 지원하지 않는 조합은 Adapter가 조용히 변경하지 않고 routing validation error로 반환해야 한다 — 단 Claude Code는 미지원 effort를 조용히 하향하는 것이 기본 동작이므로, Adapter가 소유한 정적 지원 매트릭스(model × effort)로 **호출 전에** 자체 검증해야 한다. `ultracode`(Claude Code)와 `ultra`(Codex)는 model effort가 아니라 provider 오케스트레이션 모드이므로 `effortLevel`에 넣지 않으며, harness가 오케스트레이션을 담당하는 MVP에서는 두 모드 모두 사용하지 않는다.
 
 ### 6.2 Adapter 계약
 
@@ -299,11 +307,19 @@ getUsage(sessionId) -> token/latency/provider metadata
 
 Claude Code와 Codex의 실제 session/thread semantics는 다를 수 있다. Harness는 공통 lifecycle을 제공하되 provider 고유 ID와 raw usage metadata를 보존한다.
 
+구동 표면은 양 provider 모두 공식 Python SDK다([#11](https://github.com/picpal/dev-crew/issues/11), 조사: [session-surfaces](./docs/research/session-surfaces.md)).
+
+- Claude Code Adapter: `claude-agent-sdk`의 `ClaudeSDKClient`(streaming 모드 — `interrupt()`가 이 경로에서만 지원되어 cancel을 위해 강제됨). `archive`는 네이티브 부재로 합성 구현: harness 상태(`ARCHIVED`) + `tag_session()` + transcript 파일 보관. transcript는 내부 포맷이므로 이동·보관만 하고 파싱 금지.
+- Codex Adapter: `openai-codex`의 `AsyncCodex` — 6개 연산 전부 네이티브. harness당 인스턴스 1개를 모든 Reviewer instance가 공유하며 `thread_id`가 `sessionId`가 된다. app-server 직접 호출은 비권장(불안정 표면).
+- CLI(`claude -p`, `codex exec`)는 디버깅·재현용 폴백으로만 유지한다. Codex의 `steer()`는 계약에 추가하지 않는다(Phase 2+ 후보).
+- 토큰 회계는 `usage`가 아니라 `model_usage` 기준(subagent 포함 범위가 필드별로 다름). `total_cost_usd`는 client-side 추정치로 청구 근거 사용 금지. usage 스키마는 양 provider 합집합 + raw payload 보존.
+
 ### 6.3 Session 복구
 
-- Harness 재시작 후 Session Registry에서 active instance를 복구한다.
-- provider session을 resume할 수 있으면 기존 instance를 재개한다.
-- resume이 불가능하면 기존 instance를 `FAILED_RECOVERY`로 종료하고, 요약 artifact를 전달한 새 instance를 생성한다.
+- Harness 재시작 후 Session Registry에서 active instance를 복구한다. Registry는 `harness.db`의 활성-only 테이블이다([#15](https://github.com/picpal/dev-crew/issues/15)): 살아있는 행(CREATED/RUNNING/WAITING/BLOCKED)만 보관하고 종결 시 제거하며, 전체 이력은 trace의 projection이 담당한다. Orchestrator 자신의 세션도 같은 registry의 한 행이다.
+- 복구는 **lazy verify**다: 재시작 시 행마다 전제조건만 검증(Claude: transcript 파일 존재, Codex: `thread_list` 조회)하고 RESUMABLE로 표시한다. 실제 resume은 다음 dispatch 때 수행한다. 재시작 시 LLM 호출은 0회다.
+- 검증 실패 또는 dispatch 시 resume 실패면 기존 instance를 `FAILED_RECOVERY`로 종료하고, 요약 artifact를 전달한 새 instance를 생성한다. transcript가 기본 30일 보존·로컬 한정이므로 이 경로는 예외가 아니라 **필수 경로**다.
+- 인계 artifact는 7.6절 escalation 인계 스키마를 재사용한다(reason=`FAILED_RECOVERY`). 이를 위해 매 turn 완료 시 Orchestrator가 resultSummary와 artifact 포인터를 registry 행에 갱신하는 **turn 체크포인트**를 규칙화한다. worktree는 16.3절대로 보존되어 새 instance가 인수한다.
 - recovery 때문에 model 또는 provider가 변경되면 별도 event와 reason을 기록한다.
 
 ## 7. Model Routing Policy
@@ -366,7 +382,8 @@ Spawn Decision
 | QA, 단순 로그·테스트 확인 | CHEAP | LOW~MEDIUM | 자동 결과 요약 중심 |
 | QA, 복합 failure 분석 | DEFAULT 또는 HIGH_CAPABILITY | HIGH | 재현과 원인 분리 |
 | Reviewer, Local Review | CODEX_DEFAULT | MEDIUM | Codex provider 고정 |
-| Reviewer, Integration/high-risk Review | CODEX_HIGH_REASONING | HIGH | 독립 새 review instance 권장 |
+| Reviewer, Integration Review (low/medium risk) | CODEX_DEFAULT | MEDIUM | 항상 독립 새 instance ([#4](https://github.com/picpal/dev-crew/issues/4)) |
+| Reviewer, Integration Review (high risk) | CODEX_HIGH_REASONING | HIGH | 항상 독립 새 instance, `xhigh` 승격 가능 |
 
 동일 complexity에서도 risk가 높으면 최소 한 단계 상향한다. Role의 성격상 판단 부담이 크면 complexity가 낮아도 effort를 높일 수 있다. 모든 선택은 `routingPolicyVersion`과 `routingReason`으로 재현 가능해야 한다.
 
@@ -535,7 +552,13 @@ Integration Review는 다음을 확인한다.
 - merge 후 전체 acceptance criteria
 - 개별 테스트는 통과하지만 조합에서 실패하는 문제
 
-Dependency와 shared contract가 없는 완전 독립 변경은 정책에 따라 Integration Review를 생략할 수 있다. 고위험 변경은 별도의 `REV-INTEGRATION-*` instance와 높은 reasoning 설정을 사용한다.
+Dependency와 shared contract가 없는 완전 독립 변경은 정책에 따라 Integration Review를 생략할 수 있다.
+
+Integration Review의 실행 규칙은 다음과 같다([#4](https://github.com/picpal/dev-crew/issues/4)).
+
+- **risk와 무관하게 항상 새 `REV-INTEGRATION-*` instance로 분리한다.** Local Review를 수행한 session은 자신이 승인한 branch에 정박하므로 이어받지 않는다. 분리는 항상, tier는 risk가 결정한다(low/medium은 CODEX_DEFAULT·MEDIUM, high는 CODEX_HIGH_REASONING·HIGH).
+- 입력은 구조 artifact만 준다: join된 diff, task scope·acceptance criteria, shared contract, changed-files 맵. Local Review의 verdict·finding은 주지 않는다(anchoring 방지). 중복 지적은 독립 검증이 작동한다는 신호로 본다.
+- NOT_PASS → 재작업 → 재검토 루프는 같은 instance를 resume한다. 같은 finding이 3회 반복되면 loop guard(10.3절)가 독립 Integration Reviewer escalation으로 새 instance를 spawn한다.
 
 Integration Review 실패 시 모든 Developer를 재실행하지 않는다. Orchestrator는 영향받은 node만 invalidate하고 다시 Local Review와 Integration Review를 수행한다.
 
@@ -674,12 +697,15 @@ AgentMessage:
 
 Slack event는 provider event ID와 team/channel/thread ID를 이용해 중복 처리를 방지한다.
 
+Slack 연결은 **Socket Mode**다([#8](https://github.com/picpal/dev-crew/issues/8)) — 로컬 우선 Harness에 공개 endpoint를 요구하지 않고 outbound WebSocket만 사용한다. 구현은 `slack-bolt` Python의 AsyncApp + AsyncSocketModeHandler. 토큰은 bot token(xoxb)과 app-level token(xapp, `connections:write`)을 환경 주입한다. Socket Mode는 ack 실패 시 재전송하므로 envelope의 event_id가 idempotency 키다. Events API 전환은 조직 배포 시의 Phase 3 재결정 사항이다.
+
 ## 13. Observability와 Evaluation Architecture
 
 ### 13.1 원칙
 
 - 모든 기록은 최종적으로 `taskId`와 `executionId`로 연결한다.
 - Raw event는 append-only로 보존하고 aggregate는 재계산 가능하게 한다.
+- 저장 기술은 SQLite(WAL)다([#7](https://github.com/picpal/dev-crew/issues/7)). append-only `events` 테이블(event_type, ids, ts, raw payload JSON)이 유일한 진실이고, entity 테이블(13.3절 레코드)은 in-place 갱신되는 projection으로 events에서 재구축 가능해야 한다. 파일은 수명 주기로 분리한다: `trace.db`(events + projections, 성장·아카이브 대상) / `harness.db`(Session Registry 등 운영 상태).
 - GitHub Issue와 HTML Report에는 사람이 볼 요약을 제공하고 raw trace는 Store에 둔다.
 - AS-IS와 TO-BE에서 공통 관찰 단위를 동일하게 유지한다.
 - Agent Role뿐 아니라 provider, model, effort/reasoning별 비용, 속도, 품질을 비교한다.
@@ -978,8 +1004,9 @@ Slack URL
 
 - view model을 독립된 정적 HTML로 렌더링한다.
 - template version과 renderer version을 기록한다.
-- 외부 asset 의존성을 최소화하거나 version-pinned asset을 사용한다.
-- 사용자 입력과 Agent 출력은 escape/sanitize하여 script injection을 방지한다.
+- Report는 **완전 자기완결 single-file HTML**이다([#6](https://github.com/picpal/dev-crew/issues/6)): CSS/JS 전부 인라인, 이미지는 data URI 또는 인라인 SVG, 외부 요청 0(CDN·외부 폰트·외부 스크립트 금지).
+- 사용자 입력과 Agent 출력은 전부 HTML escape 후 삽입하고, raw HTML 삽입 경로를 템플릿에서 구조적으로 제거한다(텍스트 슬롯만 제공).
+- Worker가 응답에 CSP 헤더를 부착한다: `default-src 'none'; style-src 'unsafe-inline'; img-src data:;` 기본, JS가 필요한 템플릿 버전만 `script-src 'unsafe-inline'` 추가. 외부 fetch/XHR은 어떤 버전에서도 불허. CSP 변경은 templateVersion bump로 추적한다.
 
 #### Cloudflare R2 Publisher / Hosting Adapter
 
@@ -993,7 +1020,7 @@ Slack URL
 - `GET /tasks/{taskId}`를 R2 object에 매핑한다.
 - 존재하지 않는 Task는 명확한 404를 반환한다.
 - HTML에 적절한 content type과 cache policy를 적용한다.
-- 접근 정책이 private이면 identity/auth layer를 적용하고, public이면 민감 정보 비노출을 전제로 한다.
+- 접근 정책은 **identity-aware**다([#5](https://github.com/picpal/dev-crew/issues/5)): Cloudflare Access(Zero Trust)를 Worker 앞단에 두고 IdP는 GitHub SSO 또는 email OTP, 정책은 운영자 계정 화이트리스트. Report에 security finding 등 repo 공개 범위를 넘는 내용이 담기므로 public은 성립하지 않고, Slack 링크를 임의 네트워크에서 여는 패턴 때문에 network-restricted도 배제한다. Access 인증과 무관하게 redaction 규칙(16.4절)은 유지한다.
 
 ### 15.5 Object와 URL 규칙
 
@@ -1071,16 +1098,16 @@ Raw prompt, secret, credential, 민감한 source excerpt는 Report에 포함하�
 providers:
   claudeCode:
     adapter: claude-code-adapter
-    modelTiers:
-      CHEAP: ${CLAUDE_CHEAP_MODEL}
-      DEFAULT: ${CLAUDE_DEFAULT_MODEL}
-      HIGH_CAPABILITY: ${CLAUDE_HIGH_MODEL}
+    modelTiers:            # tier = (full model ID, 기본 effort) 쌍. alias 금지 (#12)
+      CHEAP:            { model: claude-sonnet-5, effort: LOW }
+      DEFAULT:          { model: claude-sonnet-5, effort: HIGH }
+      HIGH_CAPABILITY:  { model: claude-opus-5,   effort: HIGH }   # routing이 XHIGH 승격 가능
 
   codex:
     adapter: codex-adapter
     modelTiers:
-      CODEX_DEFAULT: ${CODEX_DEFAULT_MODEL}
-      CODEX_HIGH_REASONING: ${CODEX_HIGH_MODEL}
+      CODEX_DEFAULT:        { model: gpt-5.6-terra, effort: MEDIUM }
+      CODEX_HIGH_REASONING: { model: gpt-5.6-sol,   effort: HIGH } # routing이 XHIGH 승격 가능
 
 roleDefaults:
   orchestrator: { provider: CLAUDE_CODE, tier: DEFAULT, effort: MEDIUM }
@@ -1100,9 +1127,18 @@ hosting:
   adapter: cloudflare-r2
   objectKeyPattern: reports/{taskId}/index.html
   publicUrlPattern: https://report.example.com/tasks/{taskId}
+  access: cloudflare-access        # identity-aware (#5)
+
+slack:
+  mode: socket                     # Socket Mode (#8)
+  tokens: [SLACK_BOT_TOKEN, SLACK_APP_TOKEN]   # 환경 주입
+
+store:
+  trace: trace.db                  # append-only events + projections (#7)
+  registry: harness.db             # 활성-only Session Registry (#15)
 ```
 
-실제 model ID는 환경 설정에서 관리한다. 문서나 Role prompt에 특정 시점의 제품 model 이름을 하드코딩하지 않는다.
+model tier 매핑은 설정이 소유하되 full model ID를 pin한다 — alias는 provider·시점에 따라 해석이 달라져 ModelRoutingEvent 재현성을 훼손한다. Role prompt에는 model 이름을 하드코딩하지 않는다. 미채택 기록: Haiku 4.5(effort 미지원), Fable 5(2배 비용·ZDR 불가·비대화형 무동의 과금 — Phase 2 escalation 최상단 후보), gpt-5.6-luna(미할당), gpt-5.4 계열(2026-08-31 은퇴).
 
 ## 18. MVP와 향후 단계
 
@@ -1190,6 +1226,16 @@ MVP에서 GitHub Pages, Cloudflare Pages build, localhost-only Report Server는 
 | 상세 Report | 외부 HTML URL | Slack 가독성과 drill-down |
 | Hosting | Cloudflare R2 + Worker | full-site rebuild 없이 즉시 publish |
 | GitHub Pages | 사용하지 않음 | 배포 지연이 요구와 불일치 |
+| Adapter 표면 | 양 provider 공식 Python SDK | 6.2절 연산의 네이티브 커버리지, CLI는 폴백 (#11) |
+| effortLevel | 5단계 (XHIGH 추가) | 양 provider 실제 옵션과 1:1, 4단계는 정보 손실 (#12) |
+| model tier | full model ID pin | alias는 재현성 훼손; 매핑은 17절 (#12) |
+| Integration Review | 항상 새 instance | anchoring 제거, tier는 risk가 결정 (#4) |
+| capability 강제 | 선언적 policy → provider 네이티브 변환 | 콜백 거부 + read_only sandbox + MCP 한정 (#13) |
+| Trace Store | SQLite(WAL), events+projection | trace.db/harness.db 수명 주기 분리 (#7) |
+| Session Registry | 활성-only + lazy verify | 재시작 시 LLM 호출 0회, 인계는 7.6절 스키마 재사용 (#15) |
+| Slack 연결 | Socket Mode | 로컬 우선, 공개 endpoint 불요 (#8) |
+| Report 접근 | Cloudflare Access (identity-aware) | security finding 포함으로 public 불성립 (#5) |
+| Report HTML | single-file + 엄격 CSP | 외부 요청 0, R2 단일 object와 정합 (#6) |
 
 ### 19.2 주요 위험과 완화
 
@@ -1209,12 +1255,12 @@ MVP에서 GitHub Pages, Cloudflare Pages build, localhost-only Report Server는 
 
 ### 19.3 남은 Architecture 결정
 
-- Worker URL을 public, identity-aware, network-restricted 중 어떤 정책으로 제공할지
+Phase 0 착수를 막던 결정은 [Wayfinder Map #1](https://github.com/picpal/dev-crew/issues/1)에서 전부 닫혔다(19.1절에 반영). 남은 항목은 Phase 2 운영 정책이다.
+
 - R2 report retention과 삭제 정책
 - MVP에서 Task latest overwrite를 허용하는 기간과 versioned object 전환 시점
-- provider별 실제 model tier 매핑과 effort 호환성
-- Reviewer Integration session을 항상 분리할지, high-risk에서만 분리할지
-- HTML template의 asset bundling과 CSP 정책
+
+POC 실측으로 확인할 항목: 실제 적용 effort의 관측 경로(org effort limit clamp 무보고 문제), Reviewer Queue scale signal 임계값, loopPolicy 토큰 budget(300k)의 타당성.
 
 ## 20. POC 검증 항목과 성공 기준
 
