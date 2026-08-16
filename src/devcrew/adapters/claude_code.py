@@ -42,7 +42,8 @@ class ClaudeCodeAdapter:
         options = ClaudeAgentOptions(
             model=inst.model,
             effort=inst.effort_level.value.lower(),
-            can_use_tool=make_can_use_tool(inst.role, self.trace, task_id=inst.execution_id),
+            can_use_tool=make_can_use_tool(inst.role, self.trace, task_id=inst.execution_id,
+                                           workspace_root=inst.worktree),
             **kw,
         )
         client = ClaudeSDKClient(options)

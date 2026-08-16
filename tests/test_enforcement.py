@@ -8,7 +8,9 @@ from devcrew.store.trace import TraceStore
 def test_role_policy_matches_design_3_4():
     assert "Write" not in ROLE_POLICY[Role.EXPLORER].allowed_tools
     assert "Read" in ROLE_POLICY[Role.EXPLORER].allowed_tools
-    assert "Write" in ROLE_POLICY[Role.DEVELOPER].allowed_tools
+    # Developer는 Write를 scoped_write_tools로 관리 (경로 제한)
+    assert "Write" not in ROLE_POLICY[Role.DEVELOPER].allowed_tools
+    assert "Write" in ROLE_POLICY[Role.DEVELOPER].scoped_write_tools
     # Orchestrator는 repo tool 전무 (#13, 불변 조건 2)
     assert ROLE_POLICY[Role.ORCHESTRATOR].allowed_tools == []
     assert ROLE_POLICY[Role.REVIEWER].sandbox == "read-only"
@@ -42,3 +44,26 @@ async def test_can_use_tool_denies_and_logs(tmp_path):
     assert len(evs) == 2
     assert evs[0]["payload"]["tool"] == "Write"
     assert evs[1]["payload"]["tool"] == "Bash"
+
+
+async def test_scoped_write_confinement(tmp_path):
+    """Developer Write/Edit는 workspace_root 내에서만 허용 (#13 결정)."""
+    trace = TraceStore(tmp_path / "trace.db")
+    workspace = str(tmp_path / "workspace")
+
+    # workspace_root이 설정된 경우
+    cb = make_can_use_tool(Role.DEVELOPER, trace, task_id="T-1", workspace_root=workspace)
+
+    # workspace 내의 파일 쓰기는 허용
+    allow_inside = await cb("Write", {"file_path": f"{workspace}/x.txt"}, None)
+    assert allow_inside.behavior == "allow"
+
+    # workspace 밖의 파일 쓰기는 거부
+    deny_outside = await cb("Write", {"file_path": "/etc/passwd"}, None)
+    assert deny_outside.behavior == "deny"
+
+    # 거부 이벤트 확인
+    evs = trace.events(event_type="PermissionDeniedEvent")
+    assert len(evs) == 1
+    assert evs[0]["payload"]["tool"] == "Write"
+    assert evs[0]["payload"]["reason"] == "path_outside_workspace"

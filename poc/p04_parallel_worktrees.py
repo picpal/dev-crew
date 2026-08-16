@@ -37,7 +37,7 @@ async def main():
             task_scope=filename, worktree=str(wt),
         )
         sid = await adapter.start_session(
-            inst, f"{filename} 파일을 만들고 내용은 '{name}' 한 줄만 넣어. 끝나면 'OK'라고 답해.")
+            inst, f"너의 작업 디렉터리는 {wt}다. {wt}/{filename} 파일을 만들고 내용은 '{name}' 한 줄만 넣어. 끝나면 'OK'라고 답해.")
         await adapter.archive(sid)
         return wt
 

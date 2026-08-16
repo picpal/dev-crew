@@ -18,6 +18,7 @@ _WRITE_TOOLS = ["Write", "Edit"]
 @dataclass(frozen=True)
 class RolePolicy:
     allowed_tools: list[str] = field(default_factory=list)
+    scoped_write_tools: list[str] = field(default_factory=list)  # 경로 제한이 필요한 쓰기 도구
     permission_mode: str = "default"
     sandbox: str | None = None          # Codex 전용: "read-only" 등
 
@@ -27,7 +28,8 @@ ROLE_POLICY: dict[Role, RolePolicy] = {
     Role.ORCHESTRATOR: RolePolicy(allowed_tools=[]),   # repo tool 전무
     Role.EXPLORER: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash(git log:*)", "Bash(git diff:*)"]),
     Role.ARCHITECT: RolePolicy(allowed_tools=list(_READ_TOOLS)),
-    Role.DEVELOPER: RolePolicy(allowed_tools=[*_READ_TOOLS, *_WRITE_TOOLS, "Bash"],
+    Role.DEVELOPER: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash"],
+                               scoped_write_tools=list(_WRITE_TOOLS),
                                permission_mode="acceptEdits"),
     Role.SECURITY: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash(git log:*)"]),
     Role.REVIEWER: RolePolicy(allowed_tools=list(_READ_TOOLS), sandbox="read-only"),
@@ -52,15 +54,23 @@ def codex_session_kwargs(role: Role, *, cwd: str | None) -> dict:
             "approval_mode_name": "deny_all", "cwd": cwd}
 
 
-def make_can_use_tool(role: Role, trace: TraceStore, *, task_id: str):
+def make_can_use_tool(role: Role, trace: TraceStore, *, task_id: str, workspace_root: str | None = None):
     """Claude SDK can_use_tool 콜백 — allowlist 밖 호출 거부 + 이벤트 적재.
 
     SDK 런타임(claude-agent-sdk==0.2.139)은 {"behavior": ...} dict가 아니라
     PermissionResultAllow/PermissionResultDeny 인스턴스를 요구한다 — dict를
     돌려주면 _internal/query.py의 isinstance 분기에서 TypeError가 난다
     (Task 7 조사, task-7-report.md 참조).
+
+    workspace_root이 설정된 경우 scoped_write_tools는 해당 경로로 제한된다.
+    Path confinement는 write callback으로만 구현 가능 (Bash는 PreToolUse hook 필요).
     """
-    allowed = ROLE_POLICY[role].allowed_tools
+    from pathlib import Path
+
+    policy = ROLE_POLICY[role]
+    allowed = policy.allowed_tools
+    scoped_tools = policy.scoped_write_tools
+    workspace_resolved = Path(workspace_root).resolve() if workspace_root else None
 
     def _match(tool_name: str) -> bool:
         for pat in allowed:
@@ -70,9 +80,36 @@ def make_can_use_tool(role: Role, trace: TraceStore, *, task_id: str):
                 return True
         return False
 
+    def _is_scoped_tool(tool_name: str) -> bool:
+        return tool_name in scoped_tools
+
     async def can_use_tool(tool_name: str, tool_input: dict, context) -> PermissionResultAllow | PermissionResultDeny:
+        # Check allowlisted tools
         if _match(tool_name):
             return PermissionResultAllow(updated_input=tool_input)
+
+        # Check scoped write tools (Write, Edit) with path confinement
+        if _is_scoped_tool(tool_name):
+            if workspace_resolved is not None:
+                file_path = tool_input.get("file_path", "")
+                if file_path:
+                    try:
+                        target = Path(file_path).resolve()
+                        # Check if target is within workspace
+                        if target.is_relative_to(workspace_resolved):
+                            return PermissionResultAllow(updated_input=tool_input)
+                    except (ValueError, OSError):
+                        # is_relative_to or resolve failed
+                        pass
+                trace.append("PermissionDeniedEvent", task_id=task_id,
+                             payload={"role": role.value, "tool": tool_name,
+                                     "file_path": file_path, "reason": "path_outside_workspace"})
+                return PermissionResultDeny(message=f"role {role.value} may not write outside workspace {workspace_resolved}")
+            else:
+                # No workspace_root set - allow scoped tools (for non-scoped roles or backward compat)
+                return PermissionResultAllow(updated_input=tool_input)
+
+        # Not in any allowlist
         trace.append("PermissionDeniedEvent", task_id=task_id,
                      payload={"role": role.value, "tool": tool_name})
         return PermissionResultDeny(message=f"role {role.value} may not use {tool_name}")
