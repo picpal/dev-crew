@@ -11,6 +11,11 @@ async def main():
     from devcrew.schema import Provider, Role
 
     trace, registry = stores()
+    # Idempotent cleanup: purge prior POC-5 rows from previous runs
+    for r in registry.active():
+        if r["body"]["execution_id"] == "POC-5":
+            registry.finish(r["instance_id"])
+
     claude = ClaudeCodeAdapter(trace, registry)
     orch = Orchestrator(trace, registry, {Provider.CLAUDE_CODE: claude})
 
@@ -24,11 +29,12 @@ async def main():
     dev2 = await orch.spawn(Role.DEVELOPER, "HIGH_CAPABILITY", execution_id="POC-5",
                             node_id="n1", task_scope="정렬 함수",
                             replaced=dev1, escalation_reason="NEED_REPLAN")
-    esc = trace.events(event_type="ModelEscalationEvent")[0]["payload"]
+    esc = trace.events(event_type="ModelEscalationEvent", execution_id="POC-5")[-1]["payload"]
     sid2 = await claude.start_session(
         dev2, f"이전 시도 요약: {esc['handoff']['last_summary']}. 이어서 한 줄로 답해: "
               "안정 정렬 보장 여부는?")
     await claude.archive(sid2)
+    registry.finish(dev2.instance_id)      # POC 종료 — active row를 남기지 않는다
 
     record("p05", {
         "escalation_event_recorded": esc["reason"] == "NEED_REPLAN",

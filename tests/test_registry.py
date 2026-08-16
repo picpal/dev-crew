@@ -1,3 +1,5 @@
+import pytest
+
 from devcrew.schema import InstanceStatus
 from devcrew.store.registry import SessionRegistry
 from tests.test_trace import make_inst
@@ -29,3 +31,10 @@ def test_lazy_verify_marks_resumable_or_failed(tmp_path):
     reg.upsert(make_inst("B", InstanceStatus.RUNNING), provider_ref="missing")
     result = reg.lazy_verify({"CLAUDE_CODE": lambda row: row["provider_ref"] == "exists"})
     assert result == {"A": "RESUMABLE", "B": "FAILED_RECOVERY"}
+
+
+def test_handoff_missing_instance_raises_keyerror(tmp_path):
+    """Regression: 미등록 instance_id는 StopIteration이 아니라 명시적 KeyError로 (#9)."""
+    reg = SessionRegistry(tmp_path / "harness.db")
+    with pytest.raises(KeyError, match="NOPE"):
+        reg.handoff("NOPE")

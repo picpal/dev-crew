@@ -72,7 +72,10 @@ class SessionRegistry:
 
     def handoff(self, instance_id: str) -> dict:
         """7.6절 escalation 인계 스키마 — recovery와 공용 (#15). reason은 호출자가 채운다."""
-        row = next(r for r in self.active() if r["instance_id"] == instance_id)
+        try:
+            row = next(r for r in self.active() if r["instance_id"] == instance_id)
+        except StopIteration:
+            raise KeyError(f"instance {instance_id} not in registry") from None
         body = row["body"]
         return {
             "task_scope": body["task_scope"],

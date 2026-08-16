@@ -42,8 +42,10 @@ async def main():
     if tok := os.environ.get("CF_ACCESS_TOKEN"):    # Access service token (선택)
         req.add_header("CF-Access-Client-Id", os.environ["CF_ACCESS_CLIENT_ID"])
         req.add_header("CF-Access-Client-Secret", tok)
-    body = urllib.request.urlopen(req).read().decode()
+    resp = urllib.request.urlopen(req)
+    body = resp.read().decode()
     fetch_s = time.monotonic() - t1
+    csp = resp.headers.get("content-security-policy") or ""
 
     # 3) GitHub Issue 생성·최종 갱신
     issue_no = create_task_issue(task_id, "POC e2e delivery")
@@ -59,7 +61,7 @@ async def main():
     record("p07", {
         "report_served_after_upload": task_id in body,
         "upload_plus_fetch_under_10s": (upload_s + fetch_s) < 10,
-        "csp_headers_would_apply": True,     # Worker 코드 검사로 확인
+        "csp_headers_would_apply": csp.startswith("default-src 'none'"),
         "issue_created_and_finalized": issue_no > 0,
         "slack_message_sent": bool(ts),
     }, extra={"upload_s": round(upload_s, 2), "fetch_s": round(fetch_s, 2),

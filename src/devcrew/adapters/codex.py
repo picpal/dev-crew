@@ -30,6 +30,10 @@ class CodexAdapter:
         self._codex: AsyncCodex | None = None
         self._threads: dict[str, object] = {}      # thread_id -> AsyncThread
         self._efforts: dict[str, str] = {}
+        # thread_id -> {sandbox_name, cwd, approval_mode_name, effort}: cached at
+        # start_session so resume() can re-pass the role's enforcement pin instead
+        # of falling back to thread_resume()'s own defaults (finding #2).
+        self._session_config: dict[str, dict] = {}
 
     async def _client(self) -> AsyncCodex:
         if self._codex is None:
@@ -47,7 +51,14 @@ class CodexAdapter:
             approval_mode=ApprovalMode[kw["approval_mode_name"]],
         )
         self._threads[thread.id] = thread
-        self._efforts[thread.id] = inst.effort_level.value.lower()
+        effort = inst.effort_level.value.lower()
+        self._efforts[thread.id] = effort
+        self._session_config[thread.id] = {
+            "sandbox_name": kw["sandbox_name"],
+            "cwd": kw["cwd"],
+            "approval_mode_name": kw["approval_mode_name"],
+            "effort": effort,
+        }
         await self.send(thread.id, initial_message)
         return thread.id
 
@@ -59,8 +70,37 @@ class CodexAdapter:
                            raw={"turn_id": result.id})
 
     async def resume(self, session_id: str, message: str) -> TurnOutcome:
+        """archive/disconnect 이후 thread를 재개한다 (#11).
+
+        thread_resume()에 sandbox/cwd/approval_mode를 다시 넘기지 않으면 원 thread의
+        enforcement 핀(예: REVIEWER의 read_only sandbox, deny_all approval)이 조용히
+        thread_resume() 자체 기본값으로 완화될 수 있다 — 여기서는 start_session이
+        캐시해 둔 설정을 재전달해 그 핀을 유지한다.
+
+        effort는 thread_resume() 파라미터가 아니다 (installed openai_codex==0.144.4
+        AsyncCodex.thread_resume은 approval_mode/base_instructions/config/cwd/
+        developer_instructions/model/model_provider/personality/sandbox/service_tier만
+        받는다 — api.py:443-453). effort는 turn 단위 인자(thread.run(effort=...))이므로
+        여기서는 self._efforts를 복원해 이어지는 send()가 None을 넘기지 않게 한다.
+
+        한계: 캐시는 이 adapter 인스턴스의 메모리에만 있다. start_session을 거치지
+        않은 session_id로 resume()이 불리면(예: 프로세스 재시작 후 recovery — Claude
+        adapter의 동일 갭이 deferred B1로 등재돼 있다) 캐시가 비어 있어 thread_resume()
+        기본값을 그대로 쓰게 된다. Cross-process 복구는 registry에 provider_ref로
+        thread_id를 색인하는 후속 작업이 필요하며 이번 fix wave 범위 밖이다.
+        """
         codex = await self._client()
-        resumed = await codex.thread_resume(session_id)
+        config = self._session_config.get(session_id)
+        if config is not None:
+            resumed = await codex.thread_resume(
+                session_id,
+                sandbox=Sandbox[config["sandbox_name"]],
+                cwd=config["cwd"],
+                approval_mode=ApprovalMode[config["approval_mode_name"]],
+            )
+            self._efforts[session_id] = config["effort"]
+        else:
+            resumed = await codex.thread_resume(session_id)
         self._threads[session_id] = resumed
         return await self.send(session_id, message)
 

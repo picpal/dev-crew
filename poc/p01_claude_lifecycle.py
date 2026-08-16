@@ -1,4 +1,8 @@
-"""POC 1 — Claude Code: 새 session, follow-up, resume, cancel, usage 수집 (§20)."""
+"""POC 1 — Claude Code: 새 session, follow-up, disconnect 후 resume, usage 수집 (§20).
+
+cancel은 여기서 실행하지 않는다 — 어느 provider도 cancel의 live 실행 증거가 없다
+(final-review-findings.md #6 참조).
+"""
 import asyncio
 
 from _common import record, stores
