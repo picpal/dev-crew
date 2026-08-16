@@ -47,7 +47,9 @@ def claude_options_kwargs(role: Role, *, cwd: str | None) -> dict:
 def codex_session_kwargs(role: Role, *, cwd: str | None) -> dict:
     p = ROLE_POLICY[role]
     # openai_codex.Sandbox enum 멤버 이름으로 전달; 어댑터가 enum으로 변환
-    return {"sandbox_name": (p.sandbox or "workspace-write").replace("-", "_"), "cwd": cwd}
+    # Enforcement: approval_mode pinned to deny_all for all roles (harness owns enforcement)
+    return {"sandbox_name": (p.sandbox or "workspace-write").replace("-", "_"),
+            "approval_mode_name": "deny_all", "cwd": cwd}
 
 
 def make_can_use_tool(role: Role, trace: TraceStore, *, task_id: str):
@@ -62,8 +64,9 @@ def make_can_use_tool(role: Role, trace: TraceStore, *, task_id: str):
 
     def _match(tool_name: str) -> bool:
         for pat in allowed:
-            base = pat.split("(")[0]
-            if tool_name == base:
+            # Only exact matches (entries without parentheses) are approved here.
+            # Pattern entries like "Bash(git log:*)" are evaluated by the SDK natively.
+            if pat == tool_name:
                 return True
         return False
 

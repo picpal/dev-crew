@@ -44,7 +44,7 @@ class CodexAdapter:
             model=inst.model,
             sandbox=Sandbox[kw["sandbox_name"]],
             cwd=kw["cwd"],
-            approval_mode=ApprovalMode.auto_review,
+            approval_mode=ApprovalMode[kw["approval_mode_name"]],
         )
         self._threads[thread.id] = thread
         self._efforts[thread.id] = inst.effort_level.value.lower()

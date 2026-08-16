@@ -24,6 +24,7 @@ def test_claude_options_kwargs():
 def test_codex_session_kwargs_reviewer_read_only():
     kw = codex_session_kwargs(Role.REVIEWER, cwd="/tmp/wt")
     assert kw["sandbox_name"] == "read_only"
+    assert kw["approval_mode_name"] == "deny_all"
 
 
 async def test_can_use_tool_denies_and_logs(tmp_path):
@@ -33,7 +34,11 @@ async def test_can_use_tool_denies_and_logs(tmp_path):
     cb = make_can_use_tool(Role.EXPLORER, trace, task_id="T-1")
     allow = await cb("Read", {"file_path": "/x"}, None)
     deny = await cb("Write", {"file_path": "/x"}, None)
+    bash_deny = await cb("Bash", {"command": "echo hi > /x"}, None)
     assert allow.behavior == "allow"
     assert deny.behavior == "deny"
+    assert bash_deny.behavior == "deny"
     evs = trace.events(event_type="PermissionDeniedEvent")
-    assert len(evs) == 1 and evs[0]["payload"]["tool"] == "Write"
+    assert len(evs) == 2
+    assert evs[0]["payload"]["tool"] == "Write"
+    assert evs[1]["payload"]["tool"] == "Bash"
