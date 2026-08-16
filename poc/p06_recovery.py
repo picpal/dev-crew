@@ -16,6 +16,11 @@ async def phase_a():
     from devcrew.schema import Provider, Role
 
     trace, registry = stores()
+    # Idempotent cleanup: purge prior POC-6 rows from previous runs
+    for r in registry.active():
+        if r["body"]["execution_id"] == "POC-6":
+            registry.finish(r["instance_id"])
+
     claude = ClaudeCodeAdapter(trace, registry)
     orch = Orchestrator(trace, registry, {Provider.CLAUDE_CODE: claude})
 
