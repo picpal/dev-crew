@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
 from .schema import Role
 from .store.trace import TraceStore
 
@@ -49,7 +51,13 @@ def codex_session_kwargs(role: Role, *, cwd: str | None) -> dict:
 
 
 def make_can_use_tool(role: Role, trace: TraceStore, *, task_id: str):
-    """Claude SDK can_use_tool 콜백 — allowlist 밖 호출 거부 + 이벤트 적재."""
+    """Claude SDK can_use_tool 콜백 — allowlist 밖 호출 거부 + 이벤트 적재.
+
+    SDK 런타임(claude-agent-sdk==0.2.139)은 {"behavior": ...} dict가 아니라
+    PermissionResultAllow/PermissionResultDeny 인스턴스를 요구한다 — dict를
+    돌려주면 _internal/query.py의 isinstance 분기에서 TypeError가 난다
+    (Task 7 조사, task-7-report.md 참조).
+    """
     allowed = ROLE_POLICY[role].allowed_tools
 
     def _match(tool_name: str) -> bool:
@@ -59,12 +67,11 @@ def make_can_use_tool(role: Role, trace: TraceStore, *, task_id: str):
                 return True
         return False
 
-    async def can_use_tool(tool_name: str, tool_input: dict, context) -> dict:
+    async def can_use_tool(tool_name: str, tool_input: dict, context) -> PermissionResultAllow | PermissionResultDeny:
         if _match(tool_name):
-            return {"behavior": "allow", "updatedInput": tool_input}
+            return PermissionResultAllow(updated_input=tool_input)
         trace.append("PermissionDeniedEvent", task_id=task_id,
                      payload={"role": role.value, "tool": tool_name})
-        return {"behavior": "deny",
-                "message": f"role {role.value} may not use {tool_name}"}
+        return PermissionResultDeny(message=f"role {role.value} may not use {tool_name}")
 
     return can_use_tool

@@ -2,6 +2,9 @@
 name = "devcrew"
 version = "0.0.1"
 requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.2.139",
+]
 
 [build-system]
 requires = ["uv_build>=0.9.9,<0.10.0"]

@@ -27,11 +27,13 @@ def test_codex_session_kwargs_reviewer_read_only():
 
 
 async def test_can_use_tool_denies_and_logs(tmp_path):
+    # SDK 런타임은 {"behavior": ...} dict가 아니라 PermissionResultAllow/Deny
+    # 인스턴스를 요구한다 (claude-agent-sdk==0.2.139 조사, Task 7).
     trace = TraceStore(tmp_path / "trace.db")
     cb = make_can_use_tool(Role.EXPLORER, trace, task_id="T-1")
     allow = await cb("Read", {"file_path": "/x"}, None)
     deny = await cb("Write", {"file_path": "/x"}, None)
-    assert allow["behavior"] == "allow"
-    assert deny["behavior"] == "deny"
+    assert allow.behavior == "allow"
+    assert deny.behavior == "deny"
     evs = trace.events(event_type="PermissionDeniedEvent")
     assert len(evs) == 1 and evs[0]["payload"]["tool"] == "Write"
