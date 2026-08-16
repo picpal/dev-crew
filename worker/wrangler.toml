@@ -1,0 +1,7 @@
+name = "dev-crew-reports"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+[[r2_buckets]]
+binding = "REPORTS"
+bucket_name = "dev-crew-reports"
