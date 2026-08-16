@@ -40,12 +40,14 @@ async def phase_b():
     from devcrew.schema import InstanceStatus
 
     trace, registry = stores()          # 새 프로세스 = 재시작
+    # Scope to this POC's execution — ignore rows from other POCs (e.g., p05 leftovers)
+    mine = {r["instance_id"] for r in registry.active() if r["body"]["execution_id"] == "POC-6"}
     verdicts = registry.lazy_verify({
         "CLAUDE_CODE": lambda row: bool(row["provider_ref"])
                                     and Path(row["provider_ref"]).exists(),
     })
-    live = [k for k, v in verdicts.items() if v == "RESUMABLE"]
-    dead = [k for k, v in verdicts.items() if v == "FAILED_RECOVERY"]
+    live = [k for k, v in verdicts.items() if k in mine and v == "RESUMABLE"]
+    dead = [k for k, v in verdicts.items() if k in mine and v == "FAILED_RECOVERY"]
 
     # RESUMABLE 행을 실제 resume — 컨텍스트 유지 확인 (여기서 처음 LLM 호출)
     claude = ClaudeCodeAdapter(trace, registry)
