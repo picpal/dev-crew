@@ -67,3 +67,38 @@ async def test_scoped_write_confinement(tmp_path):
     assert len(evs) == 1
     assert evs[0]["payload"]["tool"] == "Write"
     assert evs[0]["payload"]["reason"] == "path_outside_workspace"
+
+
+async def test_scoped_write_without_workspace_root_is_denied(tmp_path):
+    """Regression: workspace_root이 None이면 Developer Write는 거부 (fail-closed)."""
+    trace = TraceStore(tmp_path / "trace.db")
+    # workspace_root 미설정
+    cb = make_can_use_tool(Role.DEVELOPER, trace, task_id="T-2", workspace_root=None)
+
+    deny = await cb("Write", {"file_path": "/tmp/x.txt"}, None)
+    assert deny.behavior == "deny"
+
+    evs = trace.events(event_type="PermissionDeniedEvent")
+    assert len(evs) == 1
+    assert evs[0]["payload"]["tool"] == "Write"
+    assert evs[0]["payload"]["reason"] == "no_workspace_root"
+
+
+async def test_sibling_prefix_dir_is_not_allowed(tmp_path):
+    """Regression: /tmp/root-evil는 /tmp/root의 sibling이므로 거부."""
+    trace = TraceStore(tmp_path / "trace.db")
+    workspace = str(tmp_path / "root")
+
+    cb = make_can_use_tool(Role.DEVELOPER, trace, task_id="T-3", workspace_root=workspace)
+
+    # 정확한 workspace 내 파일은 허용
+    allow = await cb("Write", {"file_path": f"{workspace}/file.txt"}, None)
+    assert allow.behavior == "allow"
+
+    # Sibling-like prefix는 거부 (is_relative_to 시맨틱 보호)
+    deny = await cb("Write", {"file_path": f"{workspace}-evil/file.txt"}, None)
+    assert deny.behavior == "deny"
+
+    evs = trace.events(event_type="PermissionDeniedEvent")
+    assert len(evs) == 1
+    assert evs[0]["payload"]["reason"] == "path_outside_workspace"

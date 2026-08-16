@@ -98,16 +98,19 @@ def make_can_use_tool(role: Role, trace: TraceStore, *, task_id: str, workspace_
                         # Check if target is within workspace
                         if target.is_relative_to(workspace_resolved):
                             return PermissionResultAllow(updated_input=tool_input)
-                    except (ValueError, OSError):
-                        # is_relative_to or resolve failed
+                    except (ValueError, OSError, RuntimeError):
+                        # is_relative_to or resolve failed (symlink loops, permission errors, etc.)
                         pass
                 trace.append("PermissionDeniedEvent", task_id=task_id,
                              payload={"role": role.value, "tool": tool_name,
                                      "file_path": file_path, "reason": "path_outside_workspace"})
                 return PermissionResultDeny(message=f"role {role.value} may not write outside workspace {workspace_resolved}")
             else:
-                # No workspace_root set - allow scoped tools (for non-scoped roles or backward compat)
-                return PermissionResultAllow(updated_input=tool_input)
+                # Fail-closed: no workspace_root set, but role requires scoped tools → deny
+                trace.append("PermissionDeniedEvent", task_id=task_id,
+                             payload={"role": role.value, "tool": tool_name,
+                                     "reason": "no_workspace_root"})
+                return PermissionResultDeny(message=f"role {role.value} requires workspace_root for {tool_name}")
 
         # Not in any allowlist
         trace.append("PermissionDeniedEvent", task_id=task_id,
