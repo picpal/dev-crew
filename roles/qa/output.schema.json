@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "plan", "results"],
+  "properties": {
+    "status": {"type": "string", "enum": ["PASS", "NOT_PASS", "NEED_REPLAN", "BLOCKED", "INSUFFICIENT_CAPABILITY"]},
+    "summary": {"type": "string"},
+    "plan": {"type": "array", "items": {"type": "string"}},
+    "results": {"type": "array", "items": {
+      "type": "object", "additionalProperties": false,
+      "required": ["criterion", "ok"],
+      "properties": {
+        "criterion": {"type": "string"},
+        "ok": {"type": "boolean"},
+        "repro": {"type": ["string", "null"]}
+      }}}
+  }
+}
