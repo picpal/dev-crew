@@ -1,6 +1,8 @@
 """Codex Adapter (#11) — AsyncCodex 단일 인스턴스 공유, 6연산 전부 네이티브."""
 from __future__ import annotations
 
+import json
+
 from openai_codex import ApprovalMode, AsyncCodex, Sandbox
 
 from ..enforcement import codex_session_kwargs
@@ -30,9 +32,13 @@ class CodexAdapter:
         self._codex: AsyncCodex | None = None
         self._threads: dict[str, object] = {}      # thread_id -> AsyncThread
         self._efforts: dict[str, str] = {}
-        # thread_id -> {sandbox_name, cwd, approval_mode_name, effort}: cached at
-        # start_session so resume() can re-pass the role's enforcement pin instead
-        # of falling back to thread_resume()'s own defaults (finding #2).
+        self._schemas: dict[str, dict | None] = {}  # thread_id -> output_schema, for send()
+        # thread_id -> {sandbox_name, cwd, approval_mode_name, effort, output_schema}:
+        # cached at start_session so resume() can re-pass the role's enforcement pin
+        # instead of falling back to thread_resume()'s own defaults (finding #2), and
+        # can restore the structured-output schema so post-resume turns keep forcing
+        # schema-conformant output (system_prompt/base_instructions is NOT restored
+        # here — same deferred gap B1 as claude_code.py's resume()).
         self._session_config: dict[str, dict] = {}
 
     async def _client(self) -> AsyncCodex:
@@ -41,7 +47,9 @@ class CodexAdapter:
             await self._codex.__aenter__()
         return self._codex
 
-    async def start_session(self, inst: AgentInstance, initial_message: str) -> str:
+    async def start_session(self, inst: AgentInstance, initial_message: str, *,
+                             system_prompt: str | None = None,
+                             output_schema: dict | None = None) -> str:
         codex = await self._client()
         kw = codex_session_kwargs(inst.role, cwd=inst.worktree)
         thread = await codex.thread_start(
@@ -49,25 +57,37 @@ class CodexAdapter:
             sandbox=Sandbox[kw["sandbox_name"]],
             cwd=kw["cwd"],
             approval_mode=ApprovalMode[kw["approval_mode_name"]],
+            base_instructions=system_prompt,
         )
         self._threads[thread.id] = thread
         effort = inst.effort_level.value.lower()
         self._efforts[thread.id] = effort
+        self._schemas[thread.id] = output_schema
         self._session_config[thread.id] = {
             "sandbox_name": kw["sandbox_name"],
             "cwd": kw["cwd"],
             "approval_mode_name": kw["approval_mode_name"],
             "effort": effort,
+            "output_schema": output_schema,
         }
         await self.send(thread.id, initial_message)
         return thread.id
 
     async def send(self, session_id: str, message: str) -> TurnOutcome:
         thread = self._threads[session_id]
-        result = await thread.run(message, effort=self._efforts.get(session_id))
+        schema = self._schemas.get(session_id)
+        result = await thread.run(message, effort=self._efforts.get(session_id),
+                                   output_schema=schema)
+        structured = None
+        if schema and result.final_response:
+            try:
+                structured = json.loads(result.final_response)
+            except json.JSONDecodeError:
+                structured = None    # provider가 스키마 강제하므로 정상 경로에선 발생 안 함
         return TurnOutcome(text=result.final_response or "",
                            usage=_usage_from_turn(result),
-                           raw={"turn_id": result.id})
+                           raw={"turn_id": result.id},
+                           structured=structured)
 
     async def resume(self, session_id: str, message: str) -> TurnOutcome:
         """archive/disconnect 이후 thread를 재개한다 (#11).
@@ -80,8 +100,11 @@ class CodexAdapter:
         effort는 thread_resume() 파라미터가 아니다 (installed openai_codex==0.144.4
         AsyncCodex.thread_resume은 approval_mode/base_instructions/config/cwd/
         developer_instructions/model/model_provider/personality/sandbox/service_tier만
-        받는다 — api.py:443-453). effort는 turn 단위 인자(thread.run(effort=...))이므로
-        여기서는 self._efforts를 복원해 이어지는 send()가 None을 넘기지 않게 한다.
+        받는다 — api.py:443-453). effort와 output_schema는 모두 turn 단위 인자
+        (thread.run(effort=..., output_schema=...))이므로 여기서는 self._efforts와
+        self._schemas를 복원해 이어지는 send()가 둘 다 None을 넘기지 않게 한다.
+        base_instructions(system_prompt)는 캐시하지 않으므로 resume 이후에는
+        재적용되지 않는다 — claude_code.py의 동일 갭(B1)과 같은 성격.
 
         한계: 캐시는 이 adapter 인스턴스의 메모리에만 있다. start_session을 거치지
         않은 session_id로 resume()이 불리면(예: 프로세스 재시작 후 recovery — Claude
@@ -99,6 +122,7 @@ class CodexAdapter:
                 approval_mode=ApprovalMode[config["approval_mode_name"]],
             )
             self._efforts[session_id] = config["effort"]
+            self._schemas[session_id] = config.get("output_schema")
         else:
             resumed = await codex.thread_resume(session_id)
         self._threads[session_id] = resumed

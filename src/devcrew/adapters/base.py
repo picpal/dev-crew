@@ -13,10 +13,13 @@ class TurnOutcome:
     text: str
     usage: Usage
     raw: dict = field(default_factory=dict)
+    structured: dict | None = None
 
 
 class ProviderAdapter(Protocol):
-    async def start_session(self, inst: AgentInstance, initial_message: str) -> str: ...
+    async def start_session(self, inst: AgentInstance, initial_message: str, *,
+                             system_prompt: str | None = None,
+                             output_schema: dict | None = None) -> str: ...
     async def send(self, session_id: str, message: str) -> TurnOutcome: ...
     async def resume(self, session_id: str, message: str) -> TurnOutcome: ...
     async def cancel(self, session_id: str) -> str: ...
@@ -29,14 +32,22 @@ class FakeAdapter:
 
     _ids = itertools.count(1)
 
-    def __init__(self, script: list[str] | None = None, fail_after: int | None = None):
+    def __init__(self, script: list[str] | None = None, fail_after: int | None = None,
+                 structured_script: list[dict] | None = None):
         self.script = list(script or [])
         self.fail_after = fail_after
+        self.structured_script = list(structured_script or [])
         self.turns: dict[str, int] = {}
+        self.last_system_prompt: str | None = None
+        self.last_output_schema: dict | None = None
 
-    async def start_session(self, inst: AgentInstance, initial_message: str) -> str:
+    async def start_session(self, inst: AgentInstance, initial_message: str, *,
+                             system_prompt: str | None = None,
+                             output_schema: dict | None = None) -> str:
         sid = f"fake-{next(self._ids)}"
         self.turns[sid] = 0
+        self.last_system_prompt = system_prompt
+        self.last_output_schema = output_schema
         return sid
 
     async def send(self, session_id: str, message: str) -> TurnOutcome:
@@ -45,7 +56,9 @@ class FakeAdapter:
             raise RuntimeError("scripted failure")
         self.turns[session_id] = n + 1
         text = self.script[n] if n < len(self.script) else "done"
-        return TurnOutcome(text=text, usage=Usage(output_tokens=1, raw={"fake": True}))
+        structured = self.structured_script[n] if n < len(self.structured_script) else None
+        return TurnOutcome(text=text, usage=Usage(output_tokens=1, raw={"fake": True}),
+                           structured=structured)
 
     async def resume(self, session_id: str, message: str) -> TurnOutcome:
         return await self.send(session_id, message)

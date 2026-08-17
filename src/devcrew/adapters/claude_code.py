@@ -37,13 +37,17 @@ class ClaudeCodeAdapter:
         self.registry = registry
         self._clients: dict[str, ClaudeSDKClient] = {}
 
-    async def start_session(self, inst: AgentInstance, initial_message: str) -> str:
+    async def start_session(self, inst: AgentInstance, initial_message: str, *,
+                             system_prompt: str | None = None,
+                             output_schema: dict | None = None) -> str:
         kw = claude_options_kwargs(inst.role, cwd=inst.worktree)
         options = ClaudeAgentOptions(
             model=inst.model,
             effort=inst.effort_level.value.lower(),
             can_use_tool=make_can_use_tool(inst.role, self.trace, task_id=inst.execution_id,
                                            workspace_root=inst.worktree),
+            system_prompt=system_prompt,
+            output_format={"type": "json_schema", "schema": output_schema} if output_schema else None,
             **kw,
         )
         client = ClaudeSDKClient(options)
@@ -69,13 +73,21 @@ class ClaudeCodeAdapter:
             text="".join(text),
             usage=usage,
             raw={"session_id": getattr(result_msg, "session_id", None), **usage.raw},
+            structured=getattr(result_msg, "structured_output", None),
         )
 
     async def send(self, session_id: str, message: str) -> TurnOutcome:
         return await self._turn(self._clients[session_id], message)
 
     async def resume(self, session_id: str, message: str) -> TurnOutcome:
-        """프로세스 재시작 후 경로 — 새 client를 resume 옵션으로 연결."""
+        """프로세스 재시작 후 경로 — 새 client를 resume 옵션으로 연결.
+
+        system_prompt/output_format은 여기서 재주입하지 않는다 (deferred gap B1,
+        범위 밖) — start_session에서만 지정되고 resume 경로는 ClaudeAgentOptions의
+        기본값을 그대로 쓴다. Cross-process recovery 후 structured output이 필요한
+        turn을 resume으로 이어가면 output_format이 비어 있어 TurnOutcome.structured가
+        None이 될 수 있다.
+        """
         options = ClaudeAgentOptions(resume=session_id)
         client = ClaudeSDKClient(options)
         await client.connect()
