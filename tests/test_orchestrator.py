@@ -199,3 +199,45 @@ async def test_review_loop_consumes_turn_outcome_via_consume_result(tmp_path):
     assert result.passed is True and result.iterations == 2
     evs = trace.events(event_type="LoopEvent")
     assert [e["payload"]["verdict"] for e in evs] == ["NOT_PASS", "PASS"]
+
+
+async def test_consume_result_as_role_override(tmp_path):
+    """W3: as_role로 판정 role을 inst.role과 다르게 지정할 수 있다 — WorkerResultEvent
+    payload도 판정에 쓰인 role(as_role)을 기록한다."""
+    orch, trace, _ = make_orch(tmp_path)
+    dev = await orch.spawn(Role.DEVELOPER, "DEFAULT", execution_id="E1",
+                           node_id="n1", task_scope="*")
+    outcome = TurnOutcome(text="", usage=Usage(),
+                          structured={"status": "PASS", "summary": "ok",
+                                      "verdict": "NOT_PASS", "findings": []})
+    result = orch.consume_result(dev, outcome, as_role=Role.REVIEWER)
+    assert result == "NOT_PASS"
+    evs = trace.events(event_type="WorkerResultEvent")
+    assert evs[0]["payload"] == {"role": "REVIEWER", "status": "PASS", "verdict": "NOT_PASS"}
+
+
+async def test_review_loop_uses_reviewer_verdict_even_when_dev_inst_is_developer(tmp_path):
+    """W3 회귀 (재재리뷰 신규 finding): 실제 운영 시나리오처럼 dev_inst가 DEVELOPER
+    role이어도, review_fn이 반환한 TurnOutcome은 Reviewer 판정 규칙(verdict)으로
+    소비돼야 한다. dev_inst.role(DEVELOPER)로 판정하면 REVIEWER 분기를 타지 않아
+    status만 보고 첫 회에 통과 처리되는 버그가 있었다 — as_role=Role.REVIEWER 고정
+    으로 고쳤다."""
+    orch, trace, _ = make_orch(tmp_path)
+    dev = await orch.spawn(Role.DEVELOPER, "DEFAULT", execution_id="E1",
+                           node_id="n1", task_scope="*")
+    calls = {"n": 0}
+
+    async def review(_):
+        calls["n"] += 1
+        verdict = "NOT_PASS" if calls["n"] == 1 else "PASS"
+        return TurnOutcome(text="", usage=Usage(),
+                           structured={"status": "PASS", "summary": "ok",
+                                       "verdict": verdict, "findings": []})
+
+    async def fix(_): pass
+
+    result = await orch.run_review_loop(dev, review, fix)
+    # verdict=NOT_PASS인 1회차에 통과 처리됐다면 iterations==1, passed=True였을 것.
+    assert result.passed is True and result.iterations == 2
+    evs = trace.events(event_type="LoopEvent")
+    assert [e["payload"]["verdict"] for e in evs] == ["NOT_PASS", "PASS"]

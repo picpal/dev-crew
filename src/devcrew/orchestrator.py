@@ -129,46 +129,56 @@ class Orchestrator:
         self.registry.upsert(inst, provider_ref=None)
         return session_id
 
-    def consume_result(self, inst: AgentInstance, outcome: TurnOutcome) -> str:
+    def consume_result(self, inst: AgentInstance, outcome: TurnOutcome, *,
+                       as_role: Role | None = None) -> str:
         """Structured worker 결과를 상태 전이 문자열로 소비한다 (spec 결정 4, finding #3/#4).
 
         `outcome.structured`가 dict가 아니거나 `status`가 roles.STATUS_ENUM 밖이면
         malformed로 간주해 `MalformedResultEvent`를 남기고 "NEED_REPLAN"을 반환한다
         (fail-closed — 신뢰할 수 없는 출력으로 상태를 전이시키지 않는다).
 
-        Role.REVIEWER는 예외다: `structured["status"]`는 검토를 "수행"했는지
-        (PASS=검토를 마쳤다, BLOCKED=검토 불가 등)를 나타낼 뿐 코드에 대한 판정이
-        아니다 — 코드 판정은 `structured["verdict"]`(PASS/NOT_PASS)에 있다
-        (roles/reviewer/prompt.md 보고 규칙). status가 "PASS"(검토를 실제로
+        전이 판정에 쓰는 role은 `as_role or inst.role`이다. 기본은 `inst.role`이지만,
+        `outcome`이 `inst`와 다른 role의 결과일 때(예: `run_review_loop`가 DEVELOPER
+        `dev_inst`로 루프를 돌지만 `review_fn`이 돌려주는 `TurnOutcome`은 Reviewer의
+        결과인 경우) 호출자가 `as_role=Role.REVIEWER`로 실제 판정 규칙을 명시해야
+        한다 — 그렇지 않으면 `inst.role`(DEVELOPER)로 판정해 Reviewer의 verdict가
+        완전히 무시되고 `{status: PASS, verdict: NOT_PASS}`가 status만으로 성공
+        처리되는 버그가 재발한다(재재리뷰 신규 finding).
+
+        판정 role이 REVIEWER인 경우는 예외다: `structured["status"]`는 검토를
+        "수행"했는지(PASS=검토를 마쳤다, BLOCKED=검토 불가 등)를 나타낼 뿐 코드에
+        대한 판정이 아니다 — 코드 판정은 `structured["verdict"]`(PASS/NOT_PASS)에
+        있다(roles/reviewer/prompt.md 보고 규칙). status가 "PASS"(검토를 실제로
         마쳤을 때)에만 verdict를 전이값으로 쓴다. status가 그 외(BLOCKED 등,
         검토가 수행되지 않음)면 verdict를 무시하고 status를 그대로 전파한다 —
         `{status: BLOCKED, verdict: PASS}`처럼 스키마상 유효하지만 검토 불가인
-        결과가 verdict만 보고 성공(PASS)으로 진행되는 걸 막는다(재리뷰 신규
-        finding). status가 PASS인데 verdict가 PASS/NOT_PASS가 아니면 malformed로
-        처리한다. 다른 모든 role은 status를 그대로 전이값으로 쓴다.
+        결과가 verdict만 보고 성공(PASS)으로 진행되는 걸 막는다. status가 PASS인데
+        verdict가 PASS/NOT_PASS가 아니면 malformed로 처리한다. 판정 role이 그 외면
+        status를 그대로 전이값으로 쓴다.
 
-        정상 경로에서는 `WorkerResultEvent`를 남긴다 (payload: role, status, 그리고
-        Reviewer가 실제로 검토를 마친 경우 verdict도 포함).
+        정상 경로에서는 `WorkerResultEvent`를 남긴다 (payload: 판정에 쓰인 role,
+        status, 그리고 REVIEWER 판정이 실제로 검토를 마친 경우 verdict도 포함).
         """
+        role = as_role or inst.role
         structured = outcome.structured
         if not isinstance(structured, dict) or structured.get("status") not in STATUS_ENUM:
             self.trace.append("MalformedResultEvent", task_id=inst.execution_id,
                               execution_id=inst.execution_id, instance_id=inst.instance_id,
-                              payload={"role": inst.role.value, "raw": structured})
+                              payload={"role": role.value, "raw": structured})
             return "NEED_REPLAN"
 
         status = structured["status"]
-        if inst.role is Role.REVIEWER and status == "PASS":
+        if role is Role.REVIEWER and status == "PASS":
             verdict = structured.get("verdict")
             if verdict not in ("PASS", "NOT_PASS"):
                 self.trace.append("MalformedResultEvent", task_id=inst.execution_id,
                                   execution_id=inst.execution_id, instance_id=inst.instance_id,
-                                  payload={"role": inst.role.value, "raw": structured})
+                                  payload={"role": role.value, "raw": structured})
                 return "NEED_REPLAN"
-            payload = {"role": inst.role.value, "status": status, "verdict": verdict}
+            payload = {"role": role.value, "status": status, "verdict": verdict}
             transition = verdict
         else:
-            payload = {"role": inst.role.value, "status": status}
+            payload = {"role": role.value, "status": status}
             transition = status
 
         self.trace.append("WorkerResultEvent", task_id=inst.execution_id,
@@ -182,12 +192,17 @@ class Orchestrator:
         """Bounded review loop (§10). `review_fn`은 str 전이값 또는 `TurnOutcome`을
         반환할 수 있다 — `TurnOutcome`이면 `consume_result()` 경계를 통과시켜 구조화
         출력 검증/Reviewer verdict 규칙을 적용한 전이값을 얻는다(재리뷰 finding #3
-        통합). 기존 str 반환 호출자는 그대로 동작한다(하위호환).
+        통합). `review_fn`의 결과는 항상 Reviewer의 출력이므로(루프를 돌리는
+        `dev_inst`가 어떤 role이든) `as_role=Role.REVIEWER`로 판정 규칙을 고정한다
+        — `dev_inst.role`(보통 DEVELOPER)로 판정하면 verdict가 무시되고 status만으로
+        전이가 결정돼 `{status: PASS, verdict: NOT_PASS}`가 잘못 통과 처리된다
+        (wave 3 신규 finding). 기존 str 반환 호출자는 그대로 동작한다(하위호환).
         """
         last_finding, same_count = None, 0
         for i in range(1, max_iterations + 1):
             ret = await review_fn(dev_inst)
-            verdict = self.consume_result(dev_inst, ret) if isinstance(ret, TurnOutcome) else ret
+            verdict = (self.consume_result(dev_inst, ret, as_role=Role.REVIEWER)
+                      if isinstance(ret, TurnOutcome) else ret)
             self.trace.append("LoopEvent", task_id=dev_inst.execution_id,
                               execution_id=dev_inst.execution_id,
                               instance_id=dev_inst.instance_id,
