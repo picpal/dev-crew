@@ -76,3 +76,28 @@ def test_review_queue_scale_signal():
     for i in range(7):
         q.submit(f"dev-{i}")
     assert q.scale_signal() == 3                  # 압력 상승 → max까지
+
+
+async def test_spawn_records_bundle_version(tmp_path):
+    from devcrew.roles import load_bundle
+    orch, trace, reg = make_orch(tmp_path)
+    inst = await orch.spawn(Role.EXPLORER, "CHEAP", execution_id="E1",
+                            node_id="n1", task_scope="*")
+    assert inst.role_bundle_version == load_bundle(Role.EXPLORER).version
+
+
+async def test_start_worker_injects_bundle(tmp_path):
+    orch, _, _ = make_orch(tmp_path, FakeAdapter(structured_script=[{"status": "PASS", "summary": "ok"}]))
+    fake = orch.adapters[Provider.CLAUDE_CODE]
+    inst = await orch.spawn(Role.QA, "CHEAP", execution_id="E1",
+                            node_id="n1", task_scope="*")
+    await orch.start_worker(inst, "검증 시작")
+    assert fake.last_system_prompt.startswith("# QA")
+    assert fake.last_output_schema["properties"]["results"]
+
+
+async def test_spawn_without_bundle_for_out_of_scope_role(tmp_path):
+    orch, _, _ = make_orch(tmp_path)
+    inst = await orch.spawn(Role.ARCHITECT, "DEFAULT", execution_id="E1",
+                            node_id="n1", task_scope="*")
+    assert inst.role_bundle_version is None

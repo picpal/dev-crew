@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 
 from .routing import resolve
+from .roles import RoleBundle, RoleBundleError, load_bundle
 from .schema import AgentInstance, EffortLevel, InstanceStatus, Provider, Role
 from .store.registry import SessionRegistry
 from .store.trace import TraceStore
@@ -15,6 +16,8 @@ from .store.trace import TraceStore
 _EFFORT_BY_STR = {"low": EffortLevel.LOW, "medium": EffortLevel.MEDIUM,
                   "high": EffortLevel.HIGH, "xhigh": EffortLevel.XHIGH,
                   "max": EffortLevel.MAX}
+
+WORKER_ROLES = {Role.EXPLORER, Role.DEVELOPER, Role.REVIEWER, Role.QA}
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,11 @@ class Orchestrator:
             escalation_chain_id=(replaced.escalation_chain_id or replaced.instance_id)
             if replaced else None,
         )
+        # Load role bundle for WORKER_ROLES
+        if role in WORKER_ROLES:
+            bundle = load_bundle(role)
+            inst.role_bundle_version = bundle.version
+
         self.trace.append("ModelRoutingEvent", task_id=execution_id,
                           execution_id=execution_id, instance_id=inst.instance_id,
                           payload={"role": role.value, "selected_tier": tier_name,
@@ -84,6 +92,21 @@ class Orchestrator:
         self.trace.upsert_instance(inst)
         self.registry.upsert(inst, provider_ref=None)
         return inst
+
+    async def start_worker(self, inst: AgentInstance, initial_message: str) -> str:
+        """Start a worker agent session with its role bundle injected.
+
+        Loads the bundle for the worker role and passes system_prompt and output_schema
+        to the adapter's start_session method.
+        """
+        bundle = load_bundle(inst.role)
+        adapter = self.adapters[inst.provider]
+        session_id = await adapter.start_session(
+            inst, initial_message,
+            system_prompt=bundle.prompt, output_schema=bundle.schema)
+        inst.session_id = session_id
+        self.registry.upsert(inst, provider_ref=None)
+        return session_id
 
     async def run_review_loop(self, dev_inst: AgentInstance, review_fn, fix_fn,
                               *, max_iterations: int = 5,

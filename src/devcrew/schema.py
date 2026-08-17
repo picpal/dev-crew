@@ -77,6 +77,7 @@ class AgentInstance:
     parent_instance_id: str | None = None
     replaced_instance_id: str | None = None
     escalation_chain_id: str | None = None
+    role_bundle_version: str | None = None
     skills: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
     permissions: list[str] = field(default_factory=list)
