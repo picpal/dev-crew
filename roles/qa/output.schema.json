@@ -8,7 +8,7 @@
     "plan": {"type": "array", "items": {"type": "string"}},
     "results": {"type": "array", "items": {
       "type": "object", "additionalProperties": false,
-      "required": ["criterion", "ok"],
+      "required": ["criterion", "ok", "repro"],
       "properties": {
         "criterion": {"type": "string"},
         "ok": {"type": "boolean"},

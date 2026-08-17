@@ -7,7 +7,7 @@
     "summary": {"type": "string"},
     "findings": {"type": "array", "items": {
       "type": "object", "additionalProperties": false,
-      "required": ["file", "evidence", "confidence"],
+      "required": ["file", "line", "evidence", "confidence"],
       "properties": {
         "file": {"type": "string"},
         "line": {"type": ["integer", "null"]},

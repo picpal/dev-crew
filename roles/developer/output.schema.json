@@ -7,9 +7,9 @@
     "summary": {"type": "string"},
     "changed_files": {"type": "array", "items": {"type": "string"}},
     "build": {"type": "object", "additionalProperties": false,
-      "required": ["ok"], "properties": {"ok": {"type": "boolean"}, "detail": {"type": "string"}}},
+      "required": ["ok", "detail"], "properties": {"ok": {"type": "boolean"}, "detail": {"type": ["string", "null"]}}},
     "tests": {"type": "object", "additionalProperties": false,
-      "required": ["passed", "failed"],
-      "properties": {"passed": {"type": "integer"}, "failed": {"type": "integer"}, "detail": {"type": "string"}}}
+      "required": ["passed", "failed", "detail"],
+      "properties": {"passed": {"type": "integer"}, "failed": {"type": "integer"}, "detail": {"type": ["string", "null"]}}}
   }
 }

@@ -27,3 +27,24 @@ def test_role_specific_fields():
 def test_missing_bundle_fail_fast():
     with pytest.raises(RoleBundleError):
         load_bundle(Role.ORCHESTRATOR)    # 이번 effort 범위 밖 — 번들 없음
+
+
+def _assert_strict(obj):
+    """Verify object is OpenAI strict-compatible: required == all properties."""
+    if obj.get("type") == "object" or (isinstance(obj.get("type"), list) and "object" in obj["type"]):
+        props = obj.get("properties") or {}
+        required = set(obj.get("required") or [])
+        assert required == set(props), f"required {sorted(required)} != all keys {sorted(props)}"
+    # Recurse into nested objects
+    for v in (obj.get("properties") or {}).values():
+        _assert_strict(v)
+    # Handle array items
+    if obj.get("items"):
+        _assert_strict(obj["items"])
+
+
+@pytest.mark.parametrize("role", WORKERS)
+def test_schema_is_openai_strict_compatible(role):
+    """Regression guard: role schemas must be OpenAI strict-compatible."""
+    bundle = load_bundle(role)
+    _assert_strict(bundle.schema)

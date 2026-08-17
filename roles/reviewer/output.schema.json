@@ -8,7 +8,7 @@
     "verdict": {"type": "string", "enum": ["PASS", "NOT_PASS"]},
     "findings": {"type": "array", "items": {
       "type": "object", "additionalProperties": false,
-      "required": ["severity", "description"],
+      "required": ["severity", "file", "line", "description"],
       "properties": {
         "severity": {"type": "string", "enum": ["critical", "important", "minor"]},
         "file": {"type": ["string", "null"]},
