@@ -159,3 +159,43 @@ async def test_consume_result_malformed_structured_logs_event(tmp_path):
     evs = trace.events(event_type="MalformedResultEvent")
     assert len(evs) == 1
     assert evs[0]["payload"]["role"] == "EXPLORER"
+
+
+async def test_consume_result_reviewer_blocked_status_not_overridden_by_verdict(tmp_path):
+    """재리뷰 신규 finding: status=BLOCKED(검토 불가)면 verdict=PASS라도 BLOCKED를
+    그대로 전파해야 한다 — verdict는 status가 PASS(검토를 실제로 마쳤을 때)일 때만
+    쓴다."""
+    orch, trace, _ = make_orch(tmp_path)
+    inst = await orch.spawn(Role.REVIEWER, "CODEX_DEFAULT", execution_id="E1",
+                            node_id="n1", task_scope="*")
+    outcome = TurnOutcome(text="", usage=Usage(),
+                          structured={"status": "BLOCKED", "summary": "diff를 읽을 수 없음",
+                                      "verdict": "PASS", "findings": []})
+    result = orch.consume_result(inst, outcome)
+    assert result == "BLOCKED"
+    evs = trace.events(event_type="WorkerResultEvent")
+    assert evs[0]["payload"] == {"role": "REVIEWER", "status": "BLOCKED"}
+
+
+async def test_review_loop_consumes_turn_outcome_via_consume_result(tmp_path):
+    """W2-1: review_fn이 TurnOutcome을 반환하면 run_review_loop이 consume_result()
+    경계를 통과시켜 전이값을 얻는다 — Reviewer verdict=NOT_PASS면 재시도, PASS면
+    통과."""
+    orch, trace, _ = make_orch(tmp_path)
+    reviewer_inst = await orch.spawn(Role.REVIEWER, "CODEX_DEFAULT", execution_id="E1",
+                                     node_id="n1", task_scope="*")
+    calls = {"n": 0}
+
+    async def review(_):
+        calls["n"] += 1
+        verdict = "NOT_PASS" if calls["n"] == 1 else "PASS"
+        return TurnOutcome(text="", usage=Usage(),
+                           structured={"status": "PASS", "summary": "ok",
+                                       "verdict": verdict, "findings": []})
+
+    async def fix(_): pass
+
+    result = await orch.run_review_loop(reviewer_inst, review, fix)
+    assert result.passed is True and result.iterations == 2
+    evs = trace.events(event_type="LoopEvent")
+    assert [e["payload"]["verdict"] for e in evs] == ["NOT_PASS", "PASS"]

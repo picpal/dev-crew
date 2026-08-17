@@ -51,6 +51,16 @@ def test_role_default_unknown_tier_rejected(tmp_path):
         load(bad)
 
 
+def test_role_defaults_incomplete_rejected(tmp_path):
+    """W2-2: EXPLORER 하나만 있는 roleDefaults는 나머지 필수 role이 빠졌으므로 거부."""
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        "tiers:\n  CHEAP: {provider: CLAUDE_CODE, model: claude-sonnet-5, effort: LOW}\n"
+        "roleDefaults:\n  EXPLORER: {tier: CHEAP}\n")
+    with pytest.raises(ConfigError):
+        load(bad)
+
+
 def test_routing_consumes_yaml():
     from devcrew.routing import TIERS, resolve
     assert TIERS["DEFAULT"].model == "claude-sonnet-5"

@@ -139,12 +139,16 @@ class Orchestrator:
         Role.REVIEWER는 예외다: `structured["status"]`는 검토를 "수행"했는지
         (PASS=검토를 마쳤다, BLOCKED=검토 불가 등)를 나타낼 뿐 코드에 대한 판정이
         아니다 — 코드 판정은 `structured["verdict"]`(PASS/NOT_PASS)에 있다
-        (roles/reviewer/prompt.md 보고 규칙). 그래서 Reviewer 결과의 전이값은
-        status가 아니라 verdict이며, verdict가 PASS/NOT_PASS가 아니면 이 역시
-        malformed로 처리한다. 다른 모든 role은 status를 그대로 전이값으로 쓴다.
+        (roles/reviewer/prompt.md 보고 규칙). status가 "PASS"(검토를 실제로
+        마쳤을 때)에만 verdict를 전이값으로 쓴다. status가 그 외(BLOCKED 등,
+        검토가 수행되지 않음)면 verdict를 무시하고 status를 그대로 전파한다 —
+        `{status: BLOCKED, verdict: PASS}`처럼 스키마상 유효하지만 검토 불가인
+        결과가 verdict만 보고 성공(PASS)으로 진행되는 걸 막는다(재리뷰 신규
+        finding). status가 PASS인데 verdict가 PASS/NOT_PASS가 아니면 malformed로
+        처리한다. 다른 모든 role은 status를 그대로 전이값으로 쓴다.
 
         정상 경로에서는 `WorkerResultEvent`를 남긴다 (payload: role, status, 그리고
-        Reviewer의 경우 verdict도 포함).
+        Reviewer가 실제로 검토를 마친 경우 verdict도 포함).
         """
         structured = outcome.structured
         if not isinstance(structured, dict) or structured.get("status") not in STATUS_ENUM:
@@ -154,7 +158,7 @@ class Orchestrator:
             return "NEED_REPLAN"
 
         status = structured["status"]
-        if inst.role is Role.REVIEWER:
+        if inst.role is Role.REVIEWER and status == "PASS":
             verdict = structured.get("verdict")
             if verdict not in ("PASS", "NOT_PASS"):
                 self.trace.append("MalformedResultEvent", task_id=inst.execution_id,
@@ -175,9 +179,15 @@ class Orchestrator:
     async def run_review_loop(self, dev_inst: AgentInstance, review_fn, fix_fn,
                               *, max_iterations: int = 5,
                               same_finding_threshold: int = 3) -> LoopResult:
+        """Bounded review loop (§10). `review_fn`은 str 전이값 또는 `TurnOutcome`을
+        반환할 수 있다 — `TurnOutcome`이면 `consume_result()` 경계를 통과시켜 구조화
+        출력 검증/Reviewer verdict 규칙을 적용한 전이값을 얻는다(재리뷰 finding #3
+        통합). 기존 str 반환 호출자는 그대로 동작한다(하위호환).
+        """
         last_finding, same_count = None, 0
         for i in range(1, max_iterations + 1):
-            verdict = await review_fn(dev_inst)
+            ret = await review_fn(dev_inst)
+            verdict = self.consume_result(dev_inst, ret) if isinstance(ret, TurnOutcome) else ret
             self.trace.append("LoopEvent", task_id=dev_inst.execution_id,
                               execution_id=dev_inst.execution_id,
                               instance_id=dev_inst.instance_id,

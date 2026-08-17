@@ -44,10 +44,15 @@ async def main():
         sid = await orch.start_worker(inst, prompt)
         adapter = orch.adapters[inst.provider]
         out = await adapter.send(sid, "이제 최종 보고를 스키마대로 제출해.")
+        # 소비 경계(orchestrator.consume_result)를 실제로 통과시킨다 — structured
+        # 출력을 직접 들여다보는 대신 이 경로로 상태 전이값을 얻어야 role 검증/
+        # Reviewer verdict 규칙이 실제 사용된다(재리뷰 finding #3).
+        transition = orch.consume_result(inst, out)
         s = out.structured
         outputs[name] = s or {}
         checks[f"{name}_structured"] = isinstance(s, dict)
         checks[f"{name}_status_valid"] = isinstance(s, dict) and s.get("status") in STATUS_ENUM
+        checks[f"{name}_transition_valid"] = transition in STATUS_ENUM | {"PASS", "NOT_PASS"}
         await adapter.archive(sid)
         registry.finish(inst.instance_id)
 

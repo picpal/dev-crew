@@ -10,6 +10,10 @@ from .schema import EffortLevel, Provider, Role
 
 DEFAULT_PATH = Path(__file__).resolve().parents[2] / "config" / "harness.yaml"
 
+# ORCHESTRATOR는 routing 대상이 아니므로 roleDefaults 완전성 검사에서 제외한다
+# (spec 결정 2 — orchestrator는 role bundle/tier routing 밖).
+REQUIRED_ROLE_DEFAULTS = frozenset(Role) - {Role.ORCHESTRATOR}
+
 
 class ConfigError(Exception):
     pass
@@ -60,4 +64,9 @@ def load(path: str | Path | None = None) -> HarnessConfig:
     if unknown_tiers:
         raise ConfigError(
             f"roleDefaults reference unknown tiers {sorted(unknown_tiers)}: {p}")
+    missing_roles = REQUIRED_ROLE_DEFAULTS - set(role_defaults)
+    if missing_roles:
+        raise ConfigError(
+            f"roleDefaults missing required roles "
+            f"{sorted(r.value for r in missing_roles)}: {p}")
     return HarnessConfig(tiers=tiers, role_defaults=role_defaults)
