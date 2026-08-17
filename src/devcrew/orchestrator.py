@@ -7,8 +7,9 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
+from .adapters.base import TurnOutcome
 from .routing import resolve
-from .roles import RoleBundle, RoleBundleError, load_bundle
+from .roles import STATUS_ENUM, RoleBundle, RoleBundleError, load_bundle
 from .schema import AgentInstance, EffortLevel, InstanceStatus, Provider, Role
 from .store.registry import SessionRegistry
 from .store.trace import TraceStore
@@ -98,15 +99,78 @@ class Orchestrator:
 
         Loads the bundle for the worker role and passes system_prompt and output_schema
         to the adapter's start_session method.
+
+        Re-loads the bundle here (rather than trusting spawn()'s recorded version) and
+        verifies its version matches `inst.role_bundle_version`, raising RoleBundleError
+        on a mismatch — guards against role bundle files changing between spawn() and
+        start_worker(), or callers constructing an AgentInstance without going through
+        spawn() at all (finding #5).
+
+        task_scope is injected into the TRUSTED system prompt (bundle.prompt +
+        assignment scope), not left to the caller's initial_message, so a worker cannot
+        have its assigned scope silently omitted or overridden by untrusted turn content
+        (finding #7, partial — Bash/tool-level scope confinement stays a separate parked
+        item).
         """
         bundle = load_bundle(inst.role)
+        if bundle.version != inst.role_bundle_version:
+            raise RoleBundleError(
+                f"role bundle drift for {inst.role.value}: instance recorded version "
+                f"{inst.role_bundle_version!r} but current bundle is {bundle.version!r} "
+                "(bundle files changed since spawn(), or instance was never spawned)")
         adapter = self.adapters[inst.provider]
+        system_prompt = bundle.prompt
+        if inst.task_scope:
+            system_prompt = f"{bundle.prompt}\n\n## 할당 Scope\n{inst.task_scope}"
         session_id = await adapter.start_session(
             inst, initial_message,
-            system_prompt=bundle.prompt, output_schema=bundle.schema)
+            system_prompt=system_prompt, output_schema=bundle.schema)
         inst.session_id = session_id
         self.registry.upsert(inst, provider_ref=None)
         return session_id
+
+    def consume_result(self, inst: AgentInstance, outcome: TurnOutcome) -> str:
+        """Structured worker 결과를 상태 전이 문자열로 소비한다 (spec 결정 4, finding #3/#4).
+
+        `outcome.structured`가 dict가 아니거나 `status`가 roles.STATUS_ENUM 밖이면
+        malformed로 간주해 `MalformedResultEvent`를 남기고 "NEED_REPLAN"을 반환한다
+        (fail-closed — 신뢰할 수 없는 출력으로 상태를 전이시키지 않는다).
+
+        Role.REVIEWER는 예외다: `structured["status"]`는 검토를 "수행"했는지
+        (PASS=검토를 마쳤다, BLOCKED=검토 불가 등)를 나타낼 뿐 코드에 대한 판정이
+        아니다 — 코드 판정은 `structured["verdict"]`(PASS/NOT_PASS)에 있다
+        (roles/reviewer/prompt.md 보고 규칙). 그래서 Reviewer 결과의 전이값은
+        status가 아니라 verdict이며, verdict가 PASS/NOT_PASS가 아니면 이 역시
+        malformed로 처리한다. 다른 모든 role은 status를 그대로 전이값으로 쓴다.
+
+        정상 경로에서는 `WorkerResultEvent`를 남긴다 (payload: role, status, 그리고
+        Reviewer의 경우 verdict도 포함).
+        """
+        structured = outcome.structured
+        if not isinstance(structured, dict) or structured.get("status") not in STATUS_ENUM:
+            self.trace.append("MalformedResultEvent", task_id=inst.execution_id,
+                              execution_id=inst.execution_id, instance_id=inst.instance_id,
+                              payload={"role": inst.role.value, "raw": structured})
+            return "NEED_REPLAN"
+
+        status = structured["status"]
+        if inst.role is Role.REVIEWER:
+            verdict = structured.get("verdict")
+            if verdict not in ("PASS", "NOT_PASS"):
+                self.trace.append("MalformedResultEvent", task_id=inst.execution_id,
+                                  execution_id=inst.execution_id, instance_id=inst.instance_id,
+                                  payload={"role": inst.role.value, "raw": structured})
+                return "NEED_REPLAN"
+            payload = {"role": inst.role.value, "status": status, "verdict": verdict}
+            transition = verdict
+        else:
+            payload = {"role": inst.role.value, "status": status}
+            transition = status
+
+        self.trace.append("WorkerResultEvent", task_id=inst.execution_id,
+                          execution_id=inst.execution_id, instance_id=inst.instance_id,
+                          payload=payload)
+        return transition
 
     async def run_review_loop(self, dev_inst: AgentInstance, review_fn, fix_fn,
                               *, max_iterations: int = 5,

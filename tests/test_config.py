@@ -20,7 +20,33 @@ def test_invalid_effort_rejected(tmp_path):
     bad = tmp_path / "bad.yaml"
     bad.write_text(
         "tiers:\n  CHEAP: {provider: CLAUDE_CODE, model: claude-sonnet-5, effort: TURBO}\n"
+        "roleDefaults:\n  EXPLORER: {tier: CHEAP}\n")
+    with pytest.raises(ConfigError):
+        load(bad)
+
+
+def test_missing_role_defaults_section_rejected(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        "tiers:\n  CHEAP: {provider: CLAUDE_CODE, model: claude-sonnet-5, effort: LOW}\n")
+    with pytest.raises(ConfigError):
+        load(bad)
+
+
+def test_empty_role_defaults_rejected(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        "tiers:\n  CHEAP: {provider: CLAUDE_CODE, model: claude-sonnet-5, effort: LOW}\n"
         "roleDefaults: {}\n")
+    with pytest.raises(ConfigError):
+        load(bad)
+
+
+def test_role_default_unknown_tier_rejected(tmp_path):
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        "tiers:\n  CHEAP: {provider: CLAUDE_CODE, model: claude-sonnet-5, effort: LOW}\n"
+        "roleDefaults:\n  EXPLORER: {tier: NONEXISTENT}\n")
     with pytest.raises(ConfigError):
         load(bad)
 

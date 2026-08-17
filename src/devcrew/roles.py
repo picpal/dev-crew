@@ -12,7 +12,7 @@ from pathlib import Path
 from .schema import Role
 
 ROLES_DIR = Path(__file__).resolve().parents[2] / "roles"
-_STATUS_ENUM = ["PASS", "NOT_PASS", "NEED_REPLAN", "BLOCKED", "INSUFFICIENT_CAPABILITY"]
+STATUS_ENUM = ["PASS", "NOT_PASS", "NEED_REPLAN", "BLOCKED", "INSUFFICIENT_CAPABILITY"]
 
 
 class RoleBundleError(Exception):
@@ -43,7 +43,7 @@ def load_bundle(role: Role, roles_dir: str | Path | None = None) -> RoleBundle:
 def _validate_skeleton(role: Role, schema: dict) -> None:
     props = schema.get("properties") or {}
     status = props.get("status") or {}
-    if status.get("enum") != _STATUS_ENUM:
+    if status.get("enum") != STATUS_ENUM:
         raise RoleBundleError(f"{role.value}: status enum mismatch")
     if "summary" not in props or "status" not in (schema.get("required") or []):
         raise RoleBundleError(f"{role.value}: common skeleton missing")

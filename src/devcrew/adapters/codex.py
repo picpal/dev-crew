@@ -9,7 +9,7 @@ from ..enforcement import codex_session_kwargs
 from ..schema import AgentInstance, Usage
 from ..store.registry import SessionRegistry
 from ..store.trace import TraceStore
-from .base import TurnOutcome
+from .base import ResumeConfigMissingError, TurnOutcome
 
 
 def _usage_from_turn(result) -> Usage:
@@ -33,12 +33,15 @@ class CodexAdapter:
         self._threads: dict[str, object] = {}      # thread_id -> AsyncThread
         self._efforts: dict[str, str] = {}
         self._schemas: dict[str, dict | None] = {}  # thread_id -> output_schema, for send()
-        # thread_id -> {sandbox_name, cwd, approval_mode_name, effort, output_schema}:
-        # cached at start_session so resume() can re-pass the role's enforcement pin
-        # instead of falling back to thread_resume()'s own defaults (finding #2), and
-        # can restore the structured-output schema so post-resume turns keep forcing
-        # schema-conformant output (system_prompt/base_instructions is NOT restored
-        # here — same deferred gap B1 as claude_code.py's resume()).
+        # thread_id -> {sandbox_name, cwd, approval_mode_name, effort, output_schema,
+        # base_instructions}: cached at start_session so resume() can re-pass the
+        # role's enforcement pin instead of falling back to thread_resume()'s own
+        # defaults (finding #2), restore the structured-output schema so
+        # post-resume turns keep forcing schema-conformant output, and re-pass
+        # base_instructions (system_prompt) — installed openai_codex==0.144.4's
+        # AsyncCodex.thread_resume DOES accept base_instructions as a keyword
+        # (verified via inspect.signature(AsyncCodex.thread_resume), api.py:443-453),
+        # so unlike claude_code.py's resume() this is not a deferred gap here.
         self._session_config: dict[str, dict] = {}
 
     async def _client(self) -> AsyncCodex:
@@ -69,6 +72,7 @@ class CodexAdapter:
             "approval_mode_name": kw["approval_mode_name"],
             "effort": effort,
             "output_schema": output_schema,
+            "base_instructions": system_prompt,
         }
         await self.send(thread.id, initial_message)
         return thread.id
@@ -89,42 +93,54 @@ class CodexAdapter:
                            raw={"turn_id": result.id},
                            structured=structured)
 
-    async def resume(self, session_id: str, message: str) -> TurnOutcome:
-        """archive/disconnect 이후 thread를 재개한다 (#11).
+    async def resume(self, session_id: str, message: str, *,
+                      allow_unconfigured: bool = False) -> TurnOutcome:
+        """archive/disconnect 이후 thread를 재개한다 (#11, finding #2).
 
-        thread_resume()에 sandbox/cwd/approval_mode를 다시 넘기지 않으면 원 thread의
-        enforcement 핀(예: REVIEWER의 read_only sandbox, deny_all approval)이 조용히
-        thread_resume() 자체 기본값으로 완화될 수 있다 — 여기서는 start_session이
-        캐시해 둔 설정을 재전달해 그 핀을 유지한다.
+        thread_resume()에 sandbox/cwd/approval_mode/base_instructions를 다시 넘기지
+        않으면 원 thread의 enforcement 핀(예: REVIEWER의 read_only sandbox, deny_all
+        approval, role prompt)이 조용히 thread_resume() 자체 기본값으로 완화될 수
+        있다 — 여기서는 start_session이 캐시해 둔 설정을 재전달해 그 핀을 유지한다.
+        base_instructions는 installed openai_codex==0.144.4의
+        AsyncCodex.thread_resume이 실제로 받는 키워드다 (inspect.signature로 확인:
+        `approval_mode, base_instructions, config, cwd, developer_instructions,
+        model, model_provider, personality, sandbox, service_tier` — api.py:443-453),
+        그래서 claude_code.py의 resume()과 달리 이 경로는 system_prompt를 재주입할
+        수 있고 deferred B1 대상이 아니다.
 
-        effort는 thread_resume() 파라미터가 아니다 (installed openai_codex==0.144.4
-        AsyncCodex.thread_resume은 approval_mode/base_instructions/config/cwd/
-        developer_instructions/model/model_provider/personality/sandbox/service_tier만
-        받는다 — api.py:443-453). effort와 output_schema는 모두 turn 단위 인자
-        (thread.run(effort=..., output_schema=...))이므로 여기서는 self._efforts와
-        self._schemas를 복원해 이어지는 send()가 둘 다 None을 넘기지 않게 한다.
-        base_instructions(system_prompt)는 캐시하지 않으므로 resume 이후에는
-        재적용되지 않는다 — claude_code.py의 동일 갭(B1)과 같은 성격.
+        effort는 thread_resume() 파라미터가 아니다 — effort와 output_schema는 모두
+        turn 단위 인자(thread.run(effort=..., output_schema=...))이므로 여기서는
+        self._efforts와 self._schemas를 복원해 이어지는 send()가 둘 다 None을
+        넘기지 않게 한다.
 
-        한계: 캐시는 이 adapter 인스턴스의 메모리에만 있다. start_session을 거치지
-        않은 session_id로 resume()이 불리면(예: 프로세스 재시작 후 recovery — Claude
-        adapter의 동일 갭이 deferred B1로 등재돼 있다) 캐시가 비어 있어 thread_resume()
-        기본값을 그대로 쓰게 된다. Cross-process 복구는 registry에 provider_ref로
-        thread_id를 색인하는 후속 작업이 필요하며 이번 fix wave 범위 밖이다.
+        캐시(_session_config)는 이 adapter 인스턴스의 메모리에만 있다.
+        start_session을 거치지 않은 session_id로 resume()이 불리면(예: 프로세스
+        재시작 후 recovery) 기본적으로 ResumeConfigMissingError로 fail-closed
+        한다 — claude_code.py의 동일한 finding #1 수정과 대칭. 의도적으로 설정 없는
+        재개가 필요한 호출자는 allow_unconfigured=True를 넘겨야 한다. Cross-process
+        복구는 registry에 provider_ref로 thread_id를 색인하는 후속 작업이 필요하며
+        이번 fix wave 범위 밖이다(deferred).
         """
         codex = await self._client()
         config = self._session_config.get(session_id)
-        if config is not None:
+        if config is None:
+            if not allow_unconfigured:
+                raise ResumeConfigMissingError(
+                    f"no cached start config for thread {session_id} in this adapter "
+                    "instance; pass allow_unconfigured=True to resume without role "
+                    "enforcement/output schema (deferred cross-process recovery)"
+                )
+            resumed = await codex.thread_resume(session_id)
+        else:
             resumed = await codex.thread_resume(
                 session_id,
                 sandbox=Sandbox[config["sandbox_name"]],
                 cwd=config["cwd"],
                 approval_mode=ApprovalMode[config["approval_mode_name"]],
+                base_instructions=config.get("base_instructions"),
             )
             self._efforts[session_id] = config["effort"]
             self._schemas[session_id] = config.get("output_schema")
-        else:
-            resumed = await codex.thread_resume(session_id)
         self._threads[session_id] = resumed
         return await self.send(session_id, message)
 

@@ -8,6 +8,19 @@ from typing import Protocol
 from ..schema import AgentInstance, Usage
 
 
+class ResumeConfigMissingError(Exception):
+    """resume()이 호출된 session_id에 이 adapter 인스턴스의 로컬 시작 설정 캐시가
+    없을 때 발생 (예: cross-process 재시작 후 새 adapter 인스턴스에서 resume 호출).
+
+    캐시 없이 resume하면 role system prompt/output schema/tool allowlist/
+    can_use_tool/sandbox 등 시작 시점 enforcement가 SDK/provider 기본값으로
+    조용히 폴백해 role 경계와 구조화 출력 강제를 우회할 수 있다 — 그래서 fail-closed
+    한다. Cross-process 복구가 필요한 호출자는 resume(..., allow_unconfigured=True)
+    로 의도적으로 이 검사를 건너뛸 수 있다 (registry 기반 cross-process 설정 복원은
+    deferred B1, 이번 fix wave 범위 밖).
+    """
+
+
 @dataclass(frozen=True)
 class TurnOutcome:
     text: str

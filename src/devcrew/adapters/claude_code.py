@@ -9,7 +9,7 @@ from ..enforcement import claude_options_kwargs, make_can_use_tool
 from ..schema import AgentInstance, Usage
 from ..store.registry import SessionRegistry
 from ..store.trace import TraceStore
-from .base import TurnOutcome
+from .base import ResumeConfigMissingError, TurnOutcome
 
 
 def _usage_from_result(result_msg) -> Usage:
@@ -36,6 +36,9 @@ class ClaudeCodeAdapter:
         self.trace = trace
         self.registry = registry
         self._clients: dict[str, ClaudeSDKClient] = {}
+        # session_id -> start_session()이 사용한 옵션. resume()이 이를 재주입해
+        # role enforcement/구조화 출력 강제를 유지한다 (finding #1).
+        self._start_opts: dict[str, dict] = {}
 
     async def start_session(self, inst: AgentInstance, initial_message: str, *,
                              system_prompt: str | None = None,
@@ -55,6 +58,15 @@ class ClaudeCodeAdapter:
         outcome = await self._turn(client, initial_message)
         session_id = outcome.raw["session_id"]
         self._clients[session_id] = client
+        self._start_opts[session_id] = {
+            "system_prompt": system_prompt,
+            "output_schema": output_schema,
+            "role": inst.role,
+            "worktree": inst.worktree,
+            "model": inst.model,
+            "effort": inst.effort_level.value.lower(),
+            "execution_id": inst.execution_id,
+        }
         return session_id
 
     async def _turn(self, client: ClaudeSDKClient, message: str) -> TurnOutcome:
@@ -79,16 +91,45 @@ class ClaudeCodeAdapter:
     async def send(self, session_id: str, message: str) -> TurnOutcome:
         return await self._turn(self._clients[session_id], message)
 
-    async def resume(self, session_id: str, message: str) -> TurnOutcome:
-        """프로세스 재시작 후 경로 — 새 client를 resume 옵션으로 연결.
+    async def resume(self, session_id: str, message: str, *,
+                      allow_unconfigured: bool = False) -> TurnOutcome:
+        """세션 재개 — start_session에서 캐시해 둔 시작 설정을 재주입한다 (finding #1).
 
-        system_prompt/output_format은 여기서 재주입하지 않는다 (deferred gap B1,
-        범위 밖) — start_session에서만 지정되고 resume 경로는 ClaudeAgentOptions의
-        기본값을 그대로 쓴다. Cross-process recovery 후 structured output이 필요한
-        turn을 resume으로 이어가면 output_format이 비어 있어 TurnOutcome.structured가
-        None이 될 수 있다.
+        같은 adapter 인스턴스에서 이 session_id로 start_session이 먼저 호출됐다면
+        system_prompt/output_format/allowed_tools/permission_mode/can_use_tool/cwd/
+        model/effort를 모두 복원해 role 경계와 구조화 출력 강제가 resume 이후에도
+        유지된다.
+
+        캐시가 없으면 (예: 프로세스 재시작으로 새 adapter 인스턴스가 만들어진 경우)
+        기본적으로 ResumeConfigMissingError로 fail-closed 한다 — enforcement 없이
+        조용히 resume을 허용하면 이전의 fail-open 취약점이 재발한다. Cross-process
+        recovery처럼 의도적으로 설정 없는 resume이 필요한 호출자는
+        allow_unconfigured=True를 넘겨야 한다 (poc/p06_recovery.py phase_b가 이
+        경로를 쓴다 — registry 기반 cross-process 설정 복원은 deferred B1, 범위 밖).
         """
-        options = ClaudeAgentOptions(resume=session_id)
+        opts = self._start_opts.get(session_id)
+        if opts is None:
+            if not allow_unconfigured:
+                raise ResumeConfigMissingError(
+                    f"no cached start config for session {session_id} in this adapter "
+                    "instance; pass allow_unconfigured=True to resume without role "
+                    "enforcement/output schema (deferred B1)"
+                )
+            options = ClaudeAgentOptions(resume=session_id)
+        else:
+            kw = claude_options_kwargs(opts["role"], cwd=opts["worktree"])
+            options = ClaudeAgentOptions(
+                resume=session_id,
+                model=opts["model"],
+                effort=opts["effort"],
+                can_use_tool=make_can_use_tool(opts["role"], self.trace,
+                                               task_id=opts["execution_id"],
+                                               workspace_root=opts["worktree"]),
+                system_prompt=opts["system_prompt"],
+                output_format={"type": "json_schema", "schema": opts["output_schema"]}
+                if opts["output_schema"] else None,
+                **kw,
+            )
         client = ClaudeSDKClient(options)
         await client.connect()
         self._clients[session_id] = client

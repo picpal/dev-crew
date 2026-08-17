@@ -39,6 +39,9 @@ def load(path: str | Path | None = None) -> HarnessConfig:
     if not p.exists():
         raise ConfigError(f"config not found: {p}")
     raw = yaml.safe_load(p.read_text())
+    raw_role_defaults = raw.get("roleDefaults")
+    if not raw_role_defaults:
+        raise ConfigError(f"config has no roleDefaults: {p}")
     try:
         tiers = {
             name: TierSpec(Provider(t["provider"]), t["model"], EffortLevel(t["effort"]))
@@ -47,10 +50,14 @@ def load(path: str | Path | None = None) -> HarnessConfig:
         role_defaults = {
             Role(name): RoleDefault(d["tier"],
                                     EffortLevel(d["effort"]) if d.get("effort") else None)
-            for name, d in (raw.get("roleDefaults") or {}).items()
+            for name, d in raw_role_defaults.items()
         }
     except (KeyError, ValueError) as e:
         raise ConfigError(f"invalid config {p}: {e}") from e
     if not tiers:
         raise ConfigError(f"config has no tiers: {p}")
+    unknown_tiers = {rd.tier for rd in role_defaults.values()} - set(tiers)
+    if unknown_tiers:
+        raise ConfigError(
+            f"roleDefaults reference unknown tiers {sorted(unknown_tiers)}: {p}")
     return HarnessConfig(tiers=tiers, role_defaults=role_defaults)

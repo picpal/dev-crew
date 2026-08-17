@@ -1,6 +1,8 @@
-from devcrew.adapters.base import FakeAdapter
+import pytest
+from devcrew.adapters.base import FakeAdapter, TurnOutcome
 from devcrew.orchestrator import Orchestrator, ReviewQueue
-from devcrew.schema import EffortLevel, Provider, Role
+from devcrew.roles import RoleBundleError
+from devcrew.schema import EffortLevel, Provider, Role, Usage
 from devcrew.store.registry import SessionRegistry
 from devcrew.store.trace import TraceStore
 
@@ -101,3 +103,59 @@ async def test_spawn_without_bundle_for_out_of_scope_role(tmp_path):
     inst = await orch.spawn(Role.ARCHITECT, "DEFAULT", execution_id="E1",
                             node_id="n1", task_scope="*")
     assert inst.role_bundle_version is None
+
+
+async def test_start_worker_injects_task_scope(tmp_path):
+    orch, _, _ = make_orch(tmp_path, FakeAdapter(structured_script=[{"status": "PASS", "summary": "ok"}]))
+    fake = orch.adapters[Provider.CLAUDE_CODE]
+    inst = await orch.spawn(Role.QA, "CHEAP", execution_id="E1",
+                            node_id="n1", task_scope="파일 X만 수정")
+    await orch.start_worker(inst, "검증 시작")
+    assert fake.last_system_prompt.endswith("파일 X만 수정")
+
+
+async def test_start_worker_rejects_bundle_version_drift(tmp_path):
+    orch, _, _ = make_orch(tmp_path)
+    inst = await orch.spawn(Role.QA, "CHEAP", execution_id="E1",
+                            node_id="n1", task_scope="*")
+    inst.role_bundle_version = "tampered"     # bundle 변경/조작 시뮬레이션 (finding #5)
+    with pytest.raises(RoleBundleError):
+        await orch.start_worker(inst, "검증 시작")
+
+
+async def test_consume_result_valid_explorer_pass(tmp_path):
+    orch, trace, _ = make_orch(tmp_path)
+    inst = await orch.spawn(Role.EXPLORER, "CHEAP", execution_id="E1",
+                            node_id="n1", task_scope="*")
+    outcome = TurnOutcome(text="", usage=Usage(),
+                          structured={"status": "PASS", "summary": "ok", "findings": []})
+    result = orch.consume_result(inst, outcome)
+    assert result == "PASS"
+    evs = trace.events(event_type="WorkerResultEvent")
+    assert evs[0]["payload"] == {"role": "EXPLORER", "status": "PASS"}
+
+
+async def test_consume_result_reviewer_uses_verdict_not_status(tmp_path):
+    orch, trace, _ = make_orch(tmp_path)
+    inst = await orch.spawn(Role.REVIEWER, "CODEX_DEFAULT", execution_id="E1",
+                            node_id="n1", task_scope="*")
+    # status=PASS(검토를 마쳤다)이어도 verdict=NOT_PASS(코드가 실패)면 전이는 NOT_PASS.
+    outcome = TurnOutcome(text="", usage=Usage(),
+                          structured={"status": "PASS", "summary": "ok",
+                                      "verdict": "NOT_PASS", "findings": []})
+    result = orch.consume_result(inst, outcome)
+    assert result == "NOT_PASS"
+    evs = trace.events(event_type="WorkerResultEvent")
+    assert evs[0]["payload"] == {"role": "REVIEWER", "status": "PASS", "verdict": "NOT_PASS"}
+
+
+async def test_consume_result_malformed_structured_logs_event(tmp_path):
+    orch, trace, _ = make_orch(tmp_path)
+    inst = await orch.spawn(Role.EXPLORER, "CHEAP", execution_id="E1",
+                            node_id="n1", task_scope="*")
+    outcome = TurnOutcome(text="", usage=Usage(), structured=None)
+    result = orch.consume_result(inst, outcome)
+    assert result == "NEED_REPLAN"
+    evs = trace.events(event_type="MalformedResultEvent")
+    assert len(evs) == 1
+    assert evs[0]["payload"]["role"] == "EXPLORER"
