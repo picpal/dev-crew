@@ -39,6 +39,7 @@ class ProviderAdapter(Protocol):
     async def cancel(self, session_id: str) -> str: ...
     async def archive(self, session_id: str) -> str: ...
     async def get_usage(self, session_id: str) -> Usage: ...
+    async def initial_usage(self, session_id: str) -> Usage | None: ...
 
 
 class FakeAdapter:
@@ -92,3 +93,8 @@ class FakeAdapter:
 
     async def get_usage(self, session_id: str) -> Usage:
         return Usage(output_tokens=self.turns.get(session_id, 0), raw={"fake": True})
+
+    async def initial_usage(self, session_id: str) -> Usage | None:
+        # FakeAdapter.start_session은(실 어댑터와 달리) 최초 메시지에 대해 turn을
+        # 실행하지 않는다 — 버릴 usage 자체가 없으므로 항상 None (finding #6).
+        return None

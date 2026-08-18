@@ -47,3 +47,29 @@ def _validate_skeleton(role: Role, schema: dict) -> None:
         raise RoleBundleError(f"{role.value}: status enum mismatch")
     if "summary" not in props or "status" not in (schema.get("required") or []):
         raise RoleBundleError(f"{role.value}: common skeleton missing")
+
+
+def missing_required_keys(schema: dict, data, *, path: str = "") -> list[str]:
+    """경량 required-키 재귀 검사 (finding #2/#3) — jsonschema 의존성 없이 schema의
+    `required` 목록에 있는 키가 `data`에 전부 존재하는지만 확인한다. 값이 dict인
+    property는 그 object schema의 `required`도 재귀 확인한다. 타입 검증은 하지
+    않는다 — provider 네이티브 출력 강제(output_schema)가 1차 방어라는 기존 spec
+    결정을 유지하고, 여기서는 그 강제를 우회한 malformed 출력(예: 필수 필드 누락)만
+    잡는 2차 방어다.
+
+    반환값은 누락된 키의 경로 목록이다 (예: `["decision.rationale"]`). 빈 리스트면
+    통과. `data`가 dict가 아니면 스키마 자체가 object를 기대하므로 그 지점을
+    통째로 누락 취급한다.
+    """
+    if not isinstance(data, dict):
+        return [path or "$"]
+    missing: list[str] = []
+    for key in schema.get("required") or []:
+        if key not in data:
+            missing.append(f"{path}.{key}" if path else key)
+    for key, subschema in (schema.get("properties") or {}).items():
+        if (isinstance(subschema, dict) and subschema.get("type") == "object"
+                and isinstance(data.get(key), dict)):
+            missing.extend(missing_required_keys(
+                subschema, data[key], path=f"{path}.{key}" if path else key))
+    return missing
