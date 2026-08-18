@@ -42,7 +42,8 @@ class ClaudeCodeAdapter:
 
     async def start_session(self, inst: AgentInstance, initial_message: str, *,
                              system_prompt: str | None = None,
-                             output_schema: dict | None = None) -> str:
+                             output_schema: dict | None = None,
+                             mcp_servers: dict | None = None) -> str:
         kw = claude_options_kwargs(inst.role, cwd=inst.worktree)
         options = ClaudeAgentOptions(
             model=inst.model,
@@ -51,6 +52,7 @@ class ClaudeCodeAdapter:
                                            workspace_root=inst.worktree),
             system_prompt=system_prompt,
             output_format={"type": "json_schema", "schema": output_schema} if output_schema else None,
+            mcp_servers=mcp_servers or {},
             **kw,
         )
         client = ClaudeSDKClient(options)
@@ -61,6 +63,7 @@ class ClaudeCodeAdapter:
         self._start_opts[session_id] = {
             "system_prompt": system_prompt,
             "output_schema": output_schema,
+            "mcp_servers": mcp_servers,
             "role": inst.role,
             "worktree": inst.worktree,
             "model": inst.model,
@@ -96,9 +99,9 @@ class ClaudeCodeAdapter:
         """세션 재개 — start_session에서 캐시해 둔 시작 설정을 재주입한다 (finding #1).
 
         같은 adapter 인스턴스에서 이 session_id로 start_session이 먼저 호출됐다면
-        system_prompt/output_format/allowed_tools/permission_mode/can_use_tool/cwd/
-        model/effort를 모두 복원해 role 경계와 구조화 출력 강제가 resume 이후에도
-        유지된다.
+        system_prompt/output_format/mcp_servers/allowed_tools/permission_mode/
+        can_use_tool/cwd/model/effort를 모두 복원해 role 경계와 구조화 출력 강제,
+        harness MCP tool 노출이 resume 이후에도 유지된다 (Task 6).
 
         캐시가 없으면 (예: 프로세스 재시작으로 새 adapter 인스턴스가 만들어진 경우)
         기본적으로 ResumeConfigMissingError로 fail-closed 한다 — enforcement 없이
@@ -128,6 +131,7 @@ class ClaudeCodeAdapter:
                 system_prompt=opts["system_prompt"],
                 output_format={"type": "json_schema", "schema": opts["output_schema"]}
                 if opts["output_schema"] else None,
+                mcp_servers=opts.get("mcp_servers") or {},
                 **kw,
             )
         client = ClaudeSDKClient(options)

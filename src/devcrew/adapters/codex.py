@@ -52,7 +52,14 @@ class CodexAdapter:
 
     async def start_session(self, inst: AgentInstance, initial_message: str, *,
                              system_prompt: str | None = None,
-                             output_schema: dict | None = None) -> str:
+                             output_schema: dict | None = None,
+                             mcp_servers: dict | None = None) -> str:
+        if mcp_servers:
+            # Orchestrator는 항상 Claude로 고정된다(§5.1) — codex 어댑터에 harness
+            # mcp_servers가 전달되는 건 호출자 배선 오류다. 조용히 무시하면 ORCHESTRATOR가
+            # harness MCP tool 없이 기동해 결정 세션이 조회 불능 상태로 새는 걸 놓친다
+            # (fail-fast, 조용한 기본값 금지).
+            raise ValueError("codex adapter does not support harness mcp_servers")
         codex = await self._client()
         kw = codex_session_kwargs(inst.role, cwd=inst.worktree)
         thread = await codex.thread_start(

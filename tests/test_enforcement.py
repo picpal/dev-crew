@@ -11,8 +11,12 @@ def test_role_policy_matches_design_3_4():
     # Developer는 Write를 scoped_write_tools로 관리 (경로 제한)
     assert "Write" not in ROLE_POLICY[Role.DEVELOPER].allowed_tools
     assert "Write" in ROLE_POLICY[Role.DEVELOPER].scoped_write_tools
-    # Orchestrator는 repo tool 전무 (#13, 불변 조건 2)
-    assert ROLE_POLICY[Role.ORCHESTRATOR].allowed_tools == []
+    # Orchestrator는 repo tool 전무(#13, 불변 조건 2) — harness MCP read-only tool
+    # 3종만 허용된다(Task 6).
+    assert ROLE_POLICY[Role.ORCHESTRATOR].allowed_tools == [
+        "mcp__harness__get_execution_state", "mcp__harness__get_worker_result",
+        "mcp__harness__get_trace_events"]
+    assert not ROLE_POLICY[Role.ORCHESTRATOR].scoped_write_tools
     assert ROLE_POLICY[Role.REVIEWER].sandbox == "read-only"
 
 
