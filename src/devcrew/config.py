@@ -10,9 +10,7 @@ from .schema import EffortLevel, Provider, Role
 
 DEFAULT_PATH = Path(__file__).resolve().parents[2] / "config" / "harness.yaml"
 
-# ORCHESTRATOR는 routing 대상이 아니므로 roleDefaults 완전성 검사에서 제외한다
-# (spec 결정 2 — orchestrator는 role bundle/tier routing 밖).
-REQUIRED_ROLE_DEFAULTS = frozenset(Role) - {Role.ORCHESTRATOR}
+REQUIRED_ROLE_DEFAULTS = frozenset(Role)
 
 
 class ConfigError(Exception):
@@ -33,9 +31,18 @@ class RoleDefault:
 
 
 @dataclass(frozen=True)
+class LoopPolicy:
+    max_iterations: int
+    max_duration_minutes: int
+    max_token_budget: int
+    same_finding_escalation_threshold: int
+
+
+@dataclass(frozen=True)
 class HarnessConfig:
     tiers: dict[str, TierSpec]
     role_defaults: dict[Role, RoleDefault]
+    loop_policy: LoopPolicy
 
 
 def load(path: str | Path | None = None) -> HarnessConfig:
@@ -69,4 +76,15 @@ def load(path: str | Path | None = None) -> HarnessConfig:
         raise ConfigError(
             f"roleDefaults missing required roles "
             f"{sorted(r.value for r in missing_roles)}: {p}")
-    return HarnessConfig(tiers=tiers, role_defaults=role_defaults)
+    raw_lp = raw.get("loopPolicy")
+    if not raw_lp:
+        raise ConfigError(f"config has no loopPolicy: {p}")
+    try:
+        lp = LoopPolicy(int(raw_lp["maxIterations"]), int(raw_lp["maxDurationMinutes"]),
+                        int(raw_lp["maxTokenBudget"]), int(raw_lp["sameFindingEscalationThreshold"]))
+    except (KeyError, ValueError, TypeError) as e:
+        raise ConfigError(f"invalid loopPolicy {p}: {e}") from e
+    if min(lp.max_iterations, lp.max_duration_minutes, lp.max_token_budget,
+           lp.same_finding_escalation_threshold) <= 0:
+        raise ConfigError(f"loopPolicy values must be positive: {p}")
+    return HarnessConfig(tiers=tiers, role_defaults=role_defaults, loop_policy=lp)

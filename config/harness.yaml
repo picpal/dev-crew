@@ -7,9 +7,17 @@ tiers:
   CODEX_HIGH_REASONING: { provider: CODEX,       model: gpt-5.6-sol,     effort: HIGH }
 
 roleDefaults:
+  ORCHESTRATOR: { tier: HIGH_CAPABILITY }
   EXPLORER:  { tier: CHEAP }
   ARCHITECT: { tier: DEFAULT }
   DEVELOPER: { tier: DEFAULT }
   SECURITY:  { tier: DEFAULT, effort: HIGH }
   QA:        { tier: CHEAP }
   REVIEWER:  { tier: CODEX_DEFAULT }
+
+# §10.3 loop guard — Task 실패가 아니라 결정 지점 진입 조건
+loopPolicy:
+  maxIterations: 5
+  maxDurationMinutes: 60
+  maxTokenBudget: 300000
+  sameFindingEscalationThreshold: 3
