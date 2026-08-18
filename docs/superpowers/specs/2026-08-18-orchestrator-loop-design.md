@@ -34,7 +34,8 @@
    패키징해 새 ORCHESTRATOR instance를 spawn (기존 spawn/start_worker 배관 재사용).
    구조화 출력이 곧 결정 — 별도 제출 tool 없음. 결정 스키마:
    `{status, summary, decision: {action, target_node, rationale}}`,
-   action enum: `RETRY_NODE | ESCALATE_MODEL | SKIP_NODE | REPLAN | ASK_USER | ABORT`.
+   action enum: `PROCEED | RETRY_NODE | ESCALATE_MODEL | SKIP_NODE | REPLAN | ASK_USER | ABORT`
+   (`PROCEED`는 CLASSIFY 등에서 "템플릿대로 진행" 결정, `target_node`는 nullable).
    엔진은 결정을 허용 목록과 대조 검증 후 적용한다. 허용 밖 action·malformed는
    1회 재시도 후 `ASK_USER`(HUMAN)로 강등 — fail-closed.
 4. **Orchestrator role bundle 신설**: `roles/orchestrator/{prompt.md,
