@@ -24,9 +24,14 @@ def test_role_specific_fields():
     assert "results" in load_bundle(Role.QA).schema["properties"]
 
 
-def test_missing_bundle_fail_fast():
-    with pytest.raises(RoleBundleError):
-        load_bundle(Role.ORCHESTRATOR)    # 이번 effort 범위 밖 — 번들 없음
+def test_orchestrator_bundle_loads():
+    b = load_bundle(Role.ORCHESTRATOR)
+    props = b.schema["properties"]
+    d = props["decision"]["properties"]
+    assert d["action"]["enum"] == ["PROCEED", "RETRY_NODE", "ESCALATE_MODEL",
+                                  "SKIP_NODE", "REPLAN", "ASK_USER", "ABORT"]
+    assert d["target_node"]["type"] == ["string", "null"]
+    _assert_strict(b.schema)
 
 
 def _assert_strict(obj):
