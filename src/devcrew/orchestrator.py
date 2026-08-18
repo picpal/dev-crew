@@ -1,4 +1,6 @@
-"""Orchestrator 원시 연산 — spawn/escalation(§7.6), bounded loop(§10), queue(§9.1).
+"""Orchestrator 원시 연산 — spawn/escalation(§7.6), consume_result 전이 판정(§10),
+queue(§9.1). Bounded loop/decision 오케스트레이션 자체는 `WorkflowEngine`(engine.py,
+§10) 몫이다.
 
 POC 범위: 상태 전이와 이벤트 기록의 실행 가능성 증명. Slack/Task Service는 미포함.
 """
@@ -19,13 +21,6 @@ _EFFORT_BY_STR = {"low": EffortLevel.LOW, "medium": EffortLevel.MEDIUM,
                   "max": EffortLevel.MAX}
 
 WORKER_ROLES = {Role.EXPLORER, Role.DEVELOPER, Role.REVIEWER, Role.QA}
-
-
-@dataclass(frozen=True)
-class LoopResult:
-    passed: bool
-    iterations: int
-    escalated: bool
 
 
 class ReviewQueue:
@@ -138,12 +133,13 @@ class Orchestrator:
         (fail-closed — 신뢰할 수 없는 출력으로 상태를 전이시키지 않는다).
 
         전이 판정에 쓰는 role은 `as_role or inst.role`이다. 기본은 `inst.role`이지만,
-        `outcome`이 `inst`와 다른 role의 결과일 때(예: `run_review_loop`가 DEVELOPER
-        `dev_inst`로 루프를 돌지만 `review_fn`이 돌려주는 `TurnOutcome`은 Reviewer의
-        결과인 경우) 호출자가 `as_role=Role.REVIEWER`로 실제 판정 규칙을 명시해야
-        한다 — 그렇지 않으면 `inst.role`(DEVELOPER)로 판정해 Reviewer의 verdict가
-        완전히 무시되고 `{status: PASS, verdict: NOT_PASS}`가 status만으로 성공
-        처리되는 버그가 재발한다(재재리뷰 신규 finding).
+        `outcome`이 `inst`와 다른 role의 결과일 때 호출자가 `as_role=Role.REVIEWER`로
+        실제 판정 규칙을 명시해야 한다 — 그렇지 않으면 `inst.role`로 판정해 Reviewer의
+        verdict가 완전히 무시되고 `{status: PASS, verdict: NOT_PASS}`가 status만으로
+        성공 처리되는 버그가 재발한다(재재리뷰 신규 finding). `WorkflowEngine`(§10)은
+        모든 `TurnOutcome`을 그 결과를 생산한 노드의 instance로 전달하므로(예: review
+        노드의 결과는 그 노드의 Reviewer instance로) `as_role` 없이도 `inst.role`이
+        항상 정확한 판정 role이다.
 
         판정 role이 REVIEWER인 경우는 예외다: `structured["status"]`는 검토를
         "수행"했는지(PASS=검토를 마쳤다, BLOCKED=검토 불가 등)를 나타낼 뿐 코드에
@@ -158,6 +154,9 @@ class Orchestrator:
 
         정상 경로에서는 `WorkerResultEvent`를 남긴다 (payload: 판정에 쓰인 role,
         status, 그리고 REVIEWER 판정이 실제로 검토를 마친 경우 verdict도 포함).
+        `structured` 전문도 payload에 포함한다 (MCP get_worker_result의 데이터 소스;
+        §5 constraint상 프롬프트 원문이 아니라 구조화 결과이므로 trace payload에
+        남겨도 무방하다).
         """
         role = as_role or inst.role
         structured = outcome.structured
@@ -175,43 +174,14 @@ class Orchestrator:
                                   execution_id=inst.execution_id, instance_id=inst.instance_id,
                                   payload={"role": role.value, "raw": structured})
                 return "NEED_REPLAN"
-            payload = {"role": role.value, "status": status, "verdict": verdict}
+            payload = {"role": role.value, "status": status, "verdict": verdict,
+                      "structured": structured}
             transition = verdict
         else:
-            payload = {"role": role.value, "status": status}
+            payload = {"role": role.value, "status": status, "structured": structured}
             transition = status
 
         self.trace.append("WorkerResultEvent", task_id=inst.execution_id,
                           execution_id=inst.execution_id, instance_id=inst.instance_id,
                           payload=payload)
         return transition
-
-    async def run_review_loop(self, dev_inst: AgentInstance, review_fn, fix_fn,
-                              *, max_iterations: int = 5,
-                              same_finding_threshold: int = 3) -> LoopResult:
-        """Bounded review loop (§10). `review_fn`은 str 전이값 또는 `TurnOutcome`을
-        반환할 수 있다 — `TurnOutcome`이면 `consume_result()` 경계를 통과시켜 구조화
-        출력 검증/Reviewer verdict 규칙을 적용한 전이값을 얻는다(재리뷰 finding #3
-        통합). `review_fn`의 결과는 항상 Reviewer의 출력이므로(루프를 돌리는
-        `dev_inst`가 어떤 role이든) `as_role=Role.REVIEWER`로 판정 규칙을 고정한다
-        — `dev_inst.role`(보통 DEVELOPER)로 판정하면 verdict가 무시되고 status만으로
-        전이가 결정돼 `{status: PASS, verdict: NOT_PASS}`가 잘못 통과 처리된다
-        (wave 3 신규 finding). 기존 str 반환 호출자는 그대로 동작한다(하위호환).
-        """
-        last_finding, same_count = None, 0
-        for i in range(1, max_iterations + 1):
-            ret = await review_fn(dev_inst)
-            verdict = (self.consume_result(dev_inst, ret, as_role=Role.REVIEWER)
-                      if isinstance(ret, TurnOutcome) else ret)
-            self.trace.append("LoopEvent", task_id=dev_inst.execution_id,
-                              execution_id=dev_inst.execution_id,
-                              instance_id=dev_inst.instance_id,
-                              payload={"iteration": i, "verdict": verdict})
-            if verdict.startswith("PASS"):
-                return LoopResult(passed=True, iterations=i, escalated=False)
-            same_count = same_count + 1 if verdict == last_finding else 1
-            last_finding = verdict
-            if same_count >= same_finding_threshold:
-                return LoopResult(passed=False, iterations=i, escalated=True)
-            await fix_fn(dev_inst)
-        return LoopResult(passed=False, iterations=max_iterations, escalated=True)
