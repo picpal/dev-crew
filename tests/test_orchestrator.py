@@ -148,6 +148,25 @@ async def test_consume_result_valid_status_but_missing_required_fields_is_malfor
     assert evs[0]["payload"]["role"] == "DEVELOPER"
 
 
+async def test_consume_result_reviewer_findings_array_item_missing_fields_is_malformed(tmp_path):
+    """wave 2 F2 회귀: codex 재리뷰가 재현한 그대로 — top-level/verdict는 다 갖춘
+    REVIEWER 결과라도 findings 배열의 원소 내부(severity/file/line/description)가
+    비어 있으면(`findings: [{}]`) malformed로 강등돼야 한다. wave 1의
+    missing_required_keys()는 array item으로 재귀하지 않아 이 케이스를 그대로
+    PASS 처리했다(빈 누락 목록)."""
+    orch, trace, _ = make_orch(tmp_path)
+    inst = await orch.spawn(Role.REVIEWER, "CODEX_DEFAULT", execution_id="E1",
+                            node_id="n1", task_scope="*")
+    outcome = TurnOutcome(text="", usage=Usage(),
+                          structured={"status": "PASS", "summary": "ok",
+                                      "verdict": "PASS", "findings": [{}]})
+    result = orch.consume_result(inst, outcome)
+    assert result == "NEED_REPLAN"
+    evs = trace.events(event_type="MalformedResultEvent")
+    assert len(evs) == 1
+    assert evs[0]["payload"]["role"] == "REVIEWER"
+
+
 async def test_consume_result_reviewer_blocked_status_not_overridden_by_verdict(tmp_path):
     """재리뷰 신규 finding: status=BLOCKED(검토 불가)면 verdict=PASS라도 BLOCKED를
     그대로 전파해야 한다 — verdict는 status가 PASS(검토를 실제로 마쳤을 때)일 때만

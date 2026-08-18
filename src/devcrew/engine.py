@@ -149,8 +149,13 @@ class WorkflowEngine:
                                  worker_result: dict | None) -> tuple[dict, str | None, int]:
             """decide_fn을 호출해 (raw_decision, producer_instance_id, usage_tokens)를
             반환한다 (finding #5/#6 계약). decide_fn이 없거나, 예외를 내거나, 이
-            3-tuple 계약을 지키지 않으면 ASK_USER로 강등한다 (finding #4, fail-closed
-            — engine 경계에서도 callback을 신뢰하지 않는다).
+            3-tuple 계약(shape *및* 각 원소의 타입: dict with "action", str | None,
+            int 아닌 bool 제외)을 지키지 않으면 ASK_USER로 강등한다 (finding #4,
+            fail-closed — engine 경계에서도 callback을 신뢰하지 않는다). wave 1은
+            튜플 길이/첫 원소만 검사해 `usage_tokens="bad-usage"`처럼 나머지 원소가
+            잘못된 타입이면 `total_tokens += usage_tokens`에서 TypeError가 그대로
+            누출됐다 — 여기서 producer_id/usage_tokens의 타입도 함께 검증한다.
+            bool은 `isinstance(x, int)`가 True이므로 별도로 배제한다.
             """
             nonlocal decisions
             decisions += 1
@@ -163,9 +168,11 @@ class WorkflowEngine:
                 return ({"action": "ASK_USER", "target_node": None,
                         "rationale": f"decide_fn raised: {e!r}"}, None, 0)
             if (isinstance(result, tuple) and len(result) == 3
-                    and isinstance(result[0], dict) and "action" in result[0]):
+                    and isinstance(result[0], dict) and "action" in result[0]
+                    and (result[1] is None or isinstance(result[1], str))
+                    and isinstance(result[2], int) and not isinstance(result[2], bool)):
                 raw, producer_id, usage_tokens = result
-                return raw, producer_id, usage_tokens or 0
+                return raw, producer_id, usage_tokens
             return ({"action": "ASK_USER", "target_node": None,
                      "rationale": f"decide_fn returned invalid result: {result!r}"}, None, 0)
 

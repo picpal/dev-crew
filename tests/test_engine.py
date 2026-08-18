@@ -436,6 +436,42 @@ async def test_decide_fn_returns_bare_dict_demotes_to_needs_human(tmp_path):
     assert r.status == "NEEDS_HUMAN"
 
 
+async def test_decide_fn_returns_non_int_usage_tokens_demotes_to_needs_human(tmp_path):
+    # wave 2 F4 회귀: codex 재리뷰가 재현한 그대로 — decide_fn이 shape은 맞는(길이 3,
+    # 첫 원소 dict+action 있음) 3-tuple을 반환해도 usage_tokens가 int가 아니면
+    # (예: "bad-usage" 문자열) wave 1은 그대로 통과시켜 `total_tokens += usage_tokens`
+    # 에서 TypeError가 누출됐다. 이제는 이 경우도 ASK_USER로 강등한다.
+    async def decide(trigger, snapshot):
+        return {"action": "ABORT", "target_node": None, "rationale": "r"}, None, "bad-usage"
+
+    engine, _, _ = make_engine(tmp_path, [BLOCKED_DEV], decide_fn=decide)
+    r = await engine.run(execution_id="E25", task="t")
+    assert r.status == "NEEDS_HUMAN"
+    assert isinstance(r.total_tokens, int)     # TypeError 없이 정상적으로 int로 유지됨
+
+
+async def test_decide_fn_returns_bool_usage_tokens_demotes_to_needs_human(tmp_path):
+    # bool은 Python에서 isinstance(x, int)가 True이므로 별도로 배제해야 한다
+    # (usage_tokens=True/False는 의미 있는 토큰 수가 아니다).
+    async def decide(trigger, snapshot):
+        return {"action": "ABORT", "target_node": None, "rationale": "r"}, None, True
+
+    engine, _, _ = make_engine(tmp_path, [BLOCKED_DEV], decide_fn=decide)
+    r = await engine.run(execution_id="E26", task="t")
+    assert r.status == "NEEDS_HUMAN"
+
+
+async def test_decide_fn_returns_non_str_producer_id_demotes_to_needs_human(tmp_path):
+    # wave 2 F4 회귀: producer_id도 str | None 계약을 지켜야 한다 — 그 외 타입(예:
+    # int)은 ASK_USER로 강등한다.
+    async def decide(trigger, snapshot):
+        return {"action": "ABORT", "target_node": None, "rationale": "r"}, 12345, 0
+
+    engine, _, _ = make_engine(tmp_path, [BLOCKED_DEV], decide_fn=decide)
+    r = await engine.run(execution_id="E27", task="t")
+    assert r.status == "NEEDS_HUMAN"
+
+
 async def test_decision_event_records_raw_applied_degraded_and_producer(tmp_path):
     # finding #5 회귀: DecisionEvent는 trigger worker나 None이 아니라 결정을 생산한
     # instance(producer_id)에 귀속되고, 검증 전 원본(raw)과 검증/강등 후 실제 적용된
