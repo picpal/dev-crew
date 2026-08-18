@@ -8,15 +8,31 @@ from typing import Protocol
 from ..schema import AgentInstance, Usage
 
 
+class ResumeConfigMissingError(Exception):
+    """resume()이 호출된 session_id에 이 adapter 인스턴스의 로컬 시작 설정 캐시가
+    없을 때 발생 (예: cross-process 재시작 후 새 adapter 인스턴스에서 resume 호출).
+
+    캐시 없이 resume하면 role system prompt/output schema/tool allowlist/
+    can_use_tool/sandbox 등 시작 시점 enforcement가 SDK/provider 기본값으로
+    조용히 폴백해 role 경계와 구조화 출력 강제를 우회할 수 있다 — 그래서 fail-closed
+    한다. Cross-process 복구가 필요한 호출자는 resume(..., allow_unconfigured=True)
+    로 의도적으로 이 검사를 건너뛸 수 있다 (registry 기반 cross-process 설정 복원은
+    deferred B1, 이번 fix wave 범위 밖).
+    """
+
+
 @dataclass(frozen=True)
 class TurnOutcome:
     text: str
     usage: Usage
     raw: dict = field(default_factory=dict)
+    structured: dict | None = None
 
 
 class ProviderAdapter(Protocol):
-    async def start_session(self, inst: AgentInstance, initial_message: str) -> str: ...
+    async def start_session(self, inst: AgentInstance, initial_message: str, *,
+                             system_prompt: str | None = None,
+                             output_schema: dict | None = None) -> str: ...
     async def send(self, session_id: str, message: str) -> TurnOutcome: ...
     async def resume(self, session_id: str, message: str) -> TurnOutcome: ...
     async def cancel(self, session_id: str) -> str: ...
@@ -29,14 +45,22 @@ class FakeAdapter:
 
     _ids = itertools.count(1)
 
-    def __init__(self, script: list[str] | None = None, fail_after: int | None = None):
+    def __init__(self, script: list[str] | None = None, fail_after: int | None = None,
+                 structured_script: list[dict] | None = None):
         self.script = list(script or [])
         self.fail_after = fail_after
+        self.structured_script = list(structured_script or [])
         self.turns: dict[str, int] = {}
+        self.last_system_prompt: str | None = None
+        self.last_output_schema: dict | None = None
 
-    async def start_session(self, inst: AgentInstance, initial_message: str) -> str:
+    async def start_session(self, inst: AgentInstance, initial_message: str, *,
+                             system_prompt: str | None = None,
+                             output_schema: dict | None = None) -> str:
         sid = f"fake-{next(self._ids)}"
         self.turns[sid] = 0
+        self.last_system_prompt = system_prompt
+        self.last_output_schema = output_schema
         return sid
 
     async def send(self, session_id: str, message: str) -> TurnOutcome:
@@ -45,7 +69,9 @@ class FakeAdapter:
             raise RuntimeError("scripted failure")
         self.turns[session_id] = n + 1
         text = self.script[n] if n < len(self.script) else "done"
-        return TurnOutcome(text=text, usage=Usage(output_tokens=1, raw={"fake": True}))
+        structured = self.structured_script[n] if n < len(self.structured_script) else None
+        return TurnOutcome(text=text, usage=Usage(output_tokens=1, raw={"fake": True}),
+                           structured=structured)
 
     async def resume(self, session_id: str, message: str) -> TurnOutcome:
         return await self.send(session_id, message)

@@ -45,14 +45,14 @@ class Resolved:
     effort: str
 
 
-# DESIGN.md §17 — tier = (full model ID, 기본 effort) 쌍
+from .config import load as _load_config
+
+_CFG = _load_config()
 TIERS: dict[str, Tier] = {
-    "CHEAP": Tier(Provider.CLAUDE_CODE, "claude-sonnet-5", EffortLevel.LOW),
-    "DEFAULT": Tier(Provider.CLAUDE_CODE, "claude-sonnet-5", EffortLevel.HIGH),
-    "HIGH_CAPABILITY": Tier(Provider.CLAUDE_CODE, "claude-opus-5", EffortLevel.HIGH),
-    "CODEX_DEFAULT": Tier(Provider.CODEX, "gpt-5.6-terra", EffortLevel.MEDIUM),
-    "CODEX_HIGH_REASONING": Tier(Provider.CODEX, "gpt-5.6-sol", EffortLevel.HIGH),
+    name: Tier(spec.provider, spec.model, spec.default_effort)
+    for name, spec in _CFG.tiers.items()
 }
+ROLE_DEFAULTS = _CFG.role_defaults
 
 
 def validate_combo(model: str, effort: str) -> None:

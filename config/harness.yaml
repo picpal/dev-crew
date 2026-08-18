@@ -1,0 +1,15 @@
+# §17 — tier = (full model ID, 기본 effort) 쌍. alias 금지 (#12)
+tiers:
+  CHEAP:                { provider: CLAUDE_CODE, model: claude-sonnet-5, effort: LOW }
+  DEFAULT:              { provider: CLAUDE_CODE, model: claude-sonnet-5, effort: HIGH }
+  HIGH_CAPABILITY:      { provider: CLAUDE_CODE, model: claude-opus-5,   effort: HIGH }
+  CODEX_DEFAULT:        { provider: CODEX,       model: gpt-5.6-terra,   effort: MEDIUM }
+  CODEX_HIGH_REASONING: { provider: CODEX,       model: gpt-5.6-sol,     effort: HIGH }
+
+roleDefaults:
+  EXPLORER:  { tier: CHEAP }
+  ARCHITECT: { tier: DEFAULT }
+  DEVELOPER: { tier: DEFAULT }
+  SECURITY:  { tier: DEFAULT, effort: HIGH }
+  QA:        { tier: CHEAP }
+  REVIEWER:  { tier: CODEX_DEFAULT }

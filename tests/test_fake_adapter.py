@@ -22,3 +22,13 @@ async def test_fake_adapter_fail_after():
     await fa.send(sid, "1")
     with pytest.raises(RuntimeError):
         await fa.send(sid, "2")
+
+
+async def test_fake_adapter_structured_output():
+    fa = FakeAdapter(structured_script=[{"status": "PASS", "summary": "ok"}])
+    sid = await fa.start_session(make_inst(), "go",
+                                 system_prompt="지침", output_schema={"type": "object"})
+    out = await fa.send(sid, "final")
+    assert out.structured == {"status": "PASS", "summary": "ok"}
+    assert fa.last_system_prompt == "지침"          # 주입 확인용 기록
+    assert fa.last_output_schema == {"type": "object"}

@@ -54,10 +54,14 @@ async def phase_b():
     live = [k for k, v in verdicts.items() if k in mine and v == "RESUMABLE"]
     dead = [k for k, v in verdicts.items() if k in mine and v == "FAILED_RECOVERY"]
 
-    # RESUMABLE 행을 실제 resume — 컨텍스트 유지 확인 (여기서 처음 LLM 호출)
+    # RESUMABLE 행을 실제 resume — 컨텍스트 유지 확인 (여기서 처음 LLM 호출).
+    # 이 adapter는 새 프로세스의 새 인스턴스라 start_session 캐시가 없다 — recovery
+    # 경로는 의도적으로 설정 없는 resume이므로 allow_unconfigured=True로 fail-closed
+    # 검사를 건너뛴다 (deferred B1, finding #1 fix wave 범위 밖).
     claude = ClaudeCodeAdapter(trace, registry)
     row = next(r for r in registry.active() if r["instance_id"] == live[0])
-    out = await claude.resume(row["body"]["session_id"], "기억한 암호는? 숫자만.")
+    out = await claude.resume(row["body"]["session_id"], "기억한 암호는? 숫자만.",
+                              allow_unconfigured=True)
 
     # FAILED_RECOVERY 행: handoff 만들고 registry에서 제거
     h = registry.handoff(dead[0])

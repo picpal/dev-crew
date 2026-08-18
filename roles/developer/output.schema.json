@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "changed_files", "build", "tests"],
+  "properties": {
+    "status": {"type": "string", "enum": ["PASS", "NOT_PASS", "NEED_REPLAN", "BLOCKED", "INSUFFICIENT_CAPABILITY"]},
+    "summary": {"type": "string"},
+    "changed_files": {"type": "array", "items": {"type": "string"}},
+    "build": {"type": "object", "additionalProperties": false,
+      "required": ["ok", "detail"], "properties": {"ok": {"type": "boolean"}, "detail": {"type": ["string", "null"]}}},
+    "tests": {"type": "object", "additionalProperties": false,
+      "required": ["passed", "failed", "detail"],
+      "properties": {"passed": {"type": "integer"}, "failed": {"type": "integer"}, "detail": {"type": ["string", "null"]}}}
+  }
+}
