@@ -53,14 +53,17 @@ class FakeAdapter:
         self.turns: dict[str, int] = {}
         self.last_system_prompt: str | None = None
         self.last_output_schema: dict | None = None
+        self.last_mcp_servers: dict | None = None
 
     async def start_session(self, inst: AgentInstance, initial_message: str, *,
                              system_prompt: str | None = None,
-                             output_schema: dict | None = None) -> str:
+                             output_schema: dict | None = None,
+                             mcp_servers: dict | None = None) -> str:
         sid = f"fake-{next(self._ids)}"
         self.turns[sid] = 0
         self.last_system_prompt = system_prompt
         self.last_output_schema = output_schema
+        self.last_mcp_servers = mcp_servers
         return sid
 
     async def send(self, session_id: str, message: str) -> TurnOutcome:

@@ -64,8 +64,9 @@ class Orchestrator:
             escalation_chain_id=(replaced.escalation_chain_id or replaced.instance_id)
             if replaced else None,
         )
-        # Load role bundle for WORKER_ROLES
-        if role in WORKER_ROLES:
+        # Load role bundle for WORKER_ROLES + ORCHESTRATOR (decision sessions need
+        # their own prompt/output_schema bundle too — Task 5)
+        if role in WORKER_ROLES | {Role.ORCHESTRATOR}:
             bundle = load_bundle(role)
             inst.role_bundle_version = bundle.version
 
@@ -89,8 +90,13 @@ class Orchestrator:
         self.registry.upsert(inst, provider_ref=None)
         return inst
 
-    async def start_worker(self, inst: AgentInstance, initial_message: str) -> str:
+    async def start_worker(self, inst: AgentInstance, initial_message: str, *,
+                           mcp_servers: dict | None = None) -> str:
         """Start a worker agent session with its role bundle injected.
+
+        `mcp_servers` is passed through to the adapter's start_session (Task 5/6) —
+        used by decision sessions (ORCHESTRATOR) to expose the read-only harness MCP
+        tools. Workers spawned by the engine don't pass this, so it defaults to None.
 
         Loads the bundle for the worker role and passes system_prompt and output_schema
         to the adapter's start_session method.
@@ -119,7 +125,8 @@ class Orchestrator:
             system_prompt = f"{bundle.prompt}\n\n## 할당 Scope\n{inst.task_scope}"
         session_id = await adapter.start_session(
             inst, initial_message,
-            system_prompt=system_prompt, output_schema=bundle.schema)
+            system_prompt=system_prompt, output_schema=bundle.schema,
+            mcp_servers=mcp_servers)
         inst.session_id = session_id
         self.registry.upsert(inst, provider_ref=None)
         return session_id
