@@ -24,6 +24,11 @@ GENERIC_PASS = {"status": "PASS", "summary": "ok"}
 PASS_REVIEW = {"status": "PASS", "summary": "ok", "verdict": "PASS", "findings": []}
 FAIL_REVIEW = {"status": "PASS", "summary": "issues", "verdict": "NOT_PASS",
                "findings": [{"severity": "major", "file": "a.py", "line": 1, "description": "bug"}]}
+BLOCKED_DEV = {"status": "BLOCKED", "summary": "stuck", "changed_files": [],
+              "build": {"ok": False, "detail": ""}, "tests": {"passed": 0, "failed": 0, "detail": ""}}
+NEED_REPLAN_DEV = {"status": "NEED_REPLAN", "summary": "?", "changed_files": [],
+                   "build": {"ok": False, "detail": ""},
+                   "tests": {"passed": 0, "failed": 0, "detail": ""}}
 
 
 def make_engine(tmp_path, dev_script=None, review_script=None, decide_fn=None,
@@ -192,6 +197,85 @@ async def test_escalate_model_climbs_ladder_then_needs_human(tmp_path):
     esc = trace.events(event_type="ModelEscalationEvent")
     assert len(esc) == 1
     assert esc[0]["payload"]["reason"] == "BLOCKED"
+
+
+async def test_retry_node_retries_current_node_then_completes(tmp_path):
+    # BLOCKED -> RETRY_NODE(target 미지정 -> 현재 노드) -> 같은 세션에서 재시도 -> PASS 완주
+    calls = []
+
+    async def decide(trigger, snapshot):
+        calls.append(trigger)
+        return {"action": "RETRY_NODE", "target_node": None, "rationale": "try again"}
+
+    engine, _, _ = make_engine(tmp_path, [BLOCKED_DEV, PASS_DEV], [PASS_REVIEW], decide_fn=decide)
+    r = await engine.run(execution_id="E10", task="t")
+    assert r.status == "COMPLETED"
+    assert calls == ["BLOCKED"]
+    assert [h["node_id"] for h in r.node_history] == ["develop", "develop", "review"]
+    assert [h["transition"] for h in r.node_history] == ["BLOCKED", "PASS", "PASS"]
+
+
+async def test_replan_jumps_to_target_and_resets_all_iterations(tmp_path):
+    # develop PASS -> review NOT_PASS(develop iter=1) -> develop NEED_REPLAN ->
+    # REPLAN(target=develop, 전 노드 iterations 리셋) -> develop PASS -> review NOT_PASS
+    # (reset이 안 됐다면 develop iter가 2로 올라가 maxIterations=2에 걸려 즉시
+    # LOOP_GUARD_EXCEEDED가 발생하고, 그 트리거에서 decide_fn이 ABORT를 반환하므로
+    # 최종 status가 ABORTED가 돼 리셋 실패를 드러낸다) -> develop PASS -> review PASS
+    cfg = load_config()
+    cfg = dataclasses.replace(cfg, loop_policy=LoopPolicy(2, 999, 999999, 999))
+    calls = []
+
+    async def decide(trigger, snapshot):
+        calls.append(trigger)
+        if trigger == "NEED_REPLAN":
+            return {"action": "REPLAN", "target_node": "develop", "rationale": "restart"}
+        return {"action": "ABORT", "target_node": None, "rationale": "unexpected guard"}
+
+    engine, _, _ = make_engine(
+        tmp_path, [PASS_DEV, NEED_REPLAN_DEV, PASS_DEV, PASS_DEV],
+        [FAIL_REVIEW, FAIL_REVIEW, PASS_REVIEW], decide_fn=decide, cfg=cfg)
+    r = await engine.run(execution_id="E11", task="t")
+    assert r.status == "COMPLETED"
+    assert calls == ["NEED_REPLAN"]        # ABORT 분기(재-guard)를 타지 않았다 -> reset 성공
+    assert [h["node_id"] for h in r.node_history] == \
+        ["develop", "review", "develop", "develop", "review", "develop", "review"]
+    # REPLAN 이후 재루프에서 develop iteration이 2(guard)가 아니라 1까지만 올라갔다
+    # -> 전 노드 iterations 리셋이 실제로 적용됐다는 직접 증거.
+    develop_iters = [h["iteration"] for h in r.node_history if h["node_id"] == "develop"]
+    assert develop_iters == [0, 1, 0, 1]
+
+
+async def test_classify_proceed_runs_all_nodes(tmp_path):
+    # DEFAULT_TEMPLATE + CLASSIFY에서 PROCEED -> conditional 노드(explore)도 포함해 전부 실행
+    async def decide(trigger, snapshot):
+        assert trigger == "CLASSIFY"
+        return {"action": "PROCEED", "target_node": None, "rationale": "full pipeline needed"}
+
+    engine, _, _ = make_engine(tmp_path, [GENERIC_PASS], [PASS_REVIEW],
+                               decide_fn=decide, template=DEFAULT_TEMPLATE)
+    r = await engine.run(execution_id="E12", task="t")
+    assert r.status == "COMPLETED"
+    assert [h["node_id"] for h in r.node_history] == ["explore", "develop", "review", "qa"]
+
+
+async def test_retry_node_unknown_target_demotes_to_needs_human(tmp_path):
+    # RETRY_NODE의 target_node가 template에 없는 노드면 크래시 대신 NEEDS_HUMAN으로 강등
+    async def decide(trigger, snapshot):
+        return {"action": "RETRY_NODE", "target_node": "no-such-node", "rationale": "bad"}
+
+    engine, _, _ = make_engine(tmp_path, [BLOCKED_DEV], decide_fn=decide)
+    r = await engine.run(execution_id="E13", task="t")
+    assert r.status == "NEEDS_HUMAN"
+
+
+async def test_replan_unknown_target_demotes_to_needs_human(tmp_path):
+    # REPLAN의 target_node가 template에 없는 노드면 크래시 대신 NEEDS_HUMAN으로 강등
+    async def decide(trigger, snapshot):
+        return {"action": "REPLAN", "target_node": "no-such-node", "rationale": "bad"}
+
+    engine, _, _ = make_engine(tmp_path, [NEED_REPLAN_DEV], decide_fn=decide)
+    r = await engine.run(execution_id="E14", task="t")
+    assert r.status == "NEEDS_HUMAN"
 
 
 async def test_workflow_engine_rejects_unknown_ladder_tier(tmp_path):

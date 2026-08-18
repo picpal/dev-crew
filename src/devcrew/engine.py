@@ -189,8 +189,12 @@ class WorkflowEngine:
                 action = "ASK_USER"      # 트리거에 허용되지 않은 action -> 안전 기본값 강등
 
             if action == "RETRY_NODE":
-                target_idx = template.index(d.get("target_node") or rt.spec.node_id)
-                target_rt = nodes[target_idx]
+                target_rt = find_node(d.get("target_node") or rt.spec.node_id)
+                if target_rt is None:
+                    # target_node가 template에 없는 노드 -> ASK_USER와 동일하게 강등
+                    # (CLASSIFY의 invalid SKIP_NODE target과 같은 fail-safe 패턴)
+                    return ("terminal", "NEEDS_HUMAN")
+                target_idx = template.index(target_rt.spec.node_id)
                 target_rt.iterations = 0
                 same_finding_sig, same_finding_count = None, 0
                 return ("goto", target_idx, _follow_up_msg(outcome.structured))
@@ -213,7 +217,11 @@ class WorkflowEngine:
                 return await process(rt, outcome2)
 
             if action == "REPLAN":
-                target_idx = template.index(d.get("target_node") or "develop")
+                target_rt = find_node(d.get("target_node") or "develop")
+                if target_rt is None:
+                    # target_node가 template에 없는 노드 -> ASK_USER와 동일하게 강등
+                    return ("terminal", "NEEDS_HUMAN")
+                target_idx = template.index(target_rt.spec.node_id)
                 for r in nodes:
                     r.iterations = 0
                 same_finding_sig, same_finding_count = None, 0
