@@ -3,7 +3,7 @@ import dataclasses
 import pytest
 from devcrew.adapters.base import FakeAdapter
 from devcrew.config import LoopPolicy, load as load_config
-from devcrew.engine import ExecutionResult, WorkflowEngine
+from devcrew.engine import REPORT_MSG, REVISIT_MSG, ExecutionResult, WorkflowEngine
 from devcrew.orchestrator import Orchestrator
 from devcrew.schema import Provider, Role
 from devcrew.store.registry import SessionRegistry
@@ -63,6 +63,35 @@ async def test_review_loop_then_pass(tmp_path):
     r = await engine.run(execution_id="E2", task="t")
     assert r.status == "COMPLETED"
     assert r.node_history[1]["transition"] == "NOT_PASS"
+
+
+async def test_advance_revisit_sends_explicit_revisit_message(tmp_path):
+    # 회귀 고정 (Task 4 R2 근본원인, task-7-report.md): review가 develop 루프백 이후
+    # ADVANCE로 재진입할 때(세션은 이미 있음) None이 아니라 REVISIT_MSG가 실제로
+    # adapter.send에 전달돼야 한다 — None이 새면 실 어댑터가 크래시한다.
+    trace = TraceStore(tmp_path / "trace.db")
+    registry = SessionRegistry(tmp_path / "harness.db")
+
+    class RecordingAdapter(FakeAdapter):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.sent_messages: list[str | None] = []
+
+        async def send(self, session_id, message):
+            self.sent_messages.append(message)
+            return await super().send(session_id, message)
+
+    dev_fake = RecordingAdapter(structured_script=[PASS_DEV, PASS_DEV])
+    review_fake = RecordingAdapter(structured_script=[FAIL_REVIEW, PASS_REVIEW])
+    orch = Orchestrator(trace, registry,
+                        {Provider.CLAUDE_CODE: dev_fake, Provider.CODEX: review_fake})
+    engine = WorkflowEngine(orch, load_config(), template=SIM)
+    r = await engine.run(execution_id="E15", task="t")
+    assert r.status == "COMPLETED"
+    # review의 1차 방문(신규 세션)은 REPORT_MSG, 2차 방문(ADVANCE 재진입)은 REVISIT_MSG
+    assert review_fake.sent_messages == [REPORT_MSG, REVISIT_MSG]
+    assert None not in review_fake.sent_messages
+    assert None not in dev_fake.sent_messages
 
 
 async def test_attribution_reviewer_result_recorded_under_reviewer_instance(tmp_path):

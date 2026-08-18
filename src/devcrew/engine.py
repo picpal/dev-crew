@@ -23,6 +23,12 @@ ESCALATION_LADDER = {"CHEAP": "DEFAULT", "DEFAULT": "HIGH_CAPABILITY",
 
 REPORT_MSG = "이제 최종 보고를 스키마대로 제출해."
 FOLLOW_UP_MSG = "위 결과를 반영해 수정/재수행 후 스키마대로 최종 보고해."
+# ADVANCE로 재진입하는 노드(예: review가 develop 루프백 이후 다시 도달)는 직전
+# LOOP/DECIDE 분기가 만든 follow-up 메시지가 없다 — 세션이 이미 있는데 메시지가
+# None이면 실 어댑터(Claude SDK/Codex SDK)가 None 프롬프트를 거부해 크래시한다
+# (Task 4 R2 근본원인, task-7-report.md). run_node()의 재진입 경로 전체에 이 기본
+# 메시지를 적용해 None이 adapter.send로 새 나가는 경로를 원천 차단한다.
+REVISIT_MSG = "이전 보고 이후 작업 상태가 변경됐다. 동일 과업을 다시 수행하고 스키마대로 최종 보고해."
 
 
 def _tokens(u: Usage) -> int:
@@ -125,8 +131,12 @@ class WorkflowEngine:
                     rt.inst, rt.spec.message.format(task=task))
                 adapter = self.orch.adapters[rt.inst.provider]
                 return await adapter.send(rt.session_id, REPORT_MSG)
+            # 재진입(세션 기존) — ADVANCE는 follow_up_msg=None을 넘길 수 있으니
+            # (LOOP/RETRY_NODE/REPLAN은 항상 non-None 메시지를 만든다) None이면
+            # 명시적 재수행 메시지로 대체한다. adapter.send가 None을 받는 경로는 없다.
             adapter = self.orch.adapters[rt.inst.provider]
-            return await adapter.send(rt.session_id, follow_up_msg)
+            message = follow_up_msg if follow_up_msg is not None else REVISIT_MSG
+            return await adapter.send(rt.session_id, message)
 
         # 조건부 노드가 하나라도 있으면 CLASSIFY 결정을 1회만 호출한다 (SKIP_NODE는 target 1개만)
         if any(n.conditional for n in template.nodes):

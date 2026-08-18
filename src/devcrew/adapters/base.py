@@ -68,6 +68,10 @@ class FakeAdapter:
         return sid
 
     async def send(self, session_id: str, message: str) -> TurnOutcome:
+        if message is None:
+            # 실 어댑터(Claude SDK/Codex SDK)는 None 프롬프트를 거부하고 크래시한다
+            # (§Task4 R2 근본원인) — Fake도 같은 계약을 가져야 이 결함류를 unit이 잡는다.
+            raise TypeError("FakeAdapter.send: message must not be None")
         n = self.turns[session_id]
         if self.fail_after is not None and n >= self.fail_after:
             raise RuntimeError("scripted failure")
