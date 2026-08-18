@@ -39,11 +39,14 @@ def _handlers(trace: TraceStore, engine=None) -> dict:
             nodes[p["node_id"]] = {"node_id": p["node_id"], "transition": p["transition"],
                                    "step_kind": p["step_kind"], "iteration": p["iteration"],
                                    "ts": e["ts"]}
+        # finding #5 — DecisionEvent.payload는 이제 raw(검증 전 원본)/applied(검증·강등
+        # 후 실제 적용된 결정)/degraded를 담는다 ("decision" 단일 키는 더 없다).
         state = {
             "execution_id": execution_id,
             "nodes": list(nodes.values()),
             "decisions": [{"trigger": e["payload"]["trigger"],
-                          "decision": e["payload"]["decision"], "ts": e["ts"]}
+                          "applied": e["payload"]["applied"],
+                          "degraded": e["payload"]["degraded"], "ts": e["ts"]}
                          for e in decisions],
             "last_event_at": max([e["ts"] for e in transitions + decisions], default=None),
         }
@@ -57,11 +60,17 @@ def _handlers(trace: TraceStore, engine=None) -> dict:
         return _text(state)
 
     async def get_worker_result(args: dict) -> dict:
+        # finding #7 — instance_id는 필수다: 호출자가 특정 worker의 결과를 조회하려는
+        # 것이지 execution의 "가장 최근" 결과를 원하는 게 아니다. instance_id 없이
+        # execution 최근 결과로 기본 폴백하면 결정 근거가 호출자가 의도한 instance가
+        # 아닌 다른 worker의 결과로 조용히 바뀔 수 있다 (fail-closed).
         execution_id = args.get("execution_id")
         instance_id = args.get("instance_id")
+        if not instance_id:
+            return _error("instance_id is required: get_worker_result no longer "
+                          "defaults to the execution's most recent result")
         events = trace.events(event_type="WorkerResultEvent", execution_id=execution_id)
-        if instance_id:
-            events = [e for e in events if e["instance_id"] == instance_id]
+        events = [e for e in events if e["instance_id"] == instance_id]
         if not events:
             return _error(f"worker result not found: execution_id={execution_id!r} "
                           f"instance_id={instance_id!r}")
@@ -86,10 +95,11 @@ _TOOL_SPECS = {
          "required": ["execution_id"]},
     ),
     "get_worker_result": (
-        "WorkerResultEvent의 structured 결과를 조회한다 (읽기 전용).",
+        "특정 instance_id의 WorkerResultEvent structured 결과를 조회한다 (읽기 전용). "
+        "instance_id는 필수 — execution의 최근 결과로 대체되지 않는다.",
         {"type": "object", "properties": {"execution_id": {"type": "string"},
                                           "instance_id": {"type": "string"}},
-         "required": ["execution_id"]},
+         "required": ["execution_id", "instance_id"]},
     ),
     "get_trace_events": (
         "trace 이벤트를 execution_id/event_type/limit으로 필터링해 조회한다 (읽기 전용).",

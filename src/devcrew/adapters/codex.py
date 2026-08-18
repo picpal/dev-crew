@@ -43,6 +43,10 @@ class CodexAdapter:
         # (verified via inspect.signature(AsyncCodex.thread_resume), api.py:443-453),
         # so unlike claude_code.py's resume() this is not a deferred gap here.
         self._session_config: dict[str, dict] = {}
+        # thread_id -> start_session()이 소비한 최초 turn의 usage (finding #6, claude_code.py
+        # 의 동일한 캐시와 대칭) — start_session이 send()를 내부 호출해 그 결과를 버리므로
+        # 여기서 별도 보존한다.
+        self._initial_usage: dict[str, Usage] = {}
 
     async def _client(self) -> AsyncCodex:
         if self._codex is None:
@@ -81,7 +85,8 @@ class CodexAdapter:
             "output_schema": output_schema,
             "base_instructions": system_prompt,
         }
-        await self.send(thread.id, initial_message)
+        outcome = await self.send(thread.id, initial_message)
+        self._initial_usage[thread.id] = outcome.usage
         return thread.id
 
     async def send(self, session_id: str, message: str) -> TurnOutcome:
@@ -164,6 +169,10 @@ class CodexAdapter:
 
     async def get_usage(self, session_id: str) -> Usage:
         raise NotImplementedError("usage는 각 TurnOutcome.usage로 수집한다")
+
+    async def initial_usage(self, session_id: str) -> Usage | None:
+        """start_session이 소비한 최초 turn의 usage (finding #6). 캐시가 없으면 None."""
+        return self._initial_usage.get(session_id)
 
     async def thread_exists(self, thread_id: str) -> bool:
         codex = await self._client()

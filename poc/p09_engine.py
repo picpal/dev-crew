@@ -126,10 +126,17 @@ async def main():
     }
     decision = None
     try:
-        decision = await decide_fn("CLASSIFY", classify_snapshot)
+        # decide_fn 계약(finding #5/#6): async (trigger, snapshot) -> (decision,
+        # producer_instance_id, usage_tokens). engine.py를 거치지 않고 여기서 직접
+        # 호출하므로, engine이 하는 DecisionEvent 기록(검증/강등 후 applied+raw+degraded,
+        # producer 귀속)도 이 스모크가 직접 흉내낸다.
+        decision, producer_id, usage_tokens = await decide_fn("CLASSIFY", classify_snapshot)
         trace.append("DecisionEvent", task_id=execution_id, execution_id=execution_id,
-                     instance_id=None, payload={"trigger": "CLASSIFY", "decision": decision})
+                     instance_id=producer_id,
+                     payload={"trigger": "CLASSIFY", "raw": decision, "applied": decision,
+                             "degraded": False})
         extra["classify_decision"] = decision
+        extra["classify_usage_tokens"] = usage_tokens
     except Exception:
         tb = traceback.format_exc()
         extra["classify_error"] = tb
@@ -138,7 +145,7 @@ async def main():
     decision_events = trace.events(event_type="DecisionEvent", execution_id=execution_id)
     classify_events = [e for e in decision_events if e["payload"]["trigger"] == "CLASSIFY"]
     checks["classify_decision_recorded"] = any(
-        e["payload"]["decision"].get("action") in ("PROCEED", "SKIP_NODE")
+        e["payload"]["applied"].get("action") in ("PROCEED", "SKIP_NODE")
         for e in classify_events)
 
     worker_events = trace.events(event_type="WorkerResultEvent", execution_id=execution_id)

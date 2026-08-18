@@ -39,6 +39,11 @@ class ClaudeCodeAdapter:
         # session_id -> start_session()이 사용한 옵션. resume()이 이를 재주입해
         # role enforcement/구조화 출력 강제를 유지한다 (finding #1).
         self._start_opts: dict[str, dict] = {}
+        # session_id -> start_session()의 최초 turn usage. 그 turn은 session_id 자체를
+        # 반환값으로 만들어내는 turn이라 outcome 전체가 호출자에게 버려지는데, 그
+        # 소비 토큰은 실제로 발생한 비용이다 — engine이 첫 방문 직후 합산할 수 있게
+        # 별도로 캐시해 initial_usage()로 노출한다 (finding #6).
+        self._initial_usage: dict[str, Usage] = {}
 
     async def start_session(self, inst: AgentInstance, initial_message: str, *,
                              system_prompt: str | None = None,
@@ -60,6 +65,7 @@ class ClaudeCodeAdapter:
         outcome = await self._turn(client, initial_message)
         session_id = outcome.raw["session_id"]
         self._clients[session_id] = client
+        self._initial_usage[session_id] = outcome.usage
         self._start_opts[session_id] = {
             "system_prompt": system_prompt,
             "output_schema": output_schema,
@@ -152,3 +158,8 @@ class ClaudeCodeAdapter:
 
     async def get_usage(self, session_id: str) -> Usage:
         raise NotImplementedError("usage는 각 TurnOutcome.usage로 수집한다")
+
+    async def initial_usage(self, session_id: str) -> Usage | None:
+        """start_session이 소비한 최초 turn의 usage (finding #6). 캐시가 없으면 None
+        (예: 이 session_id가 이 adapter 인스턴스의 start_session을 거치지 않음)."""
+        return self._initial_usage.get(session_id)
