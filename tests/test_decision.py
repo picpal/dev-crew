@@ -46,18 +46,21 @@ async def test_llm_decide_retries_once_then_degrades(tmp_path):
     orch, trace, fake, cfg = make_env(tmp_path, [invalid, invalid])
     decide = make_llm_decide(orch, cfg)
     snapshot = {"execution_id": "E1"}
-    d = await decide("NEED_REPLAN", snapshot)
+    d, producer_id, usage_tokens = await decide("NEED_REPLAN", snapshot)
     assert d["action"] == "ASK_USER"
+    assert producer_id is not None                 # finding #5: 생산자 ORCHESTRATOR instance_id
     assert fake.turns                              # 재시도로 send 2회 소비됨을 확인
     assert sum(fake.turns.values()) == 2
+    assert usage_tokens == 2                        # finding #6b: 두 turn(1차+재시도)의 usage 합계
 
 
 async def test_llm_decide_happy_path_spawns_orchestrator(tmp_path):
     orch, trace, fake, cfg = make_env(tmp_path, [GOOD])
     decide = make_llm_decide(orch, cfg, mcp_servers={"harness": "sentinel"})
     snapshot = {"execution_id": "E2"}
-    d = await decide("NEED_REPLAN", snapshot)
+    d, producer_id, usage_tokens = await decide("NEED_REPLAN", snapshot)
     assert d["action"] == "ABORT"
+    assert usage_tokens == 1                        # finding #6b: 단일 turn(재시도 없음)의 usage
 
     routing = trace.events(event_type="ModelRoutingEvent")
     orch_routing = [e for e in routing if e["payload"]["role"] == "ORCHESTRATOR"]
@@ -65,5 +68,8 @@ async def test_llm_decide_happy_path_spawns_orchestrator(tmp_path):
 
     instance_events = trace.events(event_type="InstanceEvent")
     assert any(e["payload"]["role"] == "ORCHESTRATOR" for e in instance_events)
+    # finding #5: producer_id는 이 결정을 낸 fresh ORCHESTRATOR instance와 일치한다
+    assert any(e["payload"]["role"] == "ORCHESTRATOR" and producer_id.startswith("ORC")
+              for e in instance_events)
 
     assert fake.last_mcp_servers == {"harness": "sentinel"}

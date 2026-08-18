@@ -96,13 +96,14 @@ async def test_consume_result_valid_explorer_pass(tmp_path):
     orch, trace, _ = make_orch(tmp_path)
     inst = await orch.spawn(Role.EXPLORER, "CHEAP", execution_id="E1",
                             node_id="n1", task_scope="*")
-    outcome = TurnOutcome(text="", usage=Usage(),
-                          structured={"status": "PASS", "summary": "ok", "findings": []})
+    # EXPLORER output.schema.json required: status, summary, findings, affected_files
+    # (finding #2 — consume_result가 이제 role bundle schema 전체를 검증한다)
+    structured = {"status": "PASS", "summary": "ok", "findings": [], "affected_files": []}
+    outcome = TurnOutcome(text="", usage=Usage(), structured=structured)
     result = orch.consume_result(inst, outcome)
     assert result == "PASS"
     evs = trace.events(event_type="WorkerResultEvent")
-    assert evs[0]["payload"] == {"role": "EXPLORER", "status": "PASS",
-                                 "structured": {"status": "PASS", "summary": "ok", "findings": []}}
+    assert evs[0]["payload"] == {"role": "EXPLORER", "status": "PASS", "structured": structured}
 
 
 async def test_consume_result_reviewer_uses_verdict_not_status(tmp_path):
@@ -130,6 +131,21 @@ async def test_consume_result_malformed_structured_logs_event(tmp_path):
     evs = trace.events(event_type="MalformedResultEvent")
     assert len(evs) == 1
     assert evs[0]["payload"]["role"] == "EXPLORER"
+
+
+async def test_consume_result_valid_status_but_missing_required_fields_is_malformed(tmp_path):
+    """finding #2 회귀: codex 리뷰가 재현한 그대로 — status만 유효(PASS)하고 role bundle
+    schema의 나머지 required(summary/changed_files/build/tests)가 전부 빠진 DEVELOPER
+    출력은 더 이상 그대로 PASS 처리되지 않는다. malformed로 강등돼 NEED_REPLAN이 된다."""
+    orch, trace, _ = make_orch(tmp_path)
+    inst = await orch.spawn(Role.DEVELOPER, "DEFAULT", execution_id="E1",
+                            node_id="n1", task_scope="*")
+    outcome = TurnOutcome(text="", usage=Usage(), structured={"status": "PASS"})
+    result = orch.consume_result(inst, outcome)
+    assert result == "NEED_REPLAN"
+    evs = trace.events(event_type="MalformedResultEvent")
+    assert len(evs) == 1
+    assert evs[0]["payload"]["role"] == "DEVELOPER"
 
 
 async def test_consume_result_reviewer_blocked_status_not_overridden_by_verdict(tmp_path):

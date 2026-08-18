@@ -11,7 +11,8 @@ from dataclasses import dataclass
 
 from .adapters.base import TurnOutcome
 from .routing import resolve
-from .roles import STATUS_ENUM, RoleBundle, RoleBundleError, load_bundle
+from .roles import (STATUS_ENUM, RoleBundle, RoleBundleError, load_bundle,
+                    missing_required_keys)
 from .schema import AgentInstance, EffortLevel, InstanceStatus, Provider, Role
 from .store.registry import SessionRegistry
 from .store.trace import TraceStore
@@ -164,10 +165,20 @@ class Orchestrator:
         `structured` 전문도 payload에 포함한다 (MCP get_worker_result의 데이터 소스;
         §5 constraint상 프롬프트 원문이 아니라 구조화 결과이므로 trace payload에
         남겨도 무방하다).
+
+        finding #2 — provider의 output_schema 강제(1차 방어)를 우회한 malformed
+        출력(예: 필수 필드 누락)을 잡는 2차 방어로, `status`만이 아니라 판정
+        role의 role bundle 전체 schema를 `missing_required_keys`(경량 required-키
+        재귀 검사, jsonschema 의존성 없음)로 확인한다. 누락이 있으면 status가
+        유효한 값이어도 malformed로 강등한다.
         """
         role = as_role or inst.role
         structured = outcome.structured
-        if not isinstance(structured, dict) or structured.get("status") not in STATUS_ENUM:
+        malformed = (
+            not isinstance(structured, dict)
+            or structured.get("status") not in STATUS_ENUM
+            or missing_required_keys(load_bundle(role).schema, structured))
+        if malformed:
             self.trace.append("MalformedResultEvent", task_id=inst.execution_id,
                               execution_id=inst.execution_id, instance_id=inst.instance_id,
                               payload={"role": role.value, "raw": structured})
