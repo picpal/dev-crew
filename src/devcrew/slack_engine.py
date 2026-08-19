@@ -46,19 +46,19 @@ def make_toy_repo() -> Path:
 
 
 def progress_text(events: list, elapsed: float) -> str:
-    """trace 이벤트 → 진행 상태 한 줄 (chat.update용, 순수 함수)."""
+    """trace 이벤트 → 진행 상태 한 줄 (assistant status용, 순수 함수)."""
     spawns = [e for e in events if e["event_type"] == "ModelRoutingEvent"]
     trans = [e for e in events if e["event_type"] == "NodeTransitionEvent"]
     decisions = [e for e in events if e["event_type"] == "DecisionEvent"]
     current = spawns[-1]["payload"]["role"] if spawns else "준비"
-    txt = f"🛠 실행 중 ({int(elapsed)}s) — 현재: {current}"
+    parts = [f"{current} 실행 중 ({int(elapsed)}s)"]
+    if trans:
+        done = " → ".join(f"{e['payload']['node_id']}:{e['payload']['transition']}"
+                          for e in trans[-3:])
+        parts.append(done)
     if decisions:
-        txt += f" · 결정 {len(decisions)}회"
-    path = " → ".join(f"{e['payload']['node_id']}:{e['payload']['transition']}"
-                      for e in trans)
-    if path:
-        txt += f"\n경로: {path}"
-    return txt
+        parts.append(f"결정 {len(decisions)}회")
+    return " · ".join(parts)
 
 
 def format_result(execution_id: str, result, repo: str) -> str:
@@ -166,10 +166,10 @@ class MentionHandler:
     """app_mention 이벤트 처리 — bolt와 분리된 순수 로직 (테스트 대상)."""
 
     def __init__(self, runner: EngineRunner, *, max_seen: int = 1000, react=None,
-                 update=None):
+                 status=None):
         self.runner = runner
         self.react = react            # async (channel, ts) — 수신 확인 리액션 (선택)
-        self.update = update          # async (channel, ts, text) — 메시지 갱신 (선택)
+        self.status = status          # async (channel, thread_ts, text) — AI 앱 상태 (선택)
         self._seen: set[str] = set()
         self._max_seen = max_seen
 
@@ -190,26 +190,24 @@ class MentionHandler:
                       thread_ts=thread_ts)
             return
 
-        if self.react and event.get("channel") and event.get("ts"):
+        channel = event.get("channel")
+        if self.react and channel and event.get("ts"):
             try:
-                await self.react(event["channel"], event["ts"])
+                await self.react(channel, event["ts"])
             except Exception:
                 pass                   # reactions:write scope 없음 등 — 리액션은 best-effort
-        note = " (앞선 요청 완료 후 순차 실행됩니다)" if self.runner.busy else ""
-        resp = await say(text=f"⏳ 접수: {task}{note}", thread_ts=thread_ts)
-        status_ts = resp.get("ts") if hasattr(resp, "get") and resp else None
-        channel = event.get("channel")
-        on_progress = None
-        if self.update and status_ts and channel:
-            async def on_progress(text):
-                await self.update(channel, status_ts, text)
-        try:
-            execution_id, result, repo = await self.runner.run(task, on_progress=on_progress)
-            if on_progress:
+
+        # 상태는 메시지가 아니라 AI 앱 상태 인디케이터로 — 댓글은 최종 답변만 (사용자 UX 결정)
+        async def _status(text):
+            if self.status and channel and thread_ts:
                 try:
-                    await self.update(channel, status_ts, f"✅ 완료 — {execution_id}")
+                    await self.status(channel, thread_ts, text)
                 except Exception:
-                    pass
+                    pass               # Agents & AI Apps 미설정 등 — 상태는 best-effort
+
+        await _status("대기 중 (앞선 요청 처리 후 실행)" if self.runner.busy else "접수 — 실행 준비 중")
+        try:
+            execution_id, result, repo = await self.runner.run(task, on_progress=_status)
             await say(text=format_result(execution_id, result, repo), thread_ts=thread_ts)
         except RepoRegistryError as e:
             await say(text=f"⚠️ {e}", thread_ts=thread_ts)
@@ -235,10 +233,11 @@ async def _amain() -> None:
     async def crew_react(channel: str, ts: str) -> None:
         await app.client.reactions_add(channel=channel, timestamp=ts, name="eyes")
 
-    async def crew_update(channel: str, ts: str, text: str) -> None:
-        await app.client.chat_update(channel=channel, ts=ts, text=text)
+    async def crew_status(channel: str, thread_ts: str, text: str) -> None:
+        await app.client.assistant_threads_setStatus(
+            channel_id=channel, thread_ts=thread_ts, status=text)
 
-    handler = MentionHandler(runner, react=crew_react, update=crew_update)
+    handler = MentionHandler(runner, react=crew_react, status=crew_status)
 
     @app.event("app_mention")
     async def on_mention(body, say):
@@ -286,11 +285,12 @@ async def _amain() -> None:
         async def brain_react(channel: str, ts: str) -> None:
             await brain_app.client.reactions_add(channel=channel, timestamp=ts, name="eyes")
 
-        async def brain_update(channel: str, ts: str, text: str) -> None:
-            await brain_app.client.chat_update(channel=channel, ts=ts, text=text)
+        async def brain_status(channel: str, thread_ts: str, text: str) -> None:
+            await brain_app.client.assistant_threads_setStatus(
+                channel_id=channel, thread_ts=thread_ts, status=text)
 
         brain = BrainHandler(runner.orch, runner.cfg, runner.repos, crew_dispatch,
-                             react=brain_react, update=brain_update)
+                             react=brain_react, status=brain_status)
 
         @brain_app.event("app_mention")
         async def on_brain_mention(body, say):

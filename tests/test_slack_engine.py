@@ -50,10 +50,9 @@ async def test_mention_runs_task_and_replies_in_thread():
     runner, say = FakeRunner(), SaySpy()
     await MentionHandler(runner)(body("<@U123> calc.py에 mul 추가"), say)
     assert runner.calls == ["calc.py에 mul 추가"]           # mention 제거된 task
-    assert len(say.messages) == 2                            # 접수 + 결과
-    assert say.messages[0]["text"].startswith("⏳ 접수")
-    assert "✅ SLACK-1 COMPLETED" in say.messages[1]["text"]
-    assert all(m["thread_ts"] == "111.222" for m in say.messages)
+    assert len(say.messages) == 1                            # 최종 결과만 (상태는 인디케이터)
+    assert "✅ SLACK-1 COMPLETED" in say.messages[0]["text"]
+    assert say.messages[0]["thread_ts"] == "111.222"
 
 
 @pytest.mark.asyncio
@@ -63,7 +62,7 @@ async def test_duplicate_event_id_is_ignored():
     await h(body("<@U123> t", event_id="EvX"), say)
     await h(body("<@U123> t", event_id="EvX"), say)           # Slack 재전송
     assert runner.calls == ["t"]                              # 1회만 실행
-    assert len(say.messages) == 2
+    assert len(say.messages) == 1
 
 
 @pytest.mark.asyncio
@@ -105,5 +104,6 @@ def test_progress_text_shows_stage_and_path():
         {"event_type": "DecisionEvent", "payload": {}},
     ]
     t = progress_text(events, 32.7)
-    assert "실행 중 (32s)" in t and "현재: REVIEWER" in t
+    assert "REVIEWER 실행 중 (32s)" in t
     assert "develop:PASS" in t and "결정 1회" in t
+    assert "\n" not in t                                     # status는 한 줄

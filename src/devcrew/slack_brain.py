@@ -66,9 +66,9 @@ class BrainHandler:
     """
 
     def __init__(self, orch, cfg, repos: dict, crew_dispatch, *, max_seen: int = 1000,
-                 react=None, update=None):
+                 react=None, status=None):
         self.react = react            # async (channel, ts) — 수신 확인 리액션 (선택)
-        self.update = update          # async (channel, ts, text) — 메시지 갱신 (선택)
+        self.status = status          # async (channel, thread_ts, text) — AI 앱 상태 (선택)
         self.orch = orch
         self.cfg = cfg
         self.repos = repos
@@ -86,25 +86,14 @@ class BrainHandler:
             except Exception:
                 pass
 
-    async def _thinking(self, say, channel: str, thread_ts):
-        """'생각 중…' 자리 메시지 게시 → ts 반환 (update 불가 환경이면 None)."""
-        if not self.update:
-            return None
-        try:
-            resp = await say(text="🧠 생각 중…", thread_ts=thread_ts)
-            return resp.get("ts") if hasattr(resp, "get") and resp else None
-        except Exception:
-            return None
-
-    async def _deliver(self, say, placeholder_ts, channel: str, thread_ts, text: str):
-        """답변 전달 — 자리 메시지가 있으면 그 메시지를 답변으로 갱신, 없으면 새 메시지."""
-        if placeholder_ts and self.update and channel:
+    async def _set_status(self, channel: str, thread_ts, text: str) -> None:
+        """AI 앱 상태 인디케이터 — 스레드 밑 '생각 중…' 표기 (best-effort).
+        봇이 답글을 게시하면 Slack이 자동으로 지운다."""
+        if self.status and channel and thread_ts:
             try:
-                await self.update(channel, placeholder_ts, text)
-                return
+                await self.status(channel, thread_ts, text)
             except Exception:
                 pass
-        await say(text=text, thread_ts=thread_ts)
 
     def _dedupe(self, body: dict) -> bool:
         event_id = body.get("event_id")
@@ -137,7 +126,7 @@ class BrainHandler:
             await say(text=f"⚠️ {e}", thread_ts=thread_ts)
             return
         await self._ack(event)
-        placeholder = await self._thinking(say, event.get("channel", ""), thread_ts)
+        await self._set_status(event.get("channel", ""), thread_ts, "생각 중…")
 
         async with self._lock:
             tier = self.cfg.role_defaults[Role.BRAIN].tier
@@ -157,9 +146,9 @@ class BrainHandler:
         sess.transcript.append(f"[사용자] {topic}")
         sess.transcript.append(f"[brain] {out.text}")
         self.sessions[thread_ts] = sess
-        await self._deliver(say, placeholder, event.get("channel", ""), thread_ts,
-                            out.text + "\n\n_(이 스레드에 답글로 대화를 이어가세요 — "
-                            f"끝나면 '{HANDOFF_KEYWORD}'라고 하면 crew에 넘깁니다)_")
+        await say(text=out.text + "\n\n_(이 스레드에 답글로 대화를 이어가세요 — "
+                                  f"끝나면 '{HANDOFF_KEYWORD}'라고 하면 crew에 넘깁니다)_",
+                  thread_ts=thread_ts)
 
     async def on_thread_message(self, body: dict, say, *, deduped: bool = False) -> None:
         """진행 중 인터뷰 스레드의 답글 — 세션 지속 또는 핸드오프."""
@@ -182,7 +171,7 @@ class BrainHandler:
             await self._finalize(sess, say)
             return
 
-        placeholder = await self._thinking(say, event.get("channel", ""), thread_ts)
+        await self._set_status(event.get("channel", ""), thread_ts, "생각 중…")
         try:
             async with self._lock:
                 adapter = self.orch.adapters[sess.inst.provider]
@@ -193,12 +182,11 @@ class BrainHandler:
                       thread_ts=thread_ts)
             return
         sess.transcript.append(f"[brain] {out.text}")
-        await self._deliver(say, placeholder, event.get("channel", ""), thread_ts, out.text)
+        await say(text=out.text, thread_ts=thread_ts)
 
     async def _finalize(self, sess: BrainSession, say) -> None:
         """대화 transcript → 스키마 강제 brief → 채널 핸드오프 → crew 실행."""
-        await say(text="📝 인터뷰를 정리해 crew에 넘길 brief를 만듭니다…",
-                  thread_ts=sess.thread_ts)
+        await self._set_status(sess.channel, sess.thread_ts, "brief 정리 중…")
         transcript = "\n".join(sess.transcript)
         try:
             async with self._lock:
