@@ -14,7 +14,7 @@ roleDefaults:
   SECURITY:  { tier: DEFAULT, effort: HIGH }
   QA:        { tier: CHEAP }
   REVIEWER:  { tier: CODEX_DEFAULT }
-  BRAIN:     { tier: DEFAULT, effort: MEDIUM }  # 인터뷰 체감 응답속도
+  BRAIN:     { tier: DEFAULT, effort: XHIGH }  # 검토 품질 우선 (사용자 결정 2026-08-19)
 
 # §10.3 loop guard — Task 실패가 아니라 결정 지점 진입 조건
 loopPolicy:
