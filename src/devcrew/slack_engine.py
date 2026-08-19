@@ -183,8 +183,14 @@ async def _amain() -> None:
     tasks = [AsyncSocketModeHandler(app, app_token).start_async()]
 
     # --- @brain (선택) — 토큰이 있으면 인터뷰 앱을 같은 프로세스에 함께 띄운다 ---
-    brain_bot = os.environ.get("BRAIN_BOT_TOKEN")
-    brain_app_token = os.environ.get("BRAIN_APP_TOKEN")
+    def _real_token(v: str | None, prefix: str) -> str | None:
+        # .env 템플릿의 자리표시자("여기에-붙여넣기")는 미설정으로 취급한다
+        if not v or not v.startswith(prefix) or "붙여넣기" in v:
+            return None
+        return v
+
+    brain_bot = _real_token(os.environ.get("BRAIN_BOT_TOKEN"), "xoxb-")
+    brain_app_token = _real_token(os.environ.get("BRAIN_APP_TOKEN"), "xapp-")
     if brain_bot and brain_app_token:
         from .slack_brain import BrainHandler
 
