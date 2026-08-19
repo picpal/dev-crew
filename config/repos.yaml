@@ -1,0 +1,7 @@
+# repo registry (#16) — Slack 요청의 `이름:` 접두가 여기 이름으로 해석된다.
+# 경로는 절대경로 또는 ~ 확장. 등록된 repo는 git repo여야 한다.
+repos:
+  work-note:       ~/Desktop/workspace/work-note
+  message-gate:    ~/Desktop/workspace/message-gate
+  claude-code-hub: ~/Desktop/workspace/claude-code-hub
+  dev-crew:        ~/Desktop/workspace/dev-crew
