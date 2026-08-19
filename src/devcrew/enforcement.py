@@ -37,6 +37,8 @@ ROLE_POLICY: dict[Role, RolePolicy] = {
     Role.SECURITY: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash(git log:*)"]),
     Role.REVIEWER: RolePolicy(allowed_tools=list(_READ_TOOLS), sandbox="read-only"),
     Role.QA: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash"]),
+    Role.BRAIN: RolePolicy(allowed_tools=list(_READ_TOOLS)),  # 인터뷰 근거용 읽기 전용
+
 }
 
 

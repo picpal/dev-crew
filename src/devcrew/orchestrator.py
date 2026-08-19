@@ -22,6 +22,8 @@ _EFFORT_BY_STR = {"low": EffortLevel.LOW, "medium": EffortLevel.MEDIUM,
                   "max": EffortLevel.MAX}
 
 WORKER_ROLES = {Role.EXPLORER, Role.DEVELOPER, Role.REVIEWER, Role.QA}
+# role 번들이 존재해 spawn 시 로드해야 하는 role 전체 (워크플로 worker + 결정/대화 role)
+BUNDLED_ROLES = WORKER_ROLES | {Role.ORCHESTRATOR, Role.BRAIN}
 
 
 class ReviewQueue:
@@ -67,7 +69,7 @@ class Orchestrator:
         )
         # Load role bundle for WORKER_ROLES + ORCHESTRATOR (decision sessions need
         # their own prompt/output_schema bundle too — Task 5)
-        if role in WORKER_ROLES | {Role.ORCHESTRATOR}:
+        if role in BUNDLED_ROLES:
             bundle = load_bundle(role)
             inst.role_bundle_version = bundle.version
 
@@ -92,7 +94,8 @@ class Orchestrator:
         return inst
 
     async def start_worker(self, inst: AgentInstance, initial_message: str, *,
-                           mcp_servers: dict | None = None) -> str:
+                           mcp_servers: dict | None = None,
+                           conversational: bool = False) -> str:
         """Start a worker agent session with its role bundle injected.
 
         `mcp_servers` is passed through to the adapter's start_session (Task 5/6) —
@@ -124,9 +127,14 @@ class Orchestrator:
         system_prompt = bundle.prompt
         if inst.task_scope:
             system_prompt = f"{bundle.prompt}\n\n## 할당 Scope\n{inst.task_scope}"
+        # conversational=True는 대화형 role(BRAIN 인터뷰) 전용: provider 구조화 출력이
+        # 매 turn을 JSON으로 강제하면 자연어 인터뷰가 불가능하므로 output_schema 주입만
+        # 생략한다. role prompt/tool policy/cwd 강제는 그대로 유지된다. 최종 brief는
+        # 별도의 비대화(conversational=False) 세션이 스키마 강제로 산출한다.
         session_id = await adapter.start_session(
             inst, initial_message,
-            system_prompt=system_prompt, output_schema=bundle.schema,
+            system_prompt=system_prompt,
+            output_schema=None if conversational else bundle.schema,
             mcp_servers=mcp_servers)
         inst.session_id = session_id
         self.registry.upsert(inst, provider_ref=None)

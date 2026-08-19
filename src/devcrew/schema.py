@@ -29,6 +29,7 @@ class Role(str, enum.Enum):
     SECURITY = "SECURITY"
     REVIEWER = "REVIEWER"
     QA = "QA"
+    BRAIN = "BRAIN"           # 대화형 요구사항 인터뷰 (그릴링) — 워크플로 노드 아님
 
 
 class InstanceStatus(str, enum.Enum):

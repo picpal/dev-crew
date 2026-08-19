@@ -14,6 +14,7 @@ roleDefaults:
   SECURITY:  { tier: DEFAULT, effort: HIGH }
   QA:        { tier: CHEAP }
   REVIEWER:  { tier: CODEX_DEFAULT }
+  BRAIN:     { tier: DEFAULT }
 
 # §10.3 loop guard — Task 실패가 아니라 결정 지점 진입 조건
 loopPolicy:

@@ -87,7 +87,8 @@ def test_loop_policy_missing_fails(tmp_path):
         "  DEVELOPER: {tier: CHEAP}\n"
         "  SECURITY: {tier: CHEAP}\n"
         "  QA: {tier: CHEAP}\n"
-        "  REVIEWER: {tier: CHEAP}\n")
+        "  REVIEWER: {tier: CHEAP}\n"
+            "  BRAIN: {tier: CHEAP}\n")
     with pytest.raises(ConfigError, match="loopPolicy"):
         load(p)
 
@@ -104,6 +105,7 @@ def test_loop_policy_nonpositive_fails(tmp_path):
         "  SECURITY: {tier: CHEAP}\n"
         "  QA: {tier: CHEAP}\n"
         "  REVIEWER: {tier: CHEAP}\n"
+            "  BRAIN: {tier: CHEAP}\n"
         "loopPolicy:\n"
         "  maxIterations: 0\n"
         "  maxDurationMinutes: 60\n"
