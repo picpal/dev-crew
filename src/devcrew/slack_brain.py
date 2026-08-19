@@ -14,11 +14,14 @@ import re
 from dataclasses import dataclass, field
 
 from .repos import RepoRegistryError, split_repo_prefix
+from .report.brain_report import render_brief, render_reply, report_id
+from .report.uploader import publish_report
 from .schema import AgentInstance, Role
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 HANDOFF_KEYWORD = "전달"
 TURN_TIMEOUT = 300.0
+REPORT_THRESHOLD = 500      # 이보다 긴 응답은 HTML 리포트 링크로 제공
 
 
 @dataclass
@@ -28,6 +31,7 @@ class BrainSession:
     channel: str
     thread_ts: str
     repo_name: str | None
+    topic: str = ""
     transcript: list[str] = field(default_factory=list)
 
 
@@ -66,9 +70,10 @@ class BrainHandler:
     """
 
     def __init__(self, orch, cfg, repos: dict, crew_dispatch, *, max_seen: int = 1000,
-                 react=None, status=None):
+                 react=None, status=None, publish=publish_report):
         self.react = react            # async (channel, ts) — 수신 확인 리액션 (선택)
         self.status = status          # async (channel, thread_ts, text) — AI 앱 상태 (선택)
+        self.publish = publish        # (task_id, html) -> url|None — 리포트 업로드
         self.orch = orch
         self.cfg = cfg
         self.repos = repos
@@ -85,6 +90,22 @@ class BrainHandler:
                 await self.react(event["channel"], event["ts"])
             except Exception:
                 pass
+
+    async def _with_report(self, sess: BrainSession, full_text: str) -> str:
+        """긴 응답은 HTML 리포트로 업로드하고 요약+링크를 반환. 실패·미설정 시 원문 유지."""
+        if len(full_text) < REPORT_THRESHOLD:
+            return full_text
+        try:
+            html = render_reply(topic=sess.topic or "인터뷰", mode_hint="BRAIN 인터뷰",
+                                repo=sess.repo_name, text=full_text)
+            rid = report_id(f"{sess.thread_ts}:{len(sess.transcript)}")
+            url = await asyncio.to_thread(self.publish, rid, html)
+        except Exception:
+            return full_text
+        if not url:
+            return full_text
+        head = full_text.strip().split("\n\n")[0][:300]
+        return f"{head}\n\n📄 전체 응답: {url}"
 
     async def _set_status(self, channel: str, thread_ts, text: str) -> None:
         """AI 앱 상태 인디케이터 — 스레드 밑 '생각 중…' 표기 (best-effort).
@@ -142,12 +163,13 @@ class BrainHandler:
                 adapter.send(sid, "인터뷰를 시작해라. 첫 질문 하나를 권장안과 함께 던져라."),
                 timeout=TURN_TIMEOUT)
         sess = BrainSession(inst=inst, session_id=sid, channel=event.get("channel", ""),
-                            thread_ts=thread_ts, repo_name=repo_name)
+                            thread_ts=thread_ts, repo_name=repo_name, topic=topic)
         sess.transcript.append(f"[사용자] {topic}")
         sess.transcript.append(f"[brain] {out.text}")
         self.sessions[thread_ts] = sess
-        await say(text=out.text + "\n\n_(이 스레드에 답글로 대화를 이어가세요 — "
-                                  f"끝나면 '{HANDOFF_KEYWORD}'라고 하면 crew에 넘깁니다)_",
+        reply = await self._with_report(sess, out.text)
+        await say(text=reply + "\n\n_(이 스레드에 답글로 대화를 이어가세요 — "
+                               f"끝나면 '{HANDOFF_KEYWORD}'라고 하면 crew에 넘깁니다)_",
                   thread_ts=thread_ts)
 
     async def on_thread_message(self, body: dict, say, *, deduped: bool = False) -> None:
@@ -182,7 +204,7 @@ class BrainHandler:
                       thread_ts=thread_ts)
             return
         sess.transcript.append(f"[brain] {out.text}")
-        await say(text=out.text, thread_ts=thread_ts)
+        await say(text=await self._with_report(sess, out.text), thread_ts=thread_ts)
 
     async def _finalize(self, sess: BrainSession, say) -> None:
         """대화 transcript → 스키마 강제 brief → 채널 핸드오프 → crew 실행."""
@@ -216,10 +238,23 @@ class BrainHandler:
                       thread_ts=sess.thread_ts)
             return
 
-        await say(text="✅ brief 확정:\n" + format_brief(brief), thread_ts=sess.thread_ts)
+        brief_url = None
+        try:
+            html = render_brief(brief=brief, repo=sess.repo_name)
+            brief_url = await asyncio.to_thread(
+                self.publish, report_id(f"brief:{sess.thread_ts}"), html)
+        except Exception:
+            brief_url = None
+        confirm = "✅ brief 확정:\n" + format_brief(brief)
+        if brief_url:
+            confirm += f"\n\n📄 리포트: {brief_url}"
+        await say(text=confirm, thread_ts=sess.thread_ts)
         task = brief_to_task(brief, sess.repo_name)
         link = sess.thread_ts
-        await self.crew_dispatch(task, sess.channel, link, format_brief(brief))
+        handoff_text = format_brief(brief)
+        if brief_url:
+            handoff_text += f"\n📄 리포트: {brief_url}"
+        await self.crew_dispatch(task, sess.channel, link, handoff_text)
         # 핸드오프 완료 — 세션 정리 (대화 이력은 crew로 넘어가지 않는다)
         try:
             adapter = self.orch.adapters[sess.inst.provider]

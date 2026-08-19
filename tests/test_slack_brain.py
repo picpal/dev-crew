@@ -131,3 +131,50 @@ def test_brief_to_task_includes_repo_prefix():
 
 def test_brief_to_task_falls_back_to_session_repo():
     assert brief_to_task(BRIEF_PASS, "message-gate").startswith("message-gate: ")
+
+
+@pytest.mark.asyncio
+async def test_long_reply_becomes_report_link(tmp_path):
+    long_answer = "긴 검토 내용입니다. " * 60          # > REPORT_THRESHOLD
+    trace_dir = tmp_path
+    from devcrew.store.trace import TraceStore
+    from devcrew.store.registry import SessionRegistry
+    from devcrew.orchestrator import Orchestrator
+    from devcrew.adapters.base import FakeAdapter
+    from devcrew.schema import Provider
+    from devcrew.config import load as load_config
+    fake = FakeAdapter(script=[long_answer], structured_script=[BRIEF_PASS])
+    orch = Orchestrator(TraceStore(trace_dir / "t.db"), SessionRegistry(trace_dir / "h.db"),
+                        {Provider.CLAUDE_CODE: fake, Provider.CODEX: fake})
+    published = {}
+    def publish(task_id, html):
+        published["id"], published["html"] = task_id, html
+        return f"https://reports.example/tasks/{task_id}"
+    h = BrainHandler(orch, load_config(), {}, DispatchSpy(), publish=publish)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 대규모 구조 변경"), say)
+    msg = say.messages[0]["text"]
+    assert "📄 전체 응답: https://reports.example/tasks/brain-" in msg
+    assert len(published["html"]) > 0 and published["id"].startswith("brain-")
+    assert "<script" not in published["html"]
+
+
+@pytest.mark.asyncio
+async def test_brief_report_link_in_handoff(tmp_path):
+    def publish(task_id, html):
+        return f"https://reports.example/tasks/{task_id}"
+    h, dispatch, _ = make_handler(tmp_path)
+    h.publish = publish
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvRep"), say)
+    assert any("📄 리포트: https://reports.example/tasks/brain-" in m["text"]
+               for m in say.messages)
+
+
+def test_md_lite_escapes_and_structures():
+    from devcrew.report.brain_report import md_lite
+    out = md_lite("## 제목\n- 항목 **강조** `코드`\n<script>alert(1)</script>")
+    assert "<h2>제목</h2>" in out and "<strong>강조</strong>" in out
+    assert "<code>코드</code>" in out
+    assert "<script>" not in out and "&lt;script&gt;" in out
