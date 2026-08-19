@@ -178,3 +178,41 @@ def test_md_lite_escapes_and_structures():
     assert "<h2>제목</h2>" in out and "<strong>강조</strong>" in out
     assert "<code>코드</code>" in out
     assert "<script>" not in out and "&lt;script&gt;" in out
+
+
+def test_parse_options_and_blocks():
+    from devcrew.slack_brain import parse_options, question_blocks
+    text = "범위를 정하죠.\nA) 최소 범위 (권장)\nB) 전체 재설계\n이유: ..."
+    opts = parse_options(text)
+    assert opts == ["A) 최소 범위 (권장)", "B) 전체 재설계"]
+    blocks = question_blocks(text, opts)
+    btns = blocks[1]["elements"]
+    assert btns[0]["style"] == "primary" and "style" not in btns[1]
+    assert btns[0]["value"] == "A) 최소 범위 (권장)"
+    assert parse_options("A) 하나뿐") == []                    # 1개는 무효
+
+
+@pytest.mark.asyncio
+async def test_button_answer_feeds_session(tmp_path):
+    h, _, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    stripped = []
+    async def strip():
+        stripped.append(True)
+    await h.on_answer(thread_ts="100.1", value="A) 최소 범위 (권장)", say=say, strip=strip)
+    sess = h.sessions["100.1"]
+    assert "[사용자] A) 최소 범위 (권장)" in sess.transcript
+    assert stripped == [True]
+    assert "질문2" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_report_form_marker_accepted_from_bot(tmp_path):
+    from devcrew.slack_brain import ANSWER_MARKER
+    h, _, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply(f"{ANSWER_MARKER} B) 전체 재설계",
+                                    event_id="EvMk", bot=True), say)
+    assert "[사용자] B) 전체 재설계" in h.sessions["100.1"].transcript

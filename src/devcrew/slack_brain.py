@@ -19,6 +19,8 @@ from .report.uploader import publish_report
 from .schema import AgentInstance, Role
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
+_OPTION_RE = re.compile(r"^([A-Z])\)\s+(.+)$")
+ANSWER_MARKER = "\U0001F4E9 선택 답변:"     # 리포트 폼(worker)이 게시하는 답변 접두
 HANDOFF_KEYWORD = "전달"
 TURN_TIMEOUT = 300.0
 REPORT_THRESHOLD = 500      # 이보다 긴 응답은 HTML 리포트 링크로 제공
@@ -33,6 +35,31 @@ class BrainSession:
     repo_name: str | None
     topic: str = ""
     transcript: list[str] = field(default_factory=list)
+
+
+def parse_options(text: str) -> list[str]:
+    """`A) 내용` 형식 줄들을 선택지로 추출 (2개 이상일 때만 유효)."""
+    opts = [m.group(0).strip() for line in text.splitlines()
+            if (m := _OPTION_RE.match(line.strip()))]
+    return opts if len(opts) >= 2 else []
+
+
+def question_blocks(text: str, options: list[str]) -> list[dict]:
+    """질문 본문 + 선택지 버튼 Block Kit. '(권장)' 선택지는 primary 스타일."""
+    buttons = []
+    for opt in options[:10]:                      # actions block 버튼 한도
+        btn = {"type": "button", "action_id": f"brain_answer_{opt[0]}",
+               "text": {"type": "plain_text", "text": opt[:75]},
+               "value": opt[:2000]}
+        if "(권장)" in opt:
+            btn["style"] = "primary"
+        buttons.append(btn)
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}},
+        {"type": "actions", "block_id": "brain_answers", "elements": buttons},
+        {"type": "context", "elements": [{"type": "mrkdwn",
+            "text": "버튼 선택 또는 답글로 직접 입력 · 끝나면 '전달'"}]},
+    ]
 
 
 def format_brief(brief: dict) -> str:
@@ -90,6 +117,54 @@ class BrainHandler:
                 await self.react(event["channel"], event["ts"])
             except Exception:
                 pass
+
+    async def _say_reply(self, say, sess: BrainSession, text: str, thread_ts,
+                         *, first: bool = False) -> None:
+        """brain 응답 발신 — 선택형 질문이면 스레드 내 버튼(Block Kit), 아니면 텍스트
+        (긴 응답은 리포트 링크)."""
+        options = parse_options(text)
+        guide = ("\n\n_(버튼 선택 또는 답글로 대화 — "
+                 f"끝나면 '{HANDOFF_KEYWORD}'라고 하면 crew에 넘깁니다)_" if first else "")
+        if options:
+            try:
+                await say(text=text[:2900] + guide, thread_ts=thread_ts,
+                          blocks=question_blocks(text + guide, options))
+                return
+            except TypeError:
+                pass                              # say가 blocks 미지원(테스트 대역 등)
+        await say(text=await self._with_report(sess, text) + guide, thread_ts=thread_ts)
+
+    async def on_answer(self, *, thread_ts: str, value: str, say, strip=None) -> None:
+        """스레드 내 버튼 클릭 → 선택지를 사용자 답변으로 처리."""
+        sess = self.sessions.get(thread_ts)
+        if sess is None:
+            await say(text="⚠️ 이 인터뷰 세션은 종료됐습니다. 새로 @brain 멘션으로 시작하세요.",
+                      thread_ts=thread_ts)
+            return
+        if strip:
+            try:
+                await strip()                     # 원 메시지 버튼 제거 + 선택 표기
+            except Exception:
+                pass
+        await self._process_answer(sess, value, say)
+
+    async def _process_answer(self, sess: BrainSession, text: str, say) -> None:
+        sess.transcript.append(f"[사용자] {text}")
+        if HANDOFF_KEYWORD in text:
+            await self._finalize(sess, say)
+            return
+        await self._set_status(sess.channel, sess.thread_ts, "생각 중…")
+        try:
+            async with self._lock:
+                adapter = self.orch.adapters[sess.inst.provider]
+                out = await asyncio.wait_for(adapter.send(sess.session_id, text),
+                                             timeout=TURN_TIMEOUT)
+        except Exception as e:
+            await say(text=f"💥 인터뷰 turn 실패: {type(e).__name__}: {e}",
+                      thread_ts=sess.thread_ts)
+            return
+        sess.transcript.append(f"[brain] {out.text}")
+        await self._say_reply(say, sess, out.text, sess.thread_ts)
 
     async def _with_report(self, sess: BrainSession, full_text: str) -> str:
         """긴 응답은 HTML 리포트로 업로드하고 요약+링크를 반환. 실패·미설정 시 원문 유지."""
@@ -167,44 +242,25 @@ class BrainHandler:
         sess.transcript.append(f"[사용자] {topic}")
         sess.transcript.append(f"[brain] {out.text}")
         self.sessions[thread_ts] = sess
-        reply = await self._with_report(sess, out.text)
-        await say(text=reply + "\n\n_(이 스레드에 답글로 대화를 이어가세요 — "
-                               f"끝나면 '{HANDOFF_KEYWORD}'라고 하면 crew에 넘깁니다)_",
-                  thread_ts=thread_ts)
+        await self._say_reply(say, sess, out.text, thread_ts, first=True)
 
     async def on_thread_message(self, body: dict, say, *, deduped: bool = False) -> None:
         """진행 중 인터뷰 스레드의 답글 — 세션 지속 또는 핸드오프."""
         if not deduped and self._dedupe(body):
             return
         event = body.get("event") or {}
-        if event.get("bot_id"):              # 봇 메시지(자기 자신·crew) 무시 — 루프 차단
-            return
+        text = _MENTION_RE.sub("", event.get("text") or "").strip()
+        if event.get("bot_id"):
+            # 봇 메시지는 무시하되, 리포트 폼(worker)이 게시한 선택 답변 마커는 수용
+            if not text.startswith(ANSWER_MARKER):
+                return
+            text = text[len(ANSWER_MARKER):].strip()
         thread_ts = event.get("thread_ts")
         sess = self.sessions.get(thread_ts)
-        if sess is None:
-            return
-        text = _MENTION_RE.sub("", event.get("text") or "").strip()
-        if not text:
+        if sess is None or not text:
             return
         await self._ack(event)
-        sess.transcript.append(f"[사용자] {text}")
-
-        if HANDOFF_KEYWORD in text:
-            await self._finalize(sess, say)
-            return
-
-        await self._set_status(event.get("channel", ""), thread_ts, "생각 중…")
-        try:
-            async with self._lock:
-                adapter = self.orch.adapters[sess.inst.provider]
-                out = await asyncio.wait_for(adapter.send(sess.session_id, text),
-                                             timeout=TURN_TIMEOUT)
-        except Exception as e:
-            await say(text=f"💥 인터뷰 turn 실패: {type(e).__name__}: {e}",
-                      thread_ts=thread_ts)
-            return
-        sess.transcript.append(f"[brain] {out.text}")
-        await say(text=await self._with_report(sess, out.text), thread_ts=thread_ts)
+        await self._process_answer(sess, text, say)
 
     async def _finalize(self, sess: BrainSession, say) -> None:
         """대화 transcript → 스키마 강제 brief → 채널 핸드오프 → crew 실행."""

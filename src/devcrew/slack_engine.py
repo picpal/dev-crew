@@ -300,6 +300,25 @@ async def _amain() -> None:
         async def on_brain_message(body, say):         # 진행 중 인터뷰 스레드 답글만 반응
             await brain.on_thread_message(body, say)
 
+        @brain_app.action(re.compile("brain_answer_.*"))
+        async def on_brain_answer(ack, body):          # 스레드 내 선택지 버튼 클릭
+            await ack()
+            ch = body["channel"]["id"]
+            msg = body.get("message") or {}
+            thread = msg.get("thread_ts") or msg.get("ts")
+            value = body["actions"][0]["value"]
+
+            async def bsay(*, text, thread_ts=None, blocks=None):
+                return await brain_app.client.chat_postMessage(
+                    channel=ch, text=text, thread_ts=thread_ts or thread, blocks=blocks)
+
+            async def strip():
+                await brain_app.client.chat_update(
+                    channel=ch, ts=msg["ts"], blocks=[],
+                    text=(msg.get("text") or "질문")[:2800] + f"\n\n✅ 선택: {value}")
+
+            await brain.on_answer(thread_ts=thread, value=value, say=bsay, strip=strip)
+
         tasks.append(AsyncSocketModeHandler(brain_app, brain_app_token).start_async())
         print("devcrew: @brain 인터뷰 앱 활성화")
 
