@@ -24,7 +24,7 @@ class FakeRunner:
         self.busy = False
         self.calls: list[str] = []
 
-    async def run(self, task: str):
+    async def run(self, task: str, *, on_progress=None):
         self.calls.append(task)
         if self.timeout_flag:
             raise asyncio.TimeoutError
@@ -94,3 +94,16 @@ def test_format_result_needs_human_icon():
     assert text.startswith("🙋 SLACK-2 NEEDS_HUMAN")
     assert "develop:PASS → review:PASS" in text
     assert "토큰 12,345" in text
+
+
+def test_progress_text_shows_stage_and_path():
+    from devcrew.slack_engine import progress_text
+    events = [
+        {"event_type": "ModelRoutingEvent", "payload": {"role": "DEVELOPER"}},
+        {"event_type": "NodeTransitionEvent", "payload": {"node_id": "develop", "transition": "PASS"}},
+        {"event_type": "ModelRoutingEvent", "payload": {"role": "REVIEWER"}},
+        {"event_type": "DecisionEvent", "payload": {}},
+    ]
+    t = progress_text(events, 32.7)
+    assert "실행 중 (32s)" in t and "현재: REVIEWER" in t
+    assert "develop:PASS" in t and "결정 1회" in t

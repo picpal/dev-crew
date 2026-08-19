@@ -45,6 +45,22 @@ def make_toy_repo() -> Path:
     return repo
 
 
+def progress_text(events: list, elapsed: float) -> str:
+    """trace 이벤트 → 진행 상태 한 줄 (chat.update용, 순수 함수)."""
+    spawns = [e for e in events if e["event_type"] == "ModelRoutingEvent"]
+    trans = [e for e in events if e["event_type"] == "NodeTransitionEvent"]
+    decisions = [e for e in events if e["event_type"] == "DecisionEvent"]
+    current = spawns[-1]["payload"]["role"] if spawns else "준비"
+    txt = f"🛠 실행 중 ({int(elapsed)}s) — 현재: {current}"
+    if decisions:
+        txt += f" · 결정 {len(decisions)}회"
+    path = " → ".join(f"{e['payload']['node_id']}:{e['payload']['transition']}"
+                      for e in trans)
+    if path:
+        txt += f"\n경로: {path}"
+    return txt
+
+
 def format_result(execution_id: str, result, repo: str) -> str:
     """ExecutionResult → Slack 회신 텍스트."""
     icon = {"COMPLETED": "✅", "NEEDS_HUMAN": "🙋", "ABORTED": "❌"}.get(result.status, "❓")
@@ -99,8 +115,11 @@ class EngineRunner:
     def busy(self) -> bool:
         return any(l.locked() for l in self._locks.values())
 
-    async def run(self, task: str) -> tuple[str, object, str]:
-        """task 1건 실행 → (execution_id, ExecutionResult, repo 경로)."""
+    async def run(self, task: str, *, on_progress=None) -> tuple[str, object, str]:
+        """task 1건 실행 → (execution_id, ExecutionResult, repo 경로).
+
+        on_progress: async (text) — 지정 시 4초 간격으로 진행 상태 텍스트를 보낸다
+        (trace 이벤트 폴링 기반 — 엔진 코어 변경 없음)."""
         from .decision import make_llm_decide
         from .engine import WorkflowEngine
         from .workflow import DEFAULT_TEMPLATE
@@ -118,18 +137,39 @@ class EngineRunner:
                 where = workspace
             decide = make_llm_decide(self.orch, self.cfg, mcp_servers=self.mcp)
             engine = WorkflowEngine(self.orch, self.cfg, decide_fn=decide)
-            result = await asyncio.wait_for(
-                engine.run(execution_id=execution_id, task=task, worktree=workspace),
-                timeout=self.timeout)
+            poller = None
+            if on_progress is not None:
+                loop = asyncio.get_running_loop()
+                started = loop.time()
+
+                async def _poll():
+                    while True:
+                        await asyncio.sleep(4)
+                        try:
+                            evs = self.trace.events(execution_id=execution_id)
+                            await on_progress(progress_text(evs, loop.time() - started))
+                        except Exception:
+                            pass                     # 상태 갱신은 best-effort
+
+                poller = asyncio.create_task(_poll())
+            try:
+                result = await asyncio.wait_for(
+                    engine.run(execution_id=execution_id, task=task, worktree=workspace),
+                    timeout=self.timeout)
+            finally:
+                if poller is not None:
+                    poller.cancel()
             return execution_id, result, where
 
 
 class MentionHandler:
     """app_mention 이벤트 처리 — bolt와 분리된 순수 로직 (테스트 대상)."""
 
-    def __init__(self, runner: EngineRunner, *, max_seen: int = 1000, react=None):
+    def __init__(self, runner: EngineRunner, *, max_seen: int = 1000, react=None,
+                 update=None):
         self.runner = runner
         self.react = react            # async (channel, ts) — 수신 확인 리액션 (선택)
+        self.update = update          # async (channel, ts, text) — 메시지 갱신 (선택)
         self._seen: set[str] = set()
         self._max_seen = max_seen
 
@@ -156,9 +196,20 @@ class MentionHandler:
             except Exception:
                 pass                   # reactions:write scope 없음 등 — 리액션은 best-effort
         note = " (앞선 요청 완료 후 순차 실행됩니다)" if self.runner.busy else ""
-        await say(text=f"⏳ 접수: {task}{note}", thread_ts=thread_ts)
+        resp = await say(text=f"⏳ 접수: {task}{note}", thread_ts=thread_ts)
+        status_ts = resp.get("ts") if hasattr(resp, "get") and resp else None
+        channel = event.get("channel")
+        on_progress = None
+        if self.update and status_ts and channel:
+            async def on_progress(text):
+                await self.update(channel, status_ts, text)
         try:
-            execution_id, result, repo = await self.runner.run(task)
+            execution_id, result, repo = await self.runner.run(task, on_progress=on_progress)
+            if on_progress:
+                try:
+                    await self.update(channel, status_ts, f"✅ 완료 — {execution_id}")
+                except Exception:
+                    pass
             await say(text=format_result(execution_id, result, repo), thread_ts=thread_ts)
         except RepoRegistryError as e:
             await say(text=f"⚠️ {e}", thread_ts=thread_ts)
@@ -184,7 +235,10 @@ async def _amain() -> None:
     async def crew_react(channel: str, ts: str) -> None:
         await app.client.reactions_add(channel=channel, timestamp=ts, name="eyes")
 
-    handler = MentionHandler(runner, react=crew_react)
+    async def crew_update(channel: str, ts: str, text: str) -> None:
+        await app.client.chat_update(channel=channel, ts=ts, text=text)
+
+    handler = MentionHandler(runner, react=crew_react, update=crew_update)
 
     @app.event("app_mention")
     async def on_mention(body, say):
@@ -223,16 +277,20 @@ async def _amain() -> None:
             handoff_ts = resp["ts"]
 
             async def crew_say(*, text: str, thread_ts=None):
-                await app.client.chat_postMessage(channel=channel, text=text,
-                                                  thread_ts=thread_ts or handoff_ts)
+                return await app.client.chat_postMessage(channel=channel, text=text,
+                                                         thread_ts=thread_ts or handoff_ts)
 
-            await handler({"event": {"text": task, "ts": handoff_ts}}, crew_say)
+            await handler({"event": {"text": task, "ts": handoff_ts,
+                                     "channel": channel}}, crew_say)
 
         async def brain_react(channel: str, ts: str) -> None:
             await brain_app.client.reactions_add(channel=channel, timestamp=ts, name="eyes")
 
+        async def brain_update(channel: str, ts: str, text: str) -> None:
+            await brain_app.client.chat_update(channel=channel, ts=ts, text=text)
+
         brain = BrainHandler(runner.orch, runner.cfg, runner.repos, crew_dispatch,
-                             react=brain_react)
+                             react=brain_react, update=brain_update)
 
         @brain_app.event("app_mention")
         async def on_brain_mention(body, say):
