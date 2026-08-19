@@ -123,8 +123,9 @@ class EngineRunner:
 class MentionHandler:
     """app_mention 이벤트 처리 — bolt와 분리된 순수 로직 (테스트 대상)."""
 
-    def __init__(self, runner: EngineRunner, *, max_seen: int = 1000):
+    def __init__(self, runner: EngineRunner, *, max_seen: int = 1000, react=None):
         self.runner = runner
+        self.react = react            # async (channel, ts) — 수신 확인 리액션 (선택)
         self._seen: set[str] = set()
         self._max_seen = max_seen
 
@@ -145,6 +146,11 @@ class MentionHandler:
                       thread_ts=thread_ts)
             return
 
+        if self.react and event.get("channel") and event.get("ts"):
+            try:
+                await self.react(event["channel"], event["ts"])
+            except Exception:
+                pass                   # reactions:write scope 없음 등 — 리액션은 best-effort
         note = " (앞선 요청 완료 후 순차 실행됩니다)" if self.runner.busy else ""
         await say(text=f"⏳ 접수: {task}{note}", thread_ts=thread_ts)
         try:
@@ -170,7 +176,11 @@ async def _amain() -> None:
 
     app = AsyncApp(token=bot_token)
     runner = EngineRunner()
-    handler = MentionHandler(runner)
+
+    async def crew_react(channel: str, ts: str) -> None:
+        await app.client.reactions_add(channel=channel, timestamp=ts, name="eyes")
+
+    handler = MentionHandler(runner, react=crew_react)
 
     @app.event("app_mention")
     async def on_mention(body, say):
@@ -214,7 +224,11 @@ async def _amain() -> None:
 
             await handler({"event": {"text": task, "ts": handoff_ts}}, crew_say)
 
-        brain = BrainHandler(runner.orch, runner.cfg, runner.repos, crew_dispatch)
+        async def brain_react(channel: str, ts: str) -> None:
+            await brain_app.client.reactions_add(channel=channel, timestamp=ts, name="eyes")
+
+        brain = BrainHandler(runner.orch, runner.cfg, runner.repos, crew_dispatch,
+                             react=brain_react)
 
         @brain_app.event("app_mention")
         async def on_brain_mention(body, say):

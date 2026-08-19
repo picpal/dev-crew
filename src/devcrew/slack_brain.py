@@ -65,7 +65,9 @@ class BrainHandler:
     게시와 crew 실행을 담당하는 콜백 (bolt 배선은 slack_engine이 소유).
     """
 
-    def __init__(self, orch, cfg, repos: dict, crew_dispatch, *, max_seen: int = 1000):
+    def __init__(self, orch, cfg, repos: dict, crew_dispatch, *, max_seen: int = 1000,
+                 react=None):
+        self.react = react            # async (channel, ts) — 수신 확인 리액션 (선택)
         self.orch = orch
         self.cfg = cfg
         self.repos = repos
@@ -74,6 +76,14 @@ class BrainHandler:
         self._seen: set[str] = set()
         self._max_seen = max_seen
         self._lock = asyncio.Lock()          # 인터뷰 turn 직렬화 (세션당 동시 1 turn)
+
+    async def _ack(self, event: dict) -> None:
+        """수신 확인 리액션 — 처리 대기 중임을 요청 메시지에 표기 (best-effort)."""
+        if self.react and event.get("channel") and event.get("ts"):
+            try:
+                await self.react(event["channel"], event["ts"])
+            except Exception:
+                pass
 
     def _dedupe(self, body: dict) -> bool:
         event_id = body.get("event_id")
@@ -105,6 +115,7 @@ class BrainHandler:
         except RepoRegistryError as e:
             await say(text=f"⚠️ {e}", thread_ts=thread_ts)
             return
+        await self._ack(event)
 
         async with self._lock:
             tier = self.cfg.role_defaults[Role.BRAIN].tier
@@ -142,6 +153,7 @@ class BrainHandler:
         text = _MENTION_RE.sub("", event.get("text") or "").strip()
         if not text:
             return
+        await self._ack(event)
         sess.transcript.append(f"[사용자] {text}")
 
         if HANDOFF_KEYWORD in text:
