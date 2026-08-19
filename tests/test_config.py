@@ -8,7 +8,7 @@ def test_load_default_config():
     assert cfg.tiers["CHEAP"].model == "claude-sonnet-5"
     assert cfg.tiers["CODEX_HIGH_REASONING"].model == "gpt-5.6-sol"
     assert cfg.role_defaults[Role.EXPLORER].tier == "CHEAP"
-    assert cfg.role_defaults[Role.REVIEWER].tier == "CODEX_DEFAULT"
+    assert cfg.role_defaults[Role.REVIEWER].tier == "CODEX_HIGH_REASONING"
 
 
 def test_missing_config_is_fail_fast(tmp_path):

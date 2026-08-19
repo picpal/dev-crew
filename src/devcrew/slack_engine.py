@@ -7,7 +7,7 @@ DEFAULT_TEMPLATE 워크플로를 실행하고 스레드로 결과를 회신한�
 선택 env:
   DEVCREW_TARGET_REPO   실행 대상 git repo 경로 (registry 접두 없을 때의 기본값)
   DEVCREW_RUNTIME_DIR   trace.db/harness.db 위치 (기본 .devcrew-runtime/)
-  DEVCREW_ORCH_TIER     ORCHESTRATOR 결정 세션 tier (기본 CHEAP — 비용 원칙)
+  DEVCREW_ORCH_TIER     ORCHESTRATOR 결정 세션 tier override (기본: config = opus HIGH)
   DEVCREW_TASK_TIMEOUT  요청당 타임아웃 초 (기본 600)
 
 정책: `repo명: 작업` 접두로 config/repos.yaml registry의 repo를 지정한다. 등록
@@ -77,11 +77,15 @@ class EngineRunner:
             Provider.CODEX: CodexAdapter(self.trace, self.registry),
         })
         cfg = load_config()
-        orch_tier = os.environ.get("DEVCREW_ORCH_TIER", "CHEAP")
-        role_defaults = dict(cfg.role_defaults)
-        role_defaults[Role.ORCHESTRATOR] = dataclasses.replace(
-            role_defaults[Role.ORCHESTRATOR], tier=orch_tier)
-        self.cfg = dataclasses.replace(cfg, role_defaults=role_defaults)
+        # 사용자 결정(2026-08-19): 결정 세션도 config 기본(opus HIGH)을 따른다.
+        # DEVCREW_ORCH_TIER를 명시한 경우에만 override.
+        orch_tier = os.environ.get("DEVCREW_ORCH_TIER")
+        if orch_tier:
+            role_defaults = dict(cfg.role_defaults)
+            role_defaults[Role.ORCHESTRATOR] = dataclasses.replace(
+                role_defaults[Role.ORCHESTRATOR], tier=orch_tier)
+            cfg = dataclasses.replace(cfg, role_defaults=role_defaults)
+        self.cfg = cfg
         self.mcp = {"harness": build_harness_mcp(self.trace)}
         self.timeout = float(os.environ.get("DEVCREW_TASK_TIMEOUT", "600"))
         self.repos = load_repos()

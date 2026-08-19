@@ -22,7 +22,7 @@ from .workflow import (ALLOWED_BY_TRIGGER, DEFAULT_TEMPLATE, NodeSpec, Step,
                        WorkflowError, WorkflowTemplate, next_step)
 
 # §7.6 MODEL_ESCALATION 사다리 — 엔진 init에서 cfg.tiers 존재 검증
-ESCALATION_LADDER = {"CHEAP": "DEFAULT", "DEFAULT": "HIGH_CAPABILITY",
+ESCALATION_LADDER = {"HAIKU_FAST": "DEFAULT", "CHEAP": "DEFAULT", "DEFAULT": "HIGH_CAPABILITY",
                      "CODEX_DEFAULT": "CODEX_HIGH_REASONING"}
 
 # finding #1 — REPLAN/RETRY_NODE는 실행 전체에서 각 2회까지만 적용된다 (3회째부터는

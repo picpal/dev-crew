@@ -16,6 +16,7 @@ class RoutingValidationError(Exception):
 
 # 조사 근거: docs/research/model-effort.md §1.2, §2.2 (2026-08-14 검증)
 SUPPORT_MATRIX: dict[str, frozenset[str]] = {
+    "claude-haiku-4-5-20251001": frozenset({"low", "medium", "high"}),
     "claude-sonnet-5": frozenset({"low", "medium", "high", "xhigh", "max"}),
     "claude-opus-5": frozenset({"low", "medium", "high", "xhigh", "max"}),
     "gpt-5.6-terra": frozenset({"none", "low", "medium", "high", "xhigh", "max"}),
