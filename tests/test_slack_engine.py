@@ -144,3 +144,22 @@ def test_format_result_without_new_fields_still_renders():
     text = format_result("SLACK-9", FakeResult(), "/tmp/repo")
     assert "develop:PASS → review:PASS" in text
     assert "사유:" not in text
+
+
+def test_format_result_renders_budget_warnings_separately_from_reason():
+    """role 예산 초과는 경보 줄로만 나오고 종료 사유가 되지 않는다."""
+    @dataclass
+    class R:
+        status: str = "COMPLETED"
+        node_history: list = field(default_factory=list)
+        decisions: int = 0
+        total_tokens: int = 700000
+        reason: str = "모든 노드 통과"
+        path: list = field(default_factory=lambda: ["develop:PASS", "review:PASS"])
+        role_tokens: dict = field(default_factory=lambda: {"DEVELOPER": 700000})
+        warnings: list = field(default_factory=lambda: ["DEVELOPER 예산 초과 (700,000/600,000)"])
+
+    text = format_result("SLACK-3", R(), "/tmp/repo")
+    assert text.startswith("✅ SLACK-3 COMPLETED")
+    assert "⚠️ DEVELOPER 예산 초과 (700,000/600,000)" in text
+    assert "사유: 모든 노드 통과" in text

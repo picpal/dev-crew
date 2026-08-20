@@ -117,9 +117,10 @@ class ExecutionResult:
     node_history: list[dict]     # [{node_id, transition, iteration}]
     decisions: int
     total_tokens: int
-    reason: str = ""             # 종료 사유 (예산 초과·loop guard·ASK_USER rationale)
+    reason: str = ""             # 종료 사유 (loop guard·예산 상한·ASK_USER rationale)
     path: list[str] = field(default_factory=list)        # leader 결정 홉까지 포함한 전체 경로
     role_tokens: dict[str, int] = field(default_factory=dict)   # role별 누적 토큰
+    warnings: list[str] = field(default_factory=list)    # 경보 (종료 사유는 아님)
 
 
 class WorkflowEngine:
@@ -171,6 +172,11 @@ class WorkflowEngine:
         # 완료된 노드 결과 취합분 — 다음 노드 최초 투입 메시지에 주입된다
         completed: list[dict] = []
         guard_reason = ""
+        # role 예산 초과는 종료 트리거가 아니라 경보다 — adapter.send() 하나가 그
+        # 에이전트의 전체 agentic turn이라 토큰은 사후에만 보이고, 다음 홉을 막는
+        # 실효 가드는 반복(iterations/visits/same-finding)과 시간이다. 정상 완료한
+        # 작업을 토큰 숫자만으로 죽이던 오류(2026-08-20 SLACK-1/SLACK-2) 교정.
+        warnings: list[str] = []
         same_finding_sig = None
         same_finding_count = 0
         # finding #1 — 실행 전체 누적 카운터. 어떤 재진입/리셋 경로도 이 값들을
@@ -193,12 +199,11 @@ class WorkflowEngine:
                 return f"{role_value} 예산 초과 ({used:,}/{limit:,})"
             return None
 
-        def any_role_over_budget() -> str | None:
+        def note_budget_warnings() -> None:
             for rv in sorted(role_tokens):
                 msg = over_budget(rv)
-                if msg:
-                    return msg
-            return None
+                if msg and msg not in warnings:
+                    warnings.append(msg)
 
         def find_node(node_id: str | None) -> NodeRuntime | None:
             if node_id is None:
@@ -222,6 +227,7 @@ class WorkflowEngine:
                                    lp.same_finding_escalation_threshold,
                                "role_budgets": dict(lp.role_budgets)},
                 "spent_tokens": {"total": total_tokens, "by_role": dict(role_tokens)},
+                "budget_warnings": list(warnings),
                 "guard_reason": guard_reason,
             }
 
@@ -324,8 +330,10 @@ class WorkflowEngine:
                 return await run_node(rt, follow_up_msg)
 
         def done(status: str, reason: str) -> ExecutionResult:
+            note_budget_warnings()
             return ExecutionResult(status, node_history, decisions, total_tokens,
-                                   reason=reason, path=path, role_tokens=dict(role_tokens))
+                                   reason=reason, path=path, role_tokens=dict(role_tokens),
+                                   warnings=list(warnings))
 
         # 조건부 노드가 하나라도 있으면 CLASSIFY 결정을 1회만 호출한다 (SKIP_NODE는 target 1개만)
         if any(n.conditional for n in template.nodes):
@@ -393,9 +401,7 @@ class WorkflowEngine:
             if elapsed > lp.max_duration_minutes * 60:
                 reasons.append(
                     f"경과 시간 초과 ({int(elapsed // 60)}분/{lp.max_duration_minutes}분)")
-            role_over = any_role_over_budget()
-            if role_over:
-                reasons.append("에이전트 " + role_over)
+            note_budget_warnings()      # role 예산은 경보만 — 종료시키지 않는다
             accumulated_guard_exceeded = bool(reasons)
 
             local_loop_guard_exceeded = False
@@ -447,8 +453,10 @@ class WorkflowEngine:
                     return ("terminal", "NEEDS_HUMAN",
                             f"loop guard {loop_guard_trigger_count}회 연속 — {guard_reason}")
 
-            # crew leader 자신의 예산이 소진된 상태에서 결정 세션을 또 띄우면
-            # 초과분이 더 커지는 악순환이 된다 — 결정 없이 즉시 사람에게 넘긴다.
+            # crew leader만 예산이 hard stop이다: leader는 노드가 아니라서
+            # iterations/node_visits 반복 가드에 잡히지 않고, 가드가 켜질 때마다
+            # 호출되는 구조라 자기 자신이 원인인 루프를 만든다 (SLACK-1). 다른
+            # role은 반복 가드가 다음 홉을 막지만 leader는 그게 없다.
             orch_over = over_budget(Role.ORCHESTRATOR.value)
             if orch_over:
                 return ("terminal", "NEEDS_HUMAN",

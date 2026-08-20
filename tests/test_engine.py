@@ -557,16 +557,20 @@ async def test_handoff_carries_review_findings_to_developer(tmp_path):
     assert "bug" in qa_intro                      # findings description
 
 
-async def test_role_budget_exceeded_terminates_with_named_reason(tmp_path):
-    """role 예산을 넘기면 그 노드 완료 시점에 결정 지점으로 진입하고,
-    종료 사유에 어느 에이전트가 얼마를 썼는지 그대로 남는다."""
+async def test_worker_role_budget_warns_but_does_not_terminate(tmp_path):
+    """worker role 예산 초과는 경보일 뿐 종료 트리거가 아니다.
+
+    adapter.send() 하나가 그 에이전트의 전체 agentic turn이라 토큰은 사후에만
+    보인다 — 막지 못하는 신호로 정상 완료한 작업을 죽이던 오류(SLACK-1/SLACK-2)
+    교정. 다음 홉을 실제로 막는 건 반복/시간 가드다."""
     engine, _, _ = make_engine(
         tmp_path, [PASS_DEV, PASS_DEV], [FAIL_REVIEW, PASS_REVIEW],
         cfg=_cfg_with(role_budgets={"DEVELOPER": 1}))
     r = await engine.run(execution_id="B1", task="t")
-    assert r.status == "NEEDS_HUMAN"
-    assert "DEVELOPER 예산 초과 (2/1)" in r.reason
+    assert r.status == "COMPLETED"                  # 예산을 넘겨도 완주한다
     assert r.role_tokens["DEVELOPER"] == 2
+    assert "DEVELOPER 예산 초과 (2/1)" in r.warnings
+    assert "DEVELOPER" not in r.reason
 
 
 async def test_execution_token_budget_exceeded_named_in_reason(tmp_path):
@@ -591,6 +595,7 @@ async def test_orchestrator_budget_stops_further_decision_sessions(tmp_path):
         cfg=_cfg_with(role_budgets={"ORCHESTRATOR": 50}, max_token_budget=2))
     r = await engine.run(execution_id="B3", task="t")
     assert r.status == "NEEDS_HUMAN"
+    # leader만 hard stop — 반복 가드가 못 잡는 유일한 역할이라서
     assert "crew leader" in r.reason and "ORCHESTRATOR 예산 초과" in r.reason
     assert len(calls) == 1                        # 두 번째 결정 지점에서는 호출 안 함
     assert r.role_tokens["ORCHESTRATOR"] == 100

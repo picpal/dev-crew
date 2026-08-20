@@ -81,6 +81,8 @@ def format_result(execution_id: str, result, repo: str) -> str:
     if by_role:
         lines.append("에이전트별: " + " · ".join(
             f"{r} {t:,}" for r, t in sorted(by_role.items(), key=lambda kv: -kv[1])))
+    for w in getattr(result, "warnings", None) or []:
+        lines.append(f"⚠️ {w}")
     lines.append(f"작업 공간: {repo}")
     return "\n".join(lines)
 

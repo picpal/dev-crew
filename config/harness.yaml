@@ -25,9 +25,12 @@ loopPolicy:
   # 종료시켰다 (2026-08-20 SLACK-1/SLACK-2) — 실측 기준으로 현실화.
   maxTokenBudget: 1500000
   sameFindingEscalationThreshold: 3
-  # 에이전트(role)별 누적 토큰 예산. 초과하면 그 시점 노드 완료 때 결정 지점으로
-  # 진입한다. ORCHESTRATOR 예산이 소진되면 결정 세션을 더 띄우지 않고 즉시
-  # NEEDS_HUMAN으로 끝낸다 (초과 상태에서 leader를 계속 부르는 악순환 차단).
+  # 에이전트(role)별 토큰 경보선. adapter.send() 하나가 그 에이전트의 전체 agentic
+  # turn이라 토큰은 사후에만 보인다 — 폭주를 막지 못하므로 종료 트리거가 아니라
+  # "이 정도면 비정상" 경보로만 쓴다 (Slack 회신 + leader 스냅샷).
+  # 예외: ORCHESTRATOR만 hard stop이다. leader는 노드가 아니라서 반복 가드
+  # (iterations/node_visits)에 잡히지 않고, 가드가 켜질 때마다 호출돼 자기 자신이
+  # 원인인 루프를 만든다 (2026-08-20 SLACK-1).
   roleBudgets:
     ORCHESTRATOR: 400000
     EXPLORER:     200000
