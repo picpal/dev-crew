@@ -21,6 +21,7 @@ from .repos import RepoRegistryError, split_repo_prefix
 from .report.brain_report import render_brief, render_reply, report_id
 from .report.uploader import publish_report
 from .schema import AgentInstance, Role
+from .usage import context_badge, context_used
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 _OPTION_RE = re.compile(r"^([A-Z])\)\s+(.+)$")
@@ -107,11 +108,16 @@ class BrainSession:
     topic: str = ""
     owner: str = ""                   # 인터뷰를 시작한 Slack 사용자 — 명령 권한자
     transcript: list[str] = field(default_factory=list)
+    context_used: int = 0             # 마지막 turn의 컨텍스트 창 점유량 추정
     busy: bool = False                # turn/인계 진행 중 — 축출하면 그 turn이 죽는다
     handed_off: bool = False          # 직전 turn이 crew 인계였다 — 다음 발화에 재개 지시를 붙인다
     last_brief: dict | None = None    # 마지막으로 인계한 brief (다음 인계의 delta 기준)
     handoff_at: int = 0               # transcript 인덱스 — 이 뒤가 인계 이후의 논의
     touched: float = field(default_factory=time.monotonic)
+
+
+def _top(badge: str) -> str:
+    return f"{badge}\n\n" if badge else ""
 
 
 def command_of(text: str) -> str | None:
@@ -148,7 +154,8 @@ def parse_options(text: str) -> list[str]:
     return opts if len(opts) >= 2 else []
 
 
-def question_blocks(text: str, options: list[str], *, decided: int = 0) -> list[dict]:
+def question_blocks(text: str, options: list[str], *, decided: int = 0,
+                    banner: str = "") -> list[dict]:
     """질문 Block Kit — header(질문) / 맥락 / divider / 선택지 상세 / 짧은 버튼 / 진행.
 
     시각적 위계: 질문 한 줄은 header로 크게, 선택지 전문은 본문 리스트로,
@@ -165,8 +172,11 @@ def question_blocks(text: str, options: list[str], *, decided: int = 0) -> list[
                      if l.strip() != head and l.strip() not in option_set
                      and not _OPTION_RE.match(l.strip())]
     context = re.sub(r"\n{3,}", "\n\n", "\n".join(context_lines)).strip()
-    blocks: list[dict] = [
-        {"type": "header", "text": {"type": "plain_text", "text": head}}]
+    blocks: list[dict] = []
+    if banner:
+        blocks.append({"type": "context",
+                       "elements": [{"type": "mrkdwn", "text": banner}]})
+    blocks.append({"type": "header", "text": {"type": "plain_text", "text": head}})
     if context:
         blocks.append({"type": "section",
                        "text": {"type": "mrkdwn", "text": context[:2900]}})
@@ -259,6 +269,7 @@ class BrainHandler:
         """brain 응답 발신 — 선택형 질문이면 스레드 내 버튼(Block Kit), 아니면 텍스트
         (긴 응답은 리포트 링크)."""
         options = parse_options(text)
+        badge = context_badge(sess.context_used, self.cfg.leader_context.window_tokens)
         guide = ("\n\n_(버튼 선택 또는 답글로 대화 — "
                  f"끝나면 '{HANDOFF_KEYWORD}'라고 하면 crew에 넘깁니다)_" if first else "")
         if restored:
@@ -268,13 +279,14 @@ class BrainHandler:
         if options:
             decided = max(0, sum(1 for t in sess.transcript if t.startswith("[사용자]")) - 1)
             try:
-                await say(text=slack_text[:2900] + guide, thread_ts=thread_ts,
-                          blocks=question_blocks(slack_text, options, decided=decided))
+                await say(text=_top(badge) + slack_text[:2900] + guide, thread_ts=thread_ts,
+                          blocks=question_blocks(slack_text, options, decided=decided,
+                                                 banner=badge))
                 return
             except TypeError:
                 pass                              # say가 blocks 미지원(테스트 대역 등)
         body = await self._with_report(sess, text)
-        await say(text=to_mrkdwn(body) + guide, thread_ts=thread_ts)
+        await say(text=_top(badge) + to_mrkdwn(body) + guide, thread_ts=thread_ts)
 
     async def on_answer(self, *, thread_ts: str, value: str, say, strip=None,
                         channel: str = "", user: str = "") -> None:
@@ -304,6 +316,7 @@ class BrainHandler:
                 await say(text=f"💥 재협의 turn 실패: {type(e).__name__}: {e}",
                           thread_ts=sess.thread_ts)
                 return
+            sess.context_used = max(sess.context_used, context_used(out.usage))
             sess.transcript.append(f"[brain] {scrub(out.text)}")
             await self._say_reply(say, sess, out.text, sess.thread_ts)
             return
@@ -349,6 +362,7 @@ class BrainHandler:
             return
         finally:
             sess.busy = False
+        sess.context_used = max(sess.context_used, context_used(out.usage))
         sess.transcript.append(f"[brain] {scrub(out.text)}")
         await self._say_reply(say, sess, out.text, sess.thread_ts)
 
@@ -433,9 +447,10 @@ class BrainHandler:
             sid = await self.orch.start_worker(inst, first, conversational=True)
             adapter = self.orch.adapters[inst.provider]
             out = await asyncio.wait_for(adapter.send(sid, nudge), timeout=TURN_TIMEOUT)
+            used = context_used(out.usage)
         sess = BrainSession(inst=inst, session_id=sid, channel=channel,
                             thread_ts=thread_ts, repo_name=repo_name, topic=topic,
-                            owner=owner, last_brief=seed_brief)
+                            owner=owner, last_brief=seed_brief, context_used=used)
         sess.transcript.append(f"[사용자] {scrub(user_text or topic)}")
         sess.transcript.append(f"[brain] {scrub(out.text)}")
         self.sessions[thread_ts] = sess

@@ -675,6 +675,10 @@ Orchestrator
 | 권한 | 대화는 스레드 참여자 누구나. **`전달`·`/clear`·세션 부활은 인터뷰를 시작한 사용자만** — 그 셋만이 crew 실행·세션 파기·에이전트 spawn을 일으킨다. 봇 메시지(리포트 폼 경유)는 살아 있는 세션에 답변만 넣을 수 있다 |
 | 주입 방어 | 사용자 발화·모델 출력·brief는 프레임 머리글을 무력화(`scrub`)한 뒤 울타리(`<<<prior-brief`, `<<<thread-log`, `<<<user-message`)에 담아 투입한다. 울타리 안은 자료이지 지시가 아니다(§10.5 handoff와 같은 원칙) |
 
+답변 맨 위의 `[context usage : NN%]`는 그 세션의 창 점유율이다 — 40% 미만이면 표기하지
+않고, 그 이상부터 붙는다(brain은 인터뷰 세션, crew는 leader 세션 기준). 사용자가 압축을
+기다릴지 `/clear`로 끊을지 판단하는 근거다.
+
 crew 쪽 컨텍스트는 `@crew /clear`로 비운다 — 그 스레드의 leader·노드 세션을 모두 archive하고
 이월 상태를 지운다(`ThreadContextClearedEvent`). worktree와 커밋은 남긴다. 실행 중에는
 거부하고 중지 버튼을 먼저 쓰게 한다. 진짜 Slack 슬래시 커맨드가 아니라 멘션 뒤 토큰인

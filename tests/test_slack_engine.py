@@ -617,3 +617,17 @@ async def test_clear_thread_archives_carried_sessions(tmp_path, monkeypatch):
     assert "T9" not in runner._threads
     assert runner.trace.events(event_type="ThreadContextClearedEvent")
     assert await runner.clear_thread("T9") is None      # 두 번째는 비울 게 없다
+
+
+def test_format_result_puts_context_badge_on_top():
+    import dataclasses
+    from devcrew.engine import ExecutionResult
+
+    r = ExecutionResult("COMPLETED", [], 1, 10, report="다 됐습니다",
+                        context_used=620_000, context_window=1_000_000)
+    out = format_result("SLACK-9", r, "/tmp/wt")
+    assert out.splitlines()[0] == "[context usage : 62%]"
+    assert "다 됐습니다" in out
+
+    quiet = dataclasses.replace(r, context_used=100_000)
+    assert not format_result("SLACK-9", quiet, "/tmp/wt").startswith("[context")

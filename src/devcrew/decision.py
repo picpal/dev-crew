@@ -7,6 +7,7 @@ from .config import HarnessConfig
 from .orchestrator import Orchestrator
 from .roles import load_bundle, missing_required_keys
 from .schema import Role, Usage
+from .usage import context_used as _context_used
 from .workflow import ALLOWED_BY_TRIGGER, DEFAULT_TEMPLATE, WorkflowError, WorkflowTemplate
 
 
@@ -58,17 +59,6 @@ def _tokens(u: Usage) -> int:
     return (u.input_tokens or 0) + (u.output_tokens or 0)
 
 
-def _context_used(u: Usage) -> int:
-    """이 turn이 실제로 점유한 컨텍스트 창 크기 추정.
-
-    resume된 세션은 대화 전체가 매 turn의 입력이 된다 — 캐시된 prefix는
-    cache_read/cache_creation(Claude) 또는 cached_input(Codex)로 분리 보고되므로
-    창 점유량은 그 합계 + 신규 입력 + 출력이다. 누적 과금 토큰(_tokens)과 달리
-    이 값이 compaction 시점 판단의 근거다.
-    """
-    return ((u.input_tokens or 0) + (u.output_tokens or 0)
-            + (u.cache_read_input_tokens or 0) + (u.cache_creation_input_tokens or 0)
-            + (u.cached_input_tokens or 0))
 
 
 def validate_decision(structured, trigger: str, template: WorkflowTemplate) -> dict:

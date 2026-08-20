@@ -30,6 +30,7 @@ import tempfile
 from pathlib import Path
 
 from .repos import RepoRegistryError, load_repo_bases, load_repos, split_repo_target
+from .usage import context_badge
 from .worktree import WorktreeManager
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
@@ -107,8 +108,11 @@ def format_result(execution_id: str, result, repo: str) -> str:
     icon = {"COMPLETED": "✅", "NEEDS_HUMAN": "🙋", "ABORTED": "❌",
             "STOPPED": "🛑"}.get(result.status, "❓")
     report = sanitize_slack(str(getattr(result, "report", "") or "").strip())
-    blocks = [f"{icon} *{execution_id}*" if report
-              else f"{icon} *{execution_id} {result.status}*"]
+    badge = context_badge(getattr(result, "context_used", 0),
+                          getattr(result, "context_window", 0))
+    blocks = [badge] if badge else []
+    blocks.append(f"{icon} *{execution_id}*" if report
+                  else f"{icon} *{execution_id} {result.status}*")
     if report:
         blocks.append(report)
     for w in getattr(result, "warnings", None) or []:
@@ -322,6 +326,10 @@ class EngineRunner:
                     result, report=text or "", total_tokens=result.total_tokens + spent,
                     role_tokens={**result.role_tokens,
                                  "ORCHESTRATOR": result.role_tokens.get("ORCHESTRATOR", 0) + spent})
+            # leader 창 점유는 사용자가 /clear 시점을 판단하는 근거다 — 회신에 싣는다
+            result = dataclasses.replace(
+                result, context_used=int(st["leader"].get("context_used", 0)),
+                context_window=lc.window_tokens if lc.persistent else 0)
             return execution_id, result, where
 
 

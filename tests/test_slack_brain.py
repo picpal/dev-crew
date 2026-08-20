@@ -816,3 +816,35 @@ async def test_brain_clear_on_empty_thread_does_not_start_interview(tmp_path):
     await h.on_mention(owner_mention("<@U1> /clear", ts="777.1", event_id="EvX2"), say)
     assert h.sessions == {} and fake.initial_messages == []
     assert "정리할 인터뷰가 없습니다" in say.messages[0]["text"]
+
+
+def test_context_badge_only_from_forty_percent():
+    from devcrew.usage import context_badge
+    assert context_badge(390_000, 1_000_000) == ""
+    assert context_badge(410_000, 1_000_000) == "[context usage : 41%]"
+    assert context_badge(1_000_000, 1_000_000) == "[context usage : 100%]"
+    assert context_badge(0, 1_000_000) == "" and context_badge(500, 0) == ""
+
+
+@pytest.mark.asyncio
+async def test_brain_reply_shows_context_badge_when_window_fills(tmp_path):
+    """창이 차오르면 답변 맨 위에 점유율이 보여야 /clear 시점을 판단할 수 있다."""
+    from devcrew.schema import Usage
+    from devcrew.adapters.base import TurnOutcome
+
+    fake = FakeAdapter(script=["질문1", "질문2"], structured_script=[BRIEF_PASS] * 2)
+    heavy = Usage(input_tokens=10_000, output_tokens=1_000,
+                  cache_read_input_tokens=440_000, raw={})
+    orig = fake.send
+
+    async def send(sid, msg):
+        out = await orig(sid, msg)
+        return TurnOutcome(text=out.text, usage=heavy, structured=out.structured)
+
+    fake.send = send
+    orch = Orchestrator(TraceStore(tmp_path / "t.db"), SessionRegistry(tmp_path / "h.db"),
+                        {Provider.CLAUDE_CODE: fake, Provider.CODEX: fake})
+    h = BrainHandler(orch, load_config(), {}, DispatchSpy())
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    assert say.messages[0]["text"].startswith("[context usage : 45%]")
