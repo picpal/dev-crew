@@ -34,6 +34,15 @@ from .worktree import WorktreeManager
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 
+# Slack이 `text`에서 확장하는 브로드캐스트 토큰. leader 보고문은 결국 워커의
+# (신뢰 불가) 보고를 재료로 쓰므로, 채널 전체 알림을 유발하는 토큰은 무력화한다.
+_BROADCAST_RE = re.compile(r"<!(channel|here|everyone)(\|[^>]*)?>", re.I)
+
+
+def sanitize_slack(text: str) -> str:
+    return _BROADCAST_RE.sub(lambda m: f"@{m.group(1).lower()}", text or "")
+
+
 # 예산 경보 메시지에 붙는 중지 버튼의 action_id (bolt 핸들러가 이 이름으로 받는다)
 STOP_ACTION = "engine_stop"
 
@@ -97,7 +106,7 @@ def format_result(execution_id: str, result, repo: str) -> str:
     """
     icon = {"COMPLETED": "✅", "NEEDS_HUMAN": "🙋", "ABORTED": "❌",
             "STOPPED": "🛑"}.get(result.status, "❓")
-    report = str(getattr(result, "report", "") or "").strip()
+    report = sanitize_slack(str(getattr(result, "report", "") or "").strip())
     blocks = [f"{icon} *{execution_id}*" if report
               else f"{icon} *{execution_id} {result.status}*"]
     if report:

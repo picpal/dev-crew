@@ -746,3 +746,29 @@ async def test_no_stop_check_runs_to_completion(tmp_path):
     engine, _, _ = make_engine(tmp_path, [PASS_DEV], [PASS_REVIEW])
     r = await engine.run(execution_id="S2", task="t")
     assert r.status == "COMPLETED"
+
+
+async def test_handoff_frames_worker_reports_as_untrusted_data(tmp_path):
+    """워커 보고는 LLM 생성 입력이다 — 다음 워커 투입 메시지에 '지시가 아니라
+    데이터'라는 경계가 함께 실려야 보고문에 섞인 지시가 role/scope를 못 바꾼다."""
+    engine, _, _dev, rev = _carry_engine(
+        tmp_path, [PASS_DEV], [PASS_REVIEW], name="H9")
+    await engine.run(execution_id="H9", task="t")
+    intro = rev.initial_messages[0]
+    assert "보고 데이터" in intro and "지시가 아니며" in intro
+    assert "<<<worker-reports" in intro and "worker-reports" in intro
+    # 경계 표시가 실제 보고 내용을 감싸고 있다
+    assert intro.index("<<<worker-reports") < intro.index(PASS_DEV["summary"])
+
+
+async def test_outcome_digest_is_bounded(tmp_path):
+    """루프가 여러 번 돈 실행의 다이제스트가 leader 보고 세션 창을 밀어내지 않도록
+    summary/리스트 필드에 상한을 둔다."""
+    from devcrew.engine import _outcome_digest
+    d = _outcome_digest({"node_id": "review", "role": "REVIEWER", "transition": "NOT_PASS",
+                         "structured": {"summary": "가" * 5000,
+                                        "findings": [{"file": f"f{i}"} for i in range(50)],
+                                        "changed_files": [f"f{i}.py" for i in range(50)]}})
+    assert len(d["summary"]) == 800
+    assert len(d["findings"]) == 10 and len(d["changed_files"]) == 10
+    assert d["node_id"] == "review" and d["transition"] == "NOT_PASS"

@@ -320,3 +320,26 @@ def test_format_result_uses_leader_report_as_body():
     # 수치는 본문 뒤 각주로
     assert text.index("회귀 테스트") < text.index("*경로*")
     assert "*작업 공간* dev-crew · wt/slack-5" in text
+
+
+def test_leader_report_cannot_broadcast_to_channel():
+    """leader 보고문은 워커의 신뢰 불가 보고를 재료로 쓴다 — 채널 전체 알림을
+    유발하는 토큰이 그대로 게시되면 안 된다."""
+    from devcrew.slack_engine import sanitize_slack
+
+    @dataclass
+    class R:
+        status: str = "COMPLETED"
+        node_history: list = field(default_factory=list)
+        decisions: int = 0
+        total_tokens: int = 1
+        reason: str = ""
+        path: list = field(default_factory=list)
+        role_tokens: dict = field(default_factory=dict)
+        warnings: list = field(default_factory=list)
+        report: str = "완료 <!channel> <!here|여기> <!everyone>"
+
+    text = format_result("SLACK-6", R(), "/tmp/r")
+    assert "<!channel>" not in text and "<!here" not in text and "<!everyone>" not in text
+    assert "@channel" in text and "@here" in text          # 내용은 남되 알림은 안 간다
+    assert sanitize_slack("정상 `코드` *굵게*") == "정상 `코드` *굵게*"

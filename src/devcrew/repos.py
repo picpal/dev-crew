@@ -36,6 +36,8 @@ def _entry(name: str, loc) -> tuple[Path, str]:
         if not raw_path:
             raise RepoRegistryError(f"repo {name!r}: path 누락")
         base = str(loc.get("branch") or "HEAD")
+        if base != "HEAD":
+            validate_ref(name, base)
     else:
         raw_path, base = str(loc), "HEAD"
     rp = Path(str(raw_path)).expanduser().resolve()
@@ -71,6 +73,18 @@ def load_repo_bases(path: str | Path | None = None) -> dict[str, str]:
 
 
 _REPO_HEAD_RE = re.compile(r"[A-Za-z0-9._@/-]+")
+# branch/ref는 그대로 `git worktree add ... <ref>`의 인자가 된다. shell을 거치지
+# 않으므로 명령 주입은 불가하지만, `-f`/`--force`/`--detach` 같은 값은 git이
+# **옵션으로 해석**해 명령 의미를 바꾼다 — 선행 '-'를 막고 ref 문자 집합으로 제한한다.
+_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+
+
+def validate_ref(name: str, ref: str) -> str:
+    if not _REF_RE.fullmatch(ref) or ".." in ref or ref.endswith(("/", ".lock")):
+        raise RepoRegistryError(
+            f"repo {name!r}: 브랜치 이름으로 쓸 수 없는 값 {ref!r} "
+            "(영숫자로 시작, 영숫자/._/- 만 허용)")
+    return ref
 
 
 def split_repo_target(task: str, repos: dict[str, Path]) -> tuple[str | None, str | None, str]:
@@ -91,6 +105,8 @@ def split_repo_target(task: str, repos: dict[str, Path]) -> tuple[str | None, st
     name, _at, branch = head.partition("@")
     name, branch = name.strip(), branch.strip() or None
     if name in repos:
+        if branch is not None:
+            validate_ref(name, branch)      # git 인자 인젝션 차단 (선행 '-' 등)
         return name, branch, rest.strip()
     if _REPO_HEAD_RE.fullmatch(head):
         raise RepoRegistryError(

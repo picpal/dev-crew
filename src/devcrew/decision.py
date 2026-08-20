@@ -194,6 +194,10 @@ def make_llm_decide(orch: Orchestrator, cfg: HarnessConfig, *, mcp_servers=None,
                 sid, f"직전 결정이 거부됐다({e}). allowed_actions "
                      f"{ALLOWED_BY_TRIGGER[trigger]} 중에서만 골라 다시 제출해.")
             usage_tokens += _tokens(retry.usage)
+            if leader_state is not None:
+                # 재시도 turn도 창을 차지한다 — 빠뜨리면 compaction 시점이 밀린다
+                leader_state["context_used"] = max(leader_state.get("context_used", 0),
+                                                   _context_used(retry.usage))
             try:
                 return (validate_decision(retry.structured, trigger, tmpl),
                         inst.instance_id, usage_tokens)

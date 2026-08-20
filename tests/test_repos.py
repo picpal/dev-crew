@@ -1,5 +1,6 @@
 """repos registry — 로딩 검증과 접두 해석."""
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -109,3 +110,31 @@ def test_worktree_created_from_given_base_ref(tmp_path):
     assert (wt / "only-on-branch.txt").exists()      # 브랜치 커밋이 들어있다
     plain = WorktreeManager(repo).create("t2")       # 기본 HEAD
     assert not (plain / "only-on-branch.txt").exists()
+
+
+@pytest.mark.parametrize("bad", ["--force", "-f", "--detach", "..", "a..b", "feat/",
+                                 "x.lock", "$(whoami)"])
+def test_branch_that_git_would_read_as_option_is_rejected(bad):
+    """`repo@branch:`의 branch는 그대로 `git worktree add ... <ref>` 인자가 된다.
+    shell을 안 거쳐 명령 주입은 불가하지만 `-f`/`--force` 등은 git이 **옵션으로**
+    해석해 명령 의미를 바꾼다 — 파싱 단계에서 막는다."""
+    from devcrew.repos import RepoRegistryError, split_repo_target
+    with pytest.raises(RepoRegistryError):
+        split_repo_target(f"dev-crew@{bad}: 작업", {"dev-crew": Path("/x")})
+
+
+def test_valid_branch_prefix_passes_through():
+    from devcrew.repos import split_repo_target
+    repos = {"dev-crew": Path("/x")}
+    assert split_repo_target("dev-crew@feat/orch-loop.2: 작업", repos) == (
+        "dev-crew", "feat/orch-loop.2", "작업")
+    assert split_repo_target("dev-crew: 작업", repos) == ("dev-crew", None, "작업")
+
+
+def test_config_branch_is_validated_too(tmp_path):
+    from devcrew.repos import RepoRegistryError, load_repos
+    repo = _init_repo(tmp_path / "r")
+    cfg = tmp_path / "repos.yaml"
+    cfg.write_text(f"repos:\n  x:\n    path: {repo}\n    branch: '--force'\n")
+    with pytest.raises(RepoRegistryError, match="쓸 수 없는 값"):
+        load_repos(cfg)
