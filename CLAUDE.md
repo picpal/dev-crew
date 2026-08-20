@@ -4,6 +4,9 @@ Slack 요청을 Claude Code / Codex Agent로 분해·실행·검증하고, 결�
 
 설계의 기준 문서는 [DESIGN.md](./DESIGN.md)다. 구현, POC, 운영 정책, 평가 기준은 이 문서를 우선한다.
 
+작업을 시작하기 전에 [lessons.md](./lessons.md)를 읽는다 — 이 저장소에서 LLM이 실제로
+반복한 오판을 유형으로 모아둔 문서다. 새로 발견한 오판은 그 카테고리에 추가한다.
+
 ## Agent skills
 
 ### Issue tracker
