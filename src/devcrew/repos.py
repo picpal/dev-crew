@@ -70,20 +70,35 @@ def load_repo_bases(path: str | Path | None = None) -> dict[str, str]:
             for n, loc in (raw.get("repos") or {}).items()}
 
 
-def split_repo_prefix(task: str, repos: dict[str, Path]) -> tuple[str | None, str]:
-    """`이름: 작업` 접두 해석 → (repo_name | None, 나머지 task).
+_REPO_HEAD_RE = re.compile(r"[A-Za-z0-9._@/-]+")
+
+
+def split_repo_target(task: str, repos: dict[str, Path]) -> tuple[str | None, str | None, str]:
+    """`이름: 작업` / `이름@브랜치: 작업` 접두 해석 → (repo_name, branch, 나머지 task).
+
+    `@브랜치`는 이번 요청에 한해 worktree base를 덮어쓴다 — repos.yaml의 고정
+    브랜치가 낡았을 때 설정을 고치지 않고 바로잡는 탈출구다 (2026-08-20 SLACK-3의
+    재발 경로가 "설정 drift"이므로 요청 단위 지정이 필요하다).
 
     콜론 앞 토큰이 registry에 있을 때만 repo 지정으로 취급한다. registry에 없어도
-    repo명 형태(영숫자/._-)면 오타로 보고 RepoRegistryError를 던져 조용히 toy
-    repo로 넘기지 않는다. 그 외(한글 문장의 "주의: …" 등)는 일반 task로 통과.
+    repo명 형태면 오타로 보고 RepoRegistryError를 던져 조용히 toy repo로 넘기지
+    않는다. 그 외(한글 문장의 "주의: …" 등)는 일반 task로 통과.
     """
     head, sep, rest = task.partition(":")
     head = head.strip()
     if not sep or not head or " " in head:
-        return None, task
-    if head in repos:
-        return head, rest.strip()
-    if re.fullmatch(r"[A-Za-z0-9._-]+", head):
+        return None, None, task
+    name, _at, branch = head.partition("@")
+    name, branch = name.strip(), branch.strip() or None
+    if name in repos:
+        return name, branch, rest.strip()
+    if _REPO_HEAD_RE.fullmatch(head):
         raise RepoRegistryError(
-            f"등록되지 않은 repo {head!r} — 사용 가능: {', '.join(sorted(repos)) or '(없음)'}")
-    return None, task
+            f"등록되지 않은 repo {name!r} — 사용 가능: {', '.join(sorted(repos)) or '(없음)'}")
+    return None, None, task
+
+
+def split_repo_prefix(task: str, repos: dict[str, Path]) -> tuple[str | None, str]:
+    """`split_repo_target`의 2-tuple 호환 래퍼 (브랜치 지정은 버린다)."""
+    name, _branch, rest = split_repo_target(task, repos)
+    return name, rest

@@ -80,6 +80,17 @@ def _handoff_text(entries: list[dict], limit: int = 4) -> str:
     return "\n".join(lines)
 
 
+_DIGEST_KEYS = ("summary", "changed_files", "build", "tests", "verdict", "findings")
+
+
+def _outcome_digest(entry: dict) -> dict:
+    """노드 결과에서 보고에 쓸 부분만 추린다 (원문 전체를 보고 세션에 넣지 않는다)."""
+    st = entry.get("structured") or {}
+    return {"node_id": entry["node_id"], "role": entry["role"],
+            "transition": entry["transition"],
+            **{k: st[k] for k in _DIGEST_KEYS if k in st}}
+
+
 def _same_finding_signature(node_id: str, structured: dict | None) -> tuple:
     """LOOP 재진입이 "동일 finding"인지 판정하는 서명 (finding #1e).
 
@@ -121,6 +132,8 @@ class ExecutionResult:
     path: list[str] = field(default_factory=list)        # leader 결정 홉까지 포함한 전체 경로
     role_tokens: dict[str, int] = field(default_factory=dict)   # role별 누적 토큰
     warnings: list[str] = field(default_factory=list)    # 경보 (종료 사유는 아님)
+    report: str = ""             # crew leader가 쓴 사용자용 보고문 (Slack 본문)
+    outcomes: list[dict] = field(default_factory=list)   # 노드별 결과 요약 (보고 재료)
 
 
 class WorkflowEngine:
@@ -233,8 +246,21 @@ class WorkflowEngine:
                 return None
             return next((r for r in nodes if r.spec.node_id == node_id), None)
 
+        # 워커가 "환경/하네스가 잘못됐다"고 주장할 수 있는 트리거에서만 실제
+        # worktree 상태를 조회해 스냅샷에 싣는다 (subprocess 비용을 매 결정마다
+        # 치르지 않는다). leader는 주장과 이 사실을 대조해야 한다.
+        _FACT_TRIGGERS = {"BLOCKED", "NEED_REPLAN", "INSUFFICIENT_CAPABILITY"}
+
         def make_snapshot(trigger: str, rt: NodeRuntime | None, worker_result: dict | None) -> dict:
+            facts = None
+            if trigger in _FACT_TRIGGERS and worktree:
+                try:
+                    from .worktree import worktree_facts
+                    facts = worktree_facts(worktree)
+                except Exception as e:
+                    facts = {"error": repr(e)}
             return {
+                "worktree_facts": facts,
                 "trigger": trigger, "execution_id": execution_id, "task": task,
                 "current_node": rt.spec.node_id if rt else None,
                 "nodes": [{"node_id": r.spec.node_id, "role": r.spec.role.value,
@@ -356,7 +382,8 @@ class WorkflowEngine:
             note_budget_warnings()
             return ExecutionResult(status, node_history, decisions, total_tokens,
                                    reason=reason, path=path, role_tokens=dict(role_tokens),
-                                   warnings=list(warnings))
+                                   warnings=list(warnings),
+                                   outcomes=[_outcome_digest(e) for e in completed])
 
         # 조건부 노드가 하나라도 있으면 CLASSIFY 결정을 1회만 호출한다 (SKIP_NODE는 target 1개만)
         if any(n.conditional for n in template.nodes):

@@ -23,6 +23,37 @@ COMPACT_MSG = (
     "rationale은 '컨텍스트 압축'으로 둔다). 이 요약만 다음 세션에 인계된다.")
 
 
+REPORT_REQUEST = (
+    "실행이 끝났다. 아래 결과를 바탕으로 사용자에게 보낼 최종 보고를 role prompt의 "
+    "'최종 보고' 규칙대로 `report` 필드에 작성해라 (Slack mrkdwn, 섹션 사이 빈 줄, "
+    "하네스 내부 용어 금지). decision.action은 ASK_USER, rationale은 '최종 보고'로 둔다.\n"
+    "```json\n{result}\n```")
+
+
+def make_final_report(orch: Orchestrator, leader_state: dict | None):
+    """실행 결과 → 사용자용 보고문. leader 세션이 있으면 그 맥락으로 직접 쓰게 한다.
+
+    기계적 경로/토큰 덤프는 사람이 읽기 나쁘다 — 실행 전체를 본 leader가 종합해
+    쓴 글을 본문으로 하고, 수치는 각주로 붙인다. 세션이 없거나 실패하면 None을
+    반환해 기계 요약만 나가게 한다 (보고 실패가 결과 전달을 막지 않는다).
+    """
+    async def report(result_payload: dict) -> tuple[str | None, int]:
+        if not leader_state or not leader_state.get("sid"):
+            return None, 0
+        inst, sid = leader_state["inst"], leader_state["sid"]
+        adapter = orch.adapters[inst.provider]
+        try:
+            out = await adapter.send(sid, REPORT_REQUEST.format(
+                result=json.dumps(result_payload, ensure_ascii=False, indent=1)))
+        except Exception:
+            return None, 0
+        text = (out.structured or {}).get("report")
+        leader_state["context_used"] = max(leader_state.get("context_used", 0),
+                                           _context_used(out.usage))
+        return (str(text).strip() if text else None), _tokens(out.usage)
+    return report
+
+
 def _tokens(u: Usage) -> int:
     return (u.input_tokens or 0) + (u.output_tokens or 0)
 

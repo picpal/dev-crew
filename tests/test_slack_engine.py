@@ -61,7 +61,7 @@ async def test_mention_runs_task_and_replies_in_thread():
     await MentionHandler(runner)(body("<@U123> calc.py에 mul 추가"), say)
     assert runner.calls == ["calc.py에 mul 추가"]           # mention 제거된 task
     assert len(say.messages) == 1                            # 최종 결과만 (상태는 인디케이터)
-    assert "✅ SLACK-1 COMPLETED" in say.messages[0]["text"]
+    assert "✅ *SLACK-1 COMPLETED*" in say.messages[0]["text"]
     assert say.messages[0]["thread_ts"] == "111.222"
     # 스레드 단위 세션 이월 키로 thread_ts가 그대로 넘어간다
     assert runner.thread_keys == ["111.222"]
@@ -102,8 +102,8 @@ async def test_timeout_reported_to_thread():
 def test_format_result_needs_human_icon():
     r = FakeResult(status="NEEDS_HUMAN")
     text = format_result("SLACK-2", r, "/tmp/repo")
-    assert text.startswith("🙋 SLACK-2 NEEDS_HUMAN")
-    assert "develop:PASS → review:PASS" in text
+    assert text.startswith("🙋 *SLACK-2 NEEDS_HUMAN*")
+    assert "`develop:PASS → review:PASS`" in text
     assert "토큰 12,345" in text
 
 
@@ -139,19 +139,19 @@ def test_format_result_shows_termination_reason_and_full_path():
             "DEVELOPER": 300000, "ORCHESTRATOR": 200000, "REVIEWER": 87872})
 
     text = format_result("SLACK-2", R(), "/tmp/repo")
-    assert "사유: 실행 전체 토큰 예산 초과 (587,872/300,000)" in text
+    assert "*사유* 실행 전체 토큰 예산 초과 (587,872/300,000)" in text
     assert "leader:CLASSIFY→PROCEED → explore:PASS" in text
     assert "review:NOT_PASS↺develop" in text
     assert "leader:LOOP_GUARD_EXCEEDED→ASK_USER" in text
     # 에이전트별 토큰은 많이 쓴 순으로
-    assert "에이전트별: DEVELOPER 300,000 · ORCHESTRATOR 200,000 · REVIEWER 87,872" in text
+    assert "DEVELOPER 300,000 · ORCHESTRATOR 200,000 · REVIEWER 87,872" in text
 
 
 def test_format_result_without_new_fields_still_renders():
     """path/reason이 없는 결과(구 형식)도 node_history 폴백으로 렌더된다."""
     text = format_result("SLACK-9", FakeResult(), "/tmp/repo")
-    assert "develop:PASS → review:PASS" in text
-    assert "사유:" not in text
+    assert "`develop:PASS → review:PASS`" in text
+    assert "*사유*" not in text
 
 
 def test_format_result_renders_budget_warnings_separately_from_reason():
@@ -168,9 +168,9 @@ def test_format_result_renders_budget_warnings_separately_from_reason():
         warnings: list = field(default_factory=lambda: ["DEVELOPER 예산 초과 (700,000/600,000)"])
 
     text = format_result("SLACK-3", R(), "/tmp/repo")
-    assert text.startswith("✅ SLACK-3 COMPLETED")
+    assert text.startswith("✅ *SLACK-3 COMPLETED*")
     assert "⚠️ DEVELOPER 예산 초과 (700,000/600,000)" in text
-    assert "사유: 모든 노드 통과" in text
+    assert "*사유* 모든 노드 통과" in text
 
 
 @pytest.mark.asyncio
@@ -189,7 +189,7 @@ async def test_budget_warning_posts_stop_button_and_run_continues():
     assert button["value"] == "SLACK-1"
     assert button["style"] == "danger"
     assert warn_msg["thread_ts"] == "111.222"
-    assert "✅ SLACK-1 COMPLETED" in final_msg["text"]      # 실행은 완주했다
+    assert "✅ *SLACK-1 COMPLETED*" in final_msg["text"]      # 실행은 완주했다
 
 
 def test_stop_blocks_and_stopped_blocks_shape():
@@ -216,8 +216,8 @@ def test_format_result_stopped_icon():
         warnings: list = field(default_factory=list)
 
     text = format_result("SLACK-4", R(), "/tmp/repo")
-    assert text.startswith("🛑 SLACK-4 STOPPED")
-    assert "사유: 사용자가 실행을 중지했다" in text
+    assert text.startswith("🛑 *SLACK-4 STOPPED*")
+    assert "*사유* 사용자가 실행을 중지했다" in text
 
 
 # ---------------------------------------------------------------------------
@@ -296,3 +296,27 @@ async def test_runner_stop_request_reaches_engine(tmp_path, monkeypatch):
     await runner.run("t", thread_key="T1")
     assert box["before"] is False and box["after"] is True
     assert runner._stop_requests == set()                    # 실행 종료 후 정리된다
+
+
+def test_format_result_uses_leader_report_as_body():
+    """본문은 leader가 쓴 보고문이고, 하네스 수치는 각주로 내려간다."""
+    @dataclass
+    class R:
+        status: str = "COMPLETED"
+        node_history: list = field(default_factory=list)
+        decisions: int = 2
+        total_tokens: int = 84120
+        reason: str = "모든 노드 통과"
+        path: list = field(default_factory=lambda: ["develop:PASS", "review:PASS"])
+        role_tokens: dict = field(default_factory=lambda: {"DEVELOPER": 50000})
+        warnings: list = field(default_factory=list)
+        report: str = ("`_tokens()` 회귀 테스트를 추가했습니다.\n\n"
+                       "*확인된 것*\n• 테스트 205건 통과")
+
+    text = format_result("SLACK-5", R(), "dev-crew · wt/slack-5")
+    assert text.startswith("✅ *SLACK-5*\n\n")          # 상태 문자열 중복 없이 보고문이 본문
+    assert "회귀 테스트를 추가했습니다" in text
+    assert "*확인된 것*" in text
+    # 수치는 본문 뒤 각주로
+    assert text.index("회귀 테스트") < text.index("*경로*")
+    assert "*작업 공간* dev-crew · wt/slack-5" in text

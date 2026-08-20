@@ -90,28 +90,36 @@ def progress_text(events: list, elapsed: float) -> str:
 def format_result(execution_id: str, result, repo: str) -> str:
     """ExecutionResult → Slack 회신 텍스트.
 
-    경로는 노드 전이만이 아니라 crew leader 결정 홉(`leader:TRIGGER→ACTION`)과
-    스킵·모델 승급까지 포함한 전체 경로를 그대로 렌더한다. 종료 사유(예산 초과·
-    loop guard·ASK_USER rationale)와 에이전트별 토큰도 함께 표기한다.
+    본문은 crew leader가 쓴 보고문(`result.report`)이다 — 실행 전체를 본 관점에서
+    사용자 언어로 쓴 글이 기계적 상태 덤프보다 읽힌다. 경로·사유·토큰 같은 하네스
+    수치는 각주로 내려 붙인다. 보고문이 없으면(leader 세션 없음·생성 실패) 종전의
+    기계 요약만 나간다 — 보고 실패가 결과 전달을 막지 않는다.
     """
     icon = {"COMPLETED": "✅", "NEEDS_HUMAN": "🙋", "ABORTED": "❌",
             "STOPPED": "🛑"}.get(result.status, "❓")
+    report = str(getattr(result, "report", "") or "").strip()
+    blocks = [f"{icon} *{execution_id}*" if report
+              else f"{icon} *{execution_id} {result.status}*"]
+    if report:
+        blocks.append(report)
+    for w in getattr(result, "warnings", None) or []:
+        blocks.append(f"⚠️ {w}")
+
     hops = list(getattr(result, "path", None) or
                 [f"{h['node_id']}:{h['transition']}" for h in result.node_history])
-    lines = [f"{icon} {execution_id} {result.status}",
-             f"경로: {' → '.join(hops) or '(없음)'}"]
+    foot = [f"*경로* `{' → '.join(hops) or '(없음)'}`"]
     reason = str(getattr(result, "reason", "") or "").strip()
     if reason:
-        lines.append(f"사유: {reason}")
-    lines.append(f"결정 {result.decisions}회 · 토큰 {result.total_tokens:,}")
+        foot.append(f"*사유* {reason}")
+    tail = f"결정 {result.decisions}회 · 토큰 {result.total_tokens:,}"
     by_role = getattr(result, "role_tokens", None) or {}
     if by_role:
-        lines.append("에이전트별: " + " · ".join(
-            f"{r} {t:,}" for r, t in sorted(by_role.items(), key=lambda kv: -kv[1])))
-    for w in getattr(result, "warnings", None) or []:
-        lines.append(f"⚠️ {w}")
-    lines.append(f"작업 공간: {repo}")
-    return "\n".join(lines)
+        tail += " — " + " · ".join(
+            f"{r} {t:,}" for r, t in sorted(by_role.items(), key=lambda kv: -kv[1]))
+    foot.append(f"_{tail}_")
+    foot.append(f"*작업 공간* {repo}")
+    blocks.append("\n".join(foot))
+    return "\n\n".join(blocks)
 
 
 class EngineRunner:
@@ -182,7 +190,7 @@ class EngineRunner:
 
         on_progress: async (text) — 지정 시 4초 간격으로 진행 상태 텍스트를 보낸다
         (trace 이벤트 폴링 기반 — 엔진 코어 변경 없음)."""
-        from .decision import make_llm_decide
+        from .decision import make_final_report, make_llm_decide
         from .engine import WorkflowEngine
         from .workflow import DEFAULT_TEMPLATE
 
@@ -247,6 +255,19 @@ class EngineRunner:
                 if poller is not None:
                     poller.cancel()
                 self._stop_requests.discard(execution_id)
+            # 사용자용 보고문은 실행 전체를 본 leader가 쓴다 (기계 덤프 대체)
+            if on_progress is not None:
+                await on_progress("결과 정리 중…")
+            text, spent = await make_final_report(
+                self.orch, st["leader"] if lc.persistent else None)({
+                    "task": task, "status": result.status, "reason": result.reason,
+                    "path": result.path, "warnings": result.warnings,
+                    "workspace": where, "outcomes": result.outcomes})
+            if text or spent:
+                result = dataclasses.replace(
+                    result, report=text or "", total_tokens=result.total_tokens + spent,
+                    role_tokens={**result.role_tokens,
+                                 "ORCHESTRATOR": result.role_tokens.get("ORCHESTRATOR", 0) + spent})
             return execution_id, result, where
 
 

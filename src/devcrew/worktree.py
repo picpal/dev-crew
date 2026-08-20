@@ -1,8 +1,34 @@
 """git worktree 관리 — Developer instance 격리 (§8.2)."""
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
+
+
+def worktree_facts(path: str | Path) -> dict:
+    """worktree의 객관적 상태 — 워커의 자기 진단을 대조할 근거.
+
+    워커가 "대상 트리가 잘못 바인딩됐다" 같은 하네스 결함을 주장할 때 leader가
+    검증 없이 믿으면 정상 실행이 ASK_USER로 끝난다 (2026-08-20 SLACK-3). 결정
+    스냅샷에 이 사실을 함께 실어 주장과 실제를 대조하게 한다.
+    """
+    def git(*args: str) -> str:
+        r = subprocess.run(["git", *args], cwd=str(path), capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    p = Path(path)
+    dirty = git("status", "--porcelain")
+    return {
+        "path": str(p),
+        "exists": p.is_dir(),
+        "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+        "head": git("rev-parse", "--short", "HEAD"),
+        "head_subject": git("log", "-1", "--pretty=%s"),
+        "tracked_files": len(git("ls-files").splitlines()),
+        "dirty_files": len(dirty.splitlines()),
+        "writable": os.access(p, os.W_OK) if p.is_dir() else False,
+    }
 
 
 class WorktreeManager:

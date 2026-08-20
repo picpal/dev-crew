@@ -11,7 +11,8 @@ from devcrew.store.registry import SessionRegistry
 from devcrew.store.trace import TraceStore
 from devcrew.workflow import DEFAULT_TEMPLATE
 
-GOOD = {"status": "PASS", "summary": "s",
+# report는 strict schema상 required(nullable) — 결정 turn에서는 null이다
+GOOD = {"status": "PASS", "summary": "s", "report": None,
         "decision": {"action": "ABORT", "target_node": None, "rationale": "r"}}
 
 
@@ -22,7 +23,7 @@ def test_validate_decision_ok():
 
 @pytest.mark.parametrize("bad", [
     None,                                                        # malformed
-    {"status": "PASS", "summary": "s"},                          # decision 없음
+    {"status": "PASS", "summary": "s", "report": None},           # decision 없음
     {**GOOD, "decision": {"action": "PROCEED", "target_node": None, "rationale": "r"}},  # 허용 밖 action
     {**GOOD, "decision": {"action": "REPLAN", "target_node": "nope", "rationale": "r"}}, # unknown node
     {**GOOD, "status": "BLOCKED"},                               # 결정 미수행
@@ -44,7 +45,7 @@ def make_env(tmp_path, structured_script):
 
 async def test_llm_decide_retries_once_then_degrades(tmp_path):
     # 1차: 허용 밖 action → 재시도 메시지 전송, 2차: 여전히 invalid → ASK_USER 강등
-    invalid = {"status": "PASS", "summary": "s",
+    invalid = {"status": "PASS", "summary": "s", "report": None,
               "decision": {"action": "PROCEED", "target_node": None, "rationale": "r"}}
     orch, trace, fake, cfg = make_env(tmp_path, [invalid, invalid])
     decide = make_llm_decide(orch, cfg)
@@ -139,3 +140,26 @@ async def test_leader_compacts_when_context_window_fills(tmp_path):
     assert "지금까지 확정: A안 채택" in seed_intro
     assert trace.events(event_type="LeaderCompactEvent")
     assert state["context_used"] == 1010                # 새 세션의 첫 turn 기준
+
+
+async def test_final_report_written_by_leader(tmp_path):
+    """실행 결과를 leader가 사용자 언어로 쓴 글이 보고문이 된다."""
+    from devcrew.decision import make_final_report
+    written = {**GOOD, "report": "*완료* — `calc.py`에 `mul()`을 추가했습니다."}
+    orch, _, fake, _ = make_env(tmp_path, [GOOD, written])
+    state: dict = {}
+    decide = make_llm_decide(orch, load_config(), leader_state=state)
+    await decide("NEED_REPLAN", SNAP)
+
+    text, spent = await make_final_report(orch, state)({"status": "COMPLETED"})
+    assert text == "*완료* — `calc.py`에 `mul()`을 추가했습니다."
+    assert spent > 0
+    assert len(fake.initial_messages) == 1              # 보고도 같은 leader 세션에서
+
+
+async def test_final_report_returns_none_without_leader_session(tmp_path):
+    """leader 세션이 없으면(비지속 모드) 보고문 없이 기계 요약만 나간다."""
+    from devcrew.decision import make_final_report
+    orch, _, _, _ = make_env(tmp_path, [GOOD])
+    assert await make_final_report(orch, None)({"status": "COMPLETED"}) == (None, 0)
+    assert await make_final_report(orch, {})({"status": "COMPLETED"}) == (None, 0)
