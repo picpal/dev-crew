@@ -41,10 +41,28 @@ class LoopPolicy:
 
 
 @dataclass(frozen=True)
+class LeaderContext:
+    """crew leader(ORCHESTRATOR) 결정 세션의 컨텍스트 정책.
+
+    persistent=False면 결정마다 fresh 세션(종전 동작). True면 스레드 단위로 세션을
+    유지해 이전 결정 맥락을 들고 판단하고, 컨텍스트 점유가 window*ratio에 닿으면
+    leader가 스스로 요약해 새 세션에 인계한다(compaction).
+    """
+    persistent: bool = False
+    window_tokens: int = 1_000_000
+    compact_at_ratio: float = 0.5
+
+    @property
+    def compact_at(self) -> int:
+        return int(self.window_tokens * self.compact_at_ratio)
+
+
+@dataclass(frozen=True)
 class HarnessConfig:
     tiers: dict[str, TierSpec]
     role_defaults: dict[Role, RoleDefault]
     loop_policy: LoopPolicy
+    leader_context: LeaderContext = field(default_factory=LeaderContext)
 
 
 def load(path: str | Path | None = None) -> HarnessConfig:
@@ -101,4 +119,16 @@ def load(path: str | Path | None = None) -> HarnessConfig:
     if min(lp.max_iterations, lp.max_duration_minutes, lp.max_token_budget,
            lp.same_finding_escalation_threshold) <= 0:
         raise ConfigError(f"loopPolicy values must be positive: {p}")
-    return HarnessConfig(tiers=tiers, role_defaults=role_defaults, loop_policy=lp)
+    raw_lc = raw.get("leaderContext") or {}
+    try:
+        lc = LeaderContext(
+            persistent=bool(raw_lc.get("persistent", False)),
+            window_tokens=int(raw_lc.get("windowTokens", 1_000_000)),
+            compact_at_ratio=float(raw_lc.get("compactAtRatio", 0.5)))
+    except (ValueError, TypeError) as e:
+        raise ConfigError(f"invalid leaderContext {p}: {e}") from e
+    if lc.window_tokens <= 0 or not (0 < lc.compact_at_ratio < 1):
+        raise ConfigError(
+            f"leaderContext: windowTokens>0, 0<compactAtRatio<1 이어야 한다: {p}")
+    return HarnessConfig(tiers=tiers, role_defaults=role_defaults, loop_policy=lp,
+                         leader_context=lc)

@@ -221,7 +221,8 @@ class MentionHandler:
 
         await _status("대기 중 (앞선 요청 처리 후 실행)" if self.runner.busy else "접수 — 실행 준비 중")
         try:
-            execution_id, result, repo = await self.runner.run(task, on_progress=_status)
+            execution_id, result, repo = await self.runner.run(
+                task, on_progress=_status, thread_key=thread_ts)
             await say(text=format_result(execution_id, result, repo), thread_ts=thread_ts)
         except RepoRegistryError as e:
             await say(text=f"⚠️ {e}", thread_ts=thread_ts)

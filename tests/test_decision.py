@@ -1,9 +1,12 @@
+import dataclasses
+
 import pytest
 from devcrew.adapters.base import FakeAdapter
 from devcrew.config import load as load_config
-from devcrew.decision import DecisionError, make_llm_decide, validate_decision
+from devcrew.decision import (LEADER_INTRO, DecisionError, make_llm_decide,
+                              validate_decision)
 from devcrew.orchestrator import Orchestrator
-from devcrew.schema import Provider, Role
+from devcrew.schema import Provider, Role, Usage
 from devcrew.store.registry import SessionRegistry
 from devcrew.store.trace import TraceStore
 from devcrew.workflow import DEFAULT_TEMPLATE
@@ -73,3 +76,66 @@ async def test_llm_decide_happy_path_spawns_orchestrator(tmp_path):
               for e in instance_events)
 
     assert fake.last_mcp_servers == {"harness": "sentinel"}
+
+
+# ---------------------------------------------------------------------------
+# crew leader 컨텍스트 유지 + compaction (사용자 결정 2026-08-20)
+# ---------------------------------------------------------------------------
+
+SNAP = {"execution_id": "E1", "task": "t", "trigger": "NEED_REPLAN",
+        "allowed_actions": ["REPLAN", "ASK_USER", "ABORT"]}
+
+
+async def test_leader_state_keeps_one_session_across_decisions(tmp_path):
+    """leader_state를 넘기면 결정마다 새 세션을 띄우지 않고 한 세션을 이어 쓴다."""
+    orch, _, fake, cfg = make_env(tmp_path, [GOOD] * 10)
+    state: dict = {}
+    decide = make_llm_decide(orch, cfg, leader_state=state)
+    _, id1, _ = await decide("NEED_REPLAN", SNAP)
+    _, id2, _ = await decide("NEED_REPLAN", SNAP)
+    assert id1 == id2                                   # 같은 leader instance
+    assert len(fake.initial_messages) == 1              # 세션은 하나뿐
+    assert LEADER_INTRO in fake.initial_messages[0]
+    assert state["sid"] and state["inst"] is not None
+
+
+async def test_without_leader_state_each_decision_is_fresh(tmp_path):
+    """기존 동작 회귀 고정 — leader_state 없이는 결정마다 fresh 세션."""
+    orch, _, fake, cfg = make_env(tmp_path, [GOOD] * 10)
+    decide = make_llm_decide(orch, cfg)
+    _, id1, _ = await decide("NEED_REPLAN", SNAP)
+    _, id2, _ = await decide("NEED_REPLAN", SNAP)
+    assert id1 != id2
+    assert len(fake.initial_messages) == 2
+    assert LEADER_INTRO not in fake.initial_messages[0]
+
+
+async def test_leader_compacts_when_context_window_fills(tmp_path):
+    """컨텍스트 점유가 임계치에 닿으면 leader가 스스로 요약하고 그 요약만 들고
+    새 세션으로 넘어간다 — 창은 비우되 결정 맥락은 유지."""
+    class BigContext(FakeAdapter):
+        async def send(self, session_id, message):
+            out = await super().send(session_id, message)
+            return dataclasses.replace(out, usage=Usage(
+                input_tokens=100, output_tokens=10, cache_read_input_tokens=900))
+
+    trace = TraceStore(tmp_path / "trace.db")
+    registry = SessionRegistry(tmp_path / "harness.db")
+    summary_turn = {**GOOD, "summary": "지금까지 확정: A안 채택"}
+    fake = BigContext(structured_script=[GOOD, summary_turn, GOOD, GOOD])
+    orch = Orchestrator(trace, registry,
+                        {Provider.CLAUDE_CODE: fake, Provider.CODEX: fake})
+    state: dict = {}
+    decide = make_llm_decide(orch, load_config(), leader_state=state, compact_at=1000)
+
+    _, id1, _ = await decide("NEED_REPLAN", SNAP)
+    assert state["context_used"] == 1010               # 100 + 10 + 900
+    _, id2, _ = await decide("NEED_REPLAN", SNAP)
+
+    assert id1 != id2                                   # 세션이 교체됐다
+    assert len(fake.initial_messages) == 2
+    seed_intro = fake.initial_messages[1]
+    assert "[이전 컨텍스트 요약" in seed_intro
+    assert "지금까지 확정: A안 채택" in seed_intro
+    assert trace.events(event_type="LeaderCompactEvent")
+    assert state["context_used"] == 1010                # 새 세션의 첫 turn 기준

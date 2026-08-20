@@ -37,3 +37,13 @@ loopPolicy:
     QA:           200000
     REVIEWER:     500000
     BRAIN:        600000
+
+# crew leader 결정 세션의 컨텍스트 정책 (사용자 결정 2026-08-20)
+# persistent: 결정마다 fresh 세션 대신 스레드 단위로 세션을 유지한다 — 이전 결정과
+#   그때 확정된 사실을 들고 판단하므로 일관성이 올라가고, 스냅샷 재설명 비용이 준다.
+# compactAtRatio: 컨텍스트 점유가 window의 이 비율에 닿으면 leader가 스스로 요약해
+#   새 세션에 인계한다 (창을 비우되 결정 맥락은 유지).
+leaderContext:
+  persistent: true
+  windowTokens: 1000000
+  compactAtRatio: 0.5

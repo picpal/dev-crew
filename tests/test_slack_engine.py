@@ -23,9 +23,11 @@ class FakeRunner:
         self.timeout = 600.0
         self.busy = False
         self.calls: list[str] = []
+        self.thread_keys: list = []
 
-    async def run(self, task: str, *, on_progress=None):
+    async def run(self, task: str, *, on_progress=None, thread_key=None):
         self.calls.append(task)
+        self.thread_keys.append(thread_key)
         if self.timeout_flag:
             raise asyncio.TimeoutError
         if self.error:
@@ -53,6 +55,8 @@ async def test_mention_runs_task_and_replies_in_thread():
     assert len(say.messages) == 1                            # 최종 결과만 (상태는 인디케이터)
     assert "✅ SLACK-1 COMPLETED" in say.messages[0]["text"]
     assert say.messages[0]["thread_ts"] == "111.222"
+    # 스레드 단위 세션 이월 키로 thread_ts가 그대로 넘어간다
+    assert runner.thread_keys == ["111.222"]
 
 
 @pytest.mark.asyncio

@@ -39,6 +39,10 @@ FOLLOW_UP_MSG = "위 결과를 반영해 수정/재수행 후 스키마대로 �
 # (Task 4 R2 근본원인, task-7-report.md). run_node()의 재진입 경로 전체에 이 기본
 # 메시지를 적용해 None이 adapter.send로 새 나가는 경로를 원천 차단한다.
 REVISIT_MSG = "이전 보고 이후 작업 상태가 변경됐다. 동일 과업을 다시 수행하고 스키마대로 최종 보고해."
+# 이전 실행에서 이월된 세션이 이번 실행에서 처음 진입할 때 쓰는 메시지. 같은 작업
+# 공간·같은 세션이므로 코드베이스를 다시 탐색할 필요가 없다는 점을 명시한다.
+NEW_TASK_MSG = ("같은 작업 공간에서 이어지는 새 요청이다. 이미 파악한 코드베이스 맥락을 "
+                "그대로 유지한 채 다음을 수행하고 스키마대로 최종 보고해: {task}")
 
 _ASK_USER_NO_DECIDE_FN = {"action": "ASK_USER", "target_node": None,
                           "rationale": "no decide_fn configured"}
@@ -103,6 +107,8 @@ class NodeRuntime:
     session_id: str | None = None
     iterations: int = 0
     skipped: bool = False
+    carried: bool = False     # 이전 실행에서 이월된 세션인가
+    entered: bool = False     # 이번 실행에서 이 노드에 이미 진입했는가
 
 
 @dataclass(frozen=True)
@@ -131,11 +137,28 @@ class WorkflowEngine:
         self.decide_fn = decide_fn
         self.clock = clock
 
-    async def run(self, *, execution_id: str, task: str, worktree: str | None = None) -> ExecutionResult:
+    async def run(self, *, execution_id: str, task: str, worktree: str | None = None,
+                  carry: dict | None = None) -> ExecutionResult:
+        """워크플로 1회 실행.
+
+        `carry`가 주어지면 노드 세션을 실행 간에 이월한다 (in-process). 같은 Slack
+        스레드의 후속 요청이 같은 워커 세션을 이어받아 코드베이스를 다시 탐색하지
+        않게 하는 용도 — `{node_id: {"inst", "session_id", "tier"}}` 형태이며 엔진이
+        새 세션을 열 때마다 갱신한다. 프로세스가 재시작되면 어댑터의 클라이언트/시작
+        설정 캐시가 사라지므로 이월 세션은 무효가 되고, 그 경우 자동으로 새 세션을
+        연다 (아래 run_node의 폴백).
+        """
         template = self.template
         lp = self.cfg.loop_policy
-        nodes = [NodeRuntime(spec=n, tier=self.cfg.role_defaults[n.role].tier)
-                 for n in template.nodes]
+        nodes = []
+        for n in template.nodes:
+            rt = NodeRuntime(spec=n, tier=self.cfg.role_defaults[n.role].tier)
+            prev = (carry or {}).get(n.node_id)
+            if prev and prev.get("session_id") and prev.get("inst") is not None:
+                rt.inst, rt.session_id, rt.tier = (
+                    prev["inst"], prev["session_id"], prev.get("tier", rt.tier))
+                rt.carried = True
+            nodes.append(rt)
 
         started = self.clock()
         total_tokens = 0
@@ -242,6 +265,14 @@ class WorkflowEngine:
                 payload={"trigger": trigger, "raw": raw, "applied": applied,
                         "degraded": degraded})
 
+        def handoff_block() -> str:
+            if not completed:
+                return ""
+            return ("\n\n[선행 단계 결과 — crew leader 취합]\n"
+                    + _handoff_text(completed)
+                    + "\n\n위 결과를 전제로 진행해라. 이미 확인된 사실을 "
+                      "다시 조사하지 말고, 지적된 사항은 반영해라.")
+
         async def run_node(rt: NodeRuntime, follow_up_msg: str | None) -> TurnOutcome:
             nonlocal node_visits_total, total_tokens
             node_visits_total += 1
@@ -252,13 +283,12 @@ class WorkflowEngine:
                 # crew leader 취합 — 선행 노드 결과를 최초 투입 메시지에 함께 넘긴다.
                 # 이게 없으면 새 세션은 원본 task 문자열만 보고 시작해 앞 단계가
                 # 이미 밝힌 사실을 다시 조사하거나 모순된 산출물을 만든다.
-                intro = rt.spec.message.format(task=task)
-                if completed:
-                    intro += ("\n\n[선행 단계 결과 — crew leader 취합]\n"
-                              + _handoff_text(completed)
-                              + "\n\n위 결과를 전제로 진행해라. 이미 확인된 사실을 "
-                                "다시 조사하지 말고, 지적된 사항은 반영해라.")
+                intro = rt.spec.message.format(task=task) + handoff_block()
                 rt.session_id = await self.orch.start_worker(rt.inst, intro)
+                rt.entered = True
+                if carry is not None:
+                    carry[rt.spec.node_id] = {"inst": rt.inst,
+                                              "session_id": rt.session_id, "tier": rt.tier}
                 adapter = self.orch.adapters[rt.inst.provider]
                 # finding #6 — start_worker의 최초 turn usage는 adapter.start_session
                 # 내부로 버려진다 (반환값은 session_id뿐). 첫 방문 직후 그 usage를
@@ -271,8 +301,27 @@ class WorkflowEngine:
             # (LOOP/RETRY_NODE/REPLAN은 항상 non-None 메시지를 만든다) None이면
             # 명시적 재수행 메시지로 대체한다. adapter.send가 None을 받는 경로는 없다.
             adapter = self.orch.adapters[rt.inst.provider]
-            message = follow_up_msg if follow_up_msg is not None else REVISIT_MSG
-            return await adapter.send(rt.session_id, message)
+            if rt.carried and not rt.entered:
+                # 이전 실행에서 이월된 세션의 이번 실행 첫 진입 — 새 과업을 넘긴다
+                message = NEW_TASK_MSG.format(task=task) + handoff_block()
+            else:
+                message = follow_up_msg if follow_up_msg is not None else REVISIT_MSG
+            rt.entered = True
+            try:
+                return await adapter.send(rt.session_id, message)
+            except Exception as e:
+                if not rt.carried:
+                    raise
+                # 이월 세션이 이 프로세스에 없다(브리지 재시작 등) — 새 세션으로 폴백
+                self.orch.trace.append(
+                    "SessionCarryLostEvent", task_id=execution_id, execution_id=execution_id,
+                    instance_id=rt.inst.instance_id if rt.inst else None,
+                    payload={"node_id": rt.spec.node_id, "error": repr(e)})
+                rt.inst, rt.session_id, rt.carried = None, None, False
+                if carry is not None:
+                    carry.pop(rt.spec.node_id, None)
+                node_visits_total -= 1        # 아래 재호출에서 다시 센다
+                return await run_node(rt, follow_up_msg)
 
         def done(status: str, reason: str) -> ExecutionResult:
             return ExecutionResult(status, node_history, decisions, total_tokens,
@@ -471,7 +520,11 @@ class WorkflowEngine:
                 rt.tier = next_tier
                 adapter = self.orch.adapters[rt.inst.provider]
                 rt.session_id = await self.orch.start_worker(
-                    rt.inst, rt.spec.message.format(task=task))
+                    rt.inst, rt.spec.message.format(task=task) + handoff_block())
+                rt.carried = False
+                if carry is not None:
+                    carry[rt.spec.node_id] = {"inst": rt.inst,
+                                              "session_id": rt.session_id, "tier": next_tier}
                 initial = await adapter.initial_usage(rt.session_id)
                 if initial is not None:
                     add_tokens(rt.spec.role.value, _tokens(initial))

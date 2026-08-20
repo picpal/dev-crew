@@ -3,7 +3,8 @@ import dataclasses
 import pytest
 from devcrew.adapters.base import FakeAdapter
 from devcrew.config import LoopPolicy, load as load_config
-from devcrew.engine import REPORT_MSG, REVISIT_MSG, ExecutionResult, WorkflowEngine
+from devcrew.engine import (NEW_TASK_MSG, REPORT_MSG, REVISIT_MSG, ExecutionResult,
+                            WorkflowEngine)
 from devcrew.orchestrator import Orchestrator
 from devcrew.schema import Provider, Role
 from devcrew.store.registry import SessionRegistry
@@ -626,3 +627,64 @@ async def test_completed_result_carries_reason_and_role_tokens(tmp_path):
     assert r.status == "COMPLETED" and r.reason == "모든 노드 통과"
     assert r.path == ["develop:PASS", "review:PASS"]
     assert r.role_tokens == {"DEVELOPER": 1, "REVIEWER": 1}
+
+
+# ---------------------------------------------------------------------------
+# 실행 간 세션 이월 (carry) — "이어서 고쳐줘"에 재탐색하지 않기 (2026-08-20)
+# ---------------------------------------------------------------------------
+
+class _Recording(FakeAdapter):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.sent_messages: list[str] = []
+
+    async def send(self, session_id, message):
+        self.sent_messages.append(message)
+        return await super().send(session_id, message)
+
+
+def _carry_engine(tmp_path, dev_script, review_script, name="C"):
+    trace = TraceStore(tmp_path / f"{name}-trace.db")
+    registry = SessionRegistry(tmp_path / f"{name}-harness.db")
+    dev, rev = _Recording(structured_script=dev_script), _Recording(structured_script=review_script)
+    orch = Orchestrator(trace, registry, {Provider.CLAUDE_CODE: dev, Provider.CODEX: rev})
+    return WorkflowEngine(orch, load_config(), template=SIM), trace, dev, rev
+
+
+async def test_carry_reuses_sessions_across_executions(tmp_path):
+    """같은 carry를 넘긴 후속 실행은 노드 세션을 새로 열지 않고 이어 쓴다 —
+    새 요청은 NEW_TASK_MSG로 기존 세션에 투입된다 (코드베이스 재탐색 제거)."""
+    engine, _, dev, rev = _carry_engine(tmp_path, [PASS_DEV] * 3, [PASS_REVIEW] * 3)
+    carry: dict = {}
+    r1 = await engine.run(execution_id="C1", task="첫 요청", carry=carry)
+    assert r1.status == "COMPLETED"
+    assert set(carry) == {"develop", "review"}
+    sessions_after_first = {k: v["session_id"] for k, v in carry.items()}
+
+    r2 = await engine.run(execution_id="C2", task="이어서 고쳐줘", carry=carry)
+    assert r2.status == "COMPLETED"
+    # 세션이 그대로 재사용됐다 (새 start_session 없음)
+    assert {k: v["session_id"] for k, v in carry.items()} == sessions_after_first
+    assert len(dev.initial_messages) == 1 and len(rev.initial_messages) == 1
+    # 두 번째 실행의 첫 투입은 새 과업 메시지 (REVISIT_MSG가 아니다)
+    assert dev.sent_messages[1].startswith(NEW_TASK_MSG.format(task="이어서 고쳐줘"))
+
+
+async def test_carry_falls_back_to_fresh_session_when_lost(tmp_path):
+    """브리지 재시작 등으로 이월 세션이 이 프로세스에 없으면 새 세션으로 폴백한다."""
+    engine, trace, dev, _ = _carry_engine(tmp_path, [PASS_DEV] * 2, [PASS_REVIEW] * 2, name="C2")
+    stale = await engine.orch.spawn(Role.DEVELOPER, "DEFAULT", execution_id="X",
+                                    node_id="develop", task_scope="t")
+    carry = {"develop": {"inst": stale, "session_id": "죽은-세션", "tier": "DEFAULT"}}
+    r = await engine.run(execution_id="C3", task="t", carry=carry)
+    assert r.status == "COMPLETED"
+    assert carry["develop"]["session_id"] != "죽은-세션"      # 새 세션으로 교체됨
+    assert trace.events(event_type="SessionCarryLostEvent")
+
+
+async def test_run_without_carry_is_unchanged(tmp_path):
+    """carry를 안 넘기면 종전대로 실행마다 새 세션 (기존 동작 회귀 고정)."""
+    engine, _, dev, _ = _carry_engine(tmp_path, [PASS_DEV] * 3, [PASS_REVIEW] * 3, name="C4")
+    await engine.run(execution_id="C4", task="t")
+    await engine.run(execution_id="C5", task="t")
+    assert len(dev.initial_messages) == 2
