@@ -16,6 +16,11 @@
 - 스냅샷의 trigger, worker_result, history를 먼저 읽는다
 - 정보가 부족하면 harness MCP 조회 tool(get_execution_state, get_worker_result, get_trace_events)로 보강한다
 - 결정 근거는 rationale에 1~3문장으로 기록한다
+- 스냅샷의 `spent_tokens`(총합/에이전트별)와 `loop_policy.role_budgets`, `guard_reason`을
+  함께 읽는다. trigger가 LOOP_GUARD_EXCEEDED라면 `guard_reason`이 그 이유(예산 초과·
+  루프 상한·동일 finding 반복)를 명시한다 — 이유에 맞는 action을 고른다:
+  예산 초과인데 산출물이 이미 수용 기준을 충족했다면 무의미한 REPLAN 대신 ASK_USER로
+  사람 판단을 받고, 품질 미달로 반복 중이면 ESCALATE_MODEL이나 REPLAN을 고른다
 - 결정은 항상 스냅샷의 allowed_actions 중에서만 선택한다
 
 ## 보고 규칙

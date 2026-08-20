@@ -21,5 +21,19 @@ roleDefaults:
 loopPolicy:
   maxIterations: 5
   maxDurationMinutes: 60
-  maxTokenBudget: 300000
+  # 실행 전체 hard cap. 300k는 실측 1회 실행(587k)보다 작아 정상 완료도 강제
+  # 종료시켰다 (2026-08-20 SLACK-1/SLACK-2) — 실측 기준으로 현실화.
+  maxTokenBudget: 1500000
   sameFindingEscalationThreshold: 3
+  # 에이전트(role)별 누적 토큰 예산. 초과하면 그 시점 노드 완료 때 결정 지점으로
+  # 진입한다. ORCHESTRATOR 예산이 소진되면 결정 세션을 더 띄우지 않고 즉시
+  # NEEDS_HUMAN으로 끝낸다 (초과 상태에서 leader를 계속 부르는 악순환 차단).
+  roleBudgets:
+    ORCHESTRATOR: 400000
+    EXPLORER:     200000
+    ARCHITECT:    300000
+    DEVELOPER:    600000
+    SECURITY:     300000
+    QA:           200000
+    REVIEWER:     500000
+    BRAIN:        600000

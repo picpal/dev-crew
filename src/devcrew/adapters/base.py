@@ -56,6 +56,8 @@ class FakeAdapter:
         self.last_system_prompt: str | None = None
         self.last_output_schema: dict | None = None
         self.last_mcp_servers: dict | None = None
+        # 노드 최초 투입 메시지 기록 — crew leader 취합(handoff) 주입을 unit이 검증한다
+        self.initial_messages: list[str] = []
 
     async def start_session(self, inst: AgentInstance, initial_message: str, *,
                              system_prompt: str | None = None,
@@ -63,6 +65,7 @@ class FakeAdapter:
                              mcp_servers: dict | None = None) -> str:
         sid = f"fake-{next(self._ids)}"
         self.turns[sid] = 0
+        self.initial_messages.append(initial_message)
         self.last_system_prompt = system_prompt
         self.last_output_schema = output_schema
         self.last_mcp_servers = mcp_servers

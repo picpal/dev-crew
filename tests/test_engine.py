@@ -505,3 +505,124 @@ async def test_loop_event_recorded_on_every_loop_transition(tmp_path):
     assert loop_events[0]["payload"]["node_id"] == "review"
     assert loop_events[0]["payload"]["transition"] == "NOT_PASS"
     assert loop_events[0]["instance_id"].startswith("REV")
+
+
+# ---------------------------------------------------------------------------
+# crew leader 취합(handoff) · role별 예산 · 종료 사유 · 전체 경로 (2026-08-20)
+# ---------------------------------------------------------------------------
+
+def _cfg_with(**loop_overrides):
+    cfg = load_config()
+    return dataclasses.replace(
+        cfg, loop_policy=dataclasses.replace(cfg.loop_policy, **loop_overrides))
+
+
+async def test_handoff_of_prior_results_reaches_next_node(tmp_path):
+    """ADVANCE로 새로 여는 노드는 선행 노드 결과를 최초 투입 메시지로 함께 받는다.
+
+    이게 없으면 새 세션은 원본 task 문자열만 보고 시작해 앞 단계가 이미 밝힌
+    사실을 다시 조사한다 (2026-08-20 SLACK-2 실사례: explore가 "결과물 없음"을
+    보고했는데 develop이 그걸 못 보고 무관한 산출물을 만들었다).
+    """
+    engine, _, (dev_fake, review_fake) = make_engine(
+        tmp_path, [PASS_DEV], [PASS_REVIEW])
+    r = await engine.run(execution_id="H1", task="t")
+    assert r.status == "COMPLETED"
+    intro = review_fake.initial_messages[0]
+    assert "crew leader 취합" in intro
+    assert "[develop/DEVELOPER] PASS" in intro
+    assert PASS_DEV["summary"] in intro
+    assert "a.py" in intro                       # changed_files까지 넘어간다
+    # 첫 노드는 선행 결과가 없으므로 취합 블록이 붙지 않는다
+    assert "crew leader 취합" not in dev_fake.initial_messages[0]
+
+
+async def test_handoff_carries_review_findings_to_developer(tmp_path):
+    """review NOT_PASS 후 develop 재진입은 기존 세션이라 follow-up 경로를 타지만,
+    이후 새로 열리는 노드는 취합에 리뷰 findings까지 담아 받는다."""
+    tmpl = WorkflowTemplate("sim3", (
+        NodeSpec("develop", Role.DEVELOPER, "구현: {task}"),
+        NodeSpec("review", Role.REVIEWER, "검토: {task}", loop_back_to="develop"),
+        NodeSpec("qa", Role.QA, "검증: {task}"),
+    ))
+    # develop과 qa가 같은 provider(CLAUDE_CODE) fake를 공유한다 — 세 role의 required를
+    # 모두 만족하는 GENERIC_PASS를 써야 qa 보고가 malformed로 강등되지 않는다.
+    engine, _, (claude_fake, _) = make_engine(
+        tmp_path, [GENERIC_PASS, GENERIC_PASS], [FAIL_REVIEW, PASS_REVIEW], template=tmpl)
+    r = await engine.run(execution_id="H2", task="t")
+    assert r.status == "COMPLETED"
+    qa_intro = claude_fake.initial_messages[-1]   # develop, qa 모두 CLAUDE_CODE
+    assert "[review/REVIEWER] NOT_PASS" in qa_intro
+    assert "bug" in qa_intro                      # findings description
+
+
+async def test_role_budget_exceeded_terminates_with_named_reason(tmp_path):
+    """role 예산을 넘기면 그 노드 완료 시점에 결정 지점으로 진입하고,
+    종료 사유에 어느 에이전트가 얼마를 썼는지 그대로 남는다."""
+    engine, _, _ = make_engine(
+        tmp_path, [PASS_DEV, PASS_DEV], [FAIL_REVIEW, PASS_REVIEW],
+        cfg=_cfg_with(role_budgets={"DEVELOPER": 1}))
+    r = await engine.run(execution_id="B1", task="t")
+    assert r.status == "NEEDS_HUMAN"
+    assert "DEVELOPER 예산 초과 (2/1)" in r.reason
+    assert r.role_tokens["DEVELOPER"] == 2
+
+
+async def test_execution_token_budget_exceeded_named_in_reason(tmp_path):
+    engine, _, _ = make_engine(
+        tmp_path, [PASS_DEV], [PASS_REVIEW], cfg=_cfg_with(max_token_budget=1))
+    r = await engine.run(execution_id="B2", task="t")
+    assert r.status == "NEEDS_HUMAN"
+    assert "실행 전체 토큰 예산 초과 (2/1)" in r.reason
+
+
+async def test_orchestrator_budget_stops_further_decision_sessions(tmp_path):
+    """leader 예산이 소진되면 결정 세션을 더 띄우지 않는다 — 초과 상태에서
+    opus 결정 세션을 계속 부르며 초과분을 키우던 악순환(SLACK-1) 차단."""
+    calls = []
+
+    async def decide(trigger, snapshot):
+        calls.append(trigger)
+        return {"action": "REPLAN", "target_node": "develop", "rationale": "r"}, "ORC-1", 100
+
+    engine, _, _ = make_engine(
+        tmp_path, [PASS_DEV] * 6, [FAIL_REVIEW] * 6, decide_fn=decide,
+        cfg=_cfg_with(role_budgets={"ORCHESTRATOR": 50}, max_token_budget=2))
+    r = await engine.run(execution_id="B3", task="t")
+    assert r.status == "NEEDS_HUMAN"
+    assert "crew leader" in r.reason and "ORCHESTRATOR 예산 초과" in r.reason
+    assert len(calls) == 1                        # 두 번째 결정 지점에서는 호출 안 함
+    assert r.role_tokens["ORCHESTRATOR"] == 100
+
+
+async def test_path_records_leader_hops_loops_and_skips(tmp_path):
+    """경로에 노드 전이뿐 아니라 leader 결정 홉·루프백·스킵이 모두 남는다."""
+    async def decide(trigger, snapshot):
+        if trigger == "CLASSIFY":
+            return {"action": "SKIP_NODE", "target_node": "explore", "rationale": "r"}, "ORC-0", 0
+        return {"action": "ASK_USER", "target_node": None, "rationale": "확인 필요"}, "ORC-1", 0
+
+    tmpl = WorkflowTemplate("sim4", (
+        NodeSpec("explore", Role.EXPLORER, "조사: {task}", conditional=True),
+        NodeSpec("develop", Role.DEVELOPER, "구현: {task}"),
+        NodeSpec("review", Role.REVIEWER, "검토: {task}", loop_back_to="develop"),
+    ))
+    engine, _, _ = make_engine(
+        tmp_path, [PASS_DEV, PASS_DEV], [FAIL_REVIEW], decide_fn=decide, template=tmpl,
+        cfg=_cfg_with(max_iterations=1))
+    r = await engine.run(execution_id="P1", task="t")
+    assert r.path[0] == "leader:CLASSIFY→SKIP(explore)"
+    assert "explore:SKIPPED" in r.path
+    assert "develop:PASS" in r.path
+    assert "review:NOT_PASS↺develop" in r.path
+    assert "leader:LOOP_GUARD_EXCEEDED[1]" in r.path
+    assert "leader:LOOP_GUARD_EXCEEDED→ASK_USER" in r.path
+    assert "확인 필요" in r.reason
+
+
+async def test_completed_result_carries_reason_and_role_tokens(tmp_path):
+    engine, _, _ = make_engine(tmp_path, [PASS_DEV], [PASS_REVIEW])
+    r = await engine.run(execution_id="P2", task="t")
+    assert r.status == "COMPLETED" and r.reason == "모든 노드 통과"
+    assert r.path == ["develop:PASS", "review:PASS"]
+    assert r.role_tokens == {"DEVELOPER": 1, "REVIEWER": 1}

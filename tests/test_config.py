@@ -72,7 +72,10 @@ def test_loop_policy_loaded():
     cfg = load()
     assert cfg.loop_policy.max_iterations == 5
     assert cfg.loop_policy.max_duration_minutes == 60
-    assert cfg.loop_policy.max_token_budget == 300000
+    assert cfg.loop_policy.max_token_budget == 1500000
+    # role별 예산 — 모든 role에 값이 있고 합계는 실행 hard cap을 넘지 않게 두지 않는다
+    assert cfg.loop_policy.role_budgets["ORCHESTRATOR"] == 400000
+    assert cfg.loop_policy.role_budgets["DEVELOPER"] == 600000
     assert cfg.loop_policy.same_finding_escalation_threshold == 3
 
 

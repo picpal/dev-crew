@@ -107,3 +107,36 @@ def test_progress_text_shows_stage_and_path():
     assert "REVIEWER 실행 중 (32s)" in t
     assert "develop:PASS" in t and "결정 1회" in t
     assert "\n" not in t                                     # status는 한 줄
+
+
+def test_format_result_shows_termination_reason_and_full_path():
+    """예산 초과로 끝난 실행은 사유가 메시지에 그대로 보여야 하고, 경로에는
+    crew leader 결정 홉까지 포함된 전체 경로가 찍혀야 한다 (사용자 요청 2026-08-20)."""
+    @dataclass
+    class R:
+        status: str = "NEEDS_HUMAN"
+        node_history: list = field(default_factory=list)
+        decisions: int = 2
+        total_tokens: int = 587872
+        reason: str = "실행 전체 토큰 예산 초과 (587,872/300,000)"
+        path: list = field(default_factory=lambda: [
+            "leader:CLASSIFY→PROCEED", "explore:PASS", "develop:PASS",
+            "review:NOT_PASS↺develop", "develop:PASS", "review:PASS",
+            "leader:LOOP_GUARD_EXCEEDED[1]", "leader:LOOP_GUARD_EXCEEDED→ASK_USER"])
+        role_tokens: dict = field(default_factory=lambda: {
+            "DEVELOPER": 300000, "ORCHESTRATOR": 200000, "REVIEWER": 87872})
+
+    text = format_result("SLACK-2", R(), "/tmp/repo")
+    assert "사유: 실행 전체 토큰 예산 초과 (587,872/300,000)" in text
+    assert "leader:CLASSIFY→PROCEED → explore:PASS" in text
+    assert "review:NOT_PASS↺develop" in text
+    assert "leader:LOOP_GUARD_EXCEEDED→ASK_USER" in text
+    # 에이전트별 토큰은 많이 쓴 순으로
+    assert "에이전트별: DEVELOPER 300,000 · ORCHESTRATOR 200,000 · REVIEWER 87,872" in text
+
+
+def test_format_result_without_new_fields_still_renders():
+    """path/reason이 없는 결과(구 형식)도 node_history 폴백으로 렌더된다."""
+    text = format_result("SLACK-9", FakeResult(), "/tmp/repo")
+    assert "develop:PASS → review:PASS" in text
+    assert "사유:" not in text

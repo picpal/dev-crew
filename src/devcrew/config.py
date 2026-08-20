@@ -1,7 +1,7 @@
 """§17 설정 로딩 — 설정이 정본, 코드 폴백 없음."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -34,8 +34,10 @@ class RoleDefault:
 class LoopPolicy:
     max_iterations: int
     max_duration_minutes: int
-    max_token_budget: int
+    max_token_budget: int          # 실행 전체 hard cap
     same_finding_escalation_threshold: int
+    # role별 누적 토큰 상한 (role 이름 -> 토큰). 비어 있으면 role 가드 없음.
+    role_budgets: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -79,9 +81,21 @@ def load(path: str | Path | None = None) -> HarnessConfig:
     raw_lp = raw.get("loopPolicy")
     if not raw_lp:
         raise ConfigError(f"config has no loopPolicy: {p}")
+    role_budgets: dict[str, int] = {}
+    for name, v in (raw_lp.get("roleBudgets") or {}).items():
+        try:
+            role = Role(name)
+            budget = int(v)
+        except ValueError as e:
+            raise ConfigError(f"invalid roleBudgets entry {name!r} in {p}: {e}") from e
+        if budget <= 0:
+            raise ConfigError(f"roleBudgets[{name}] must be positive: {p}")
+        role_budgets[role.value] = budget
     try:
         lp = LoopPolicy(int(raw_lp["maxIterations"]), int(raw_lp["maxDurationMinutes"]),
-                        int(raw_lp["maxTokenBudget"]), int(raw_lp["sameFindingEscalationThreshold"]))
+                        int(raw_lp["maxTokenBudget"]),
+                        int(raw_lp["sameFindingEscalationThreshold"]),
+                        role_budgets=role_budgets)
     except (KeyError, ValueError, TypeError) as e:
         raise ConfigError(f"invalid loopPolicy {p}: {e}") from e
     if min(lp.max_iterations, lp.max_duration_minutes, lp.max_token_budget,

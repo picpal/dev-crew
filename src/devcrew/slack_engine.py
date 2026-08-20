@@ -62,13 +62,27 @@ def progress_text(events: list, elapsed: float) -> str:
 
 
 def format_result(execution_id: str, result, repo: str) -> str:
-    """ExecutionResult → Slack 회신 텍스트."""
+    """ExecutionResult → Slack 회신 텍스트.
+
+    경로는 노드 전이만이 아니라 crew leader 결정 홉(`leader:TRIGGER→ACTION`)과
+    스킵·모델 승급까지 포함한 전체 경로를 그대로 렌더한다. 종료 사유(예산 초과·
+    loop guard·ASK_USER rationale)와 에이전트별 토큰도 함께 표기한다.
+    """
     icon = {"COMPLETED": "✅", "NEEDS_HUMAN": "🙋", "ABORTED": "❌"}.get(result.status, "❓")
-    path = " → ".join(f"{h['node_id']}:{h['transition']}" for h in result.node_history)
-    return (f"{icon} {execution_id} {result.status}\n"
-            f"경로: {path or '(없음)'}\n"
-            f"결정 {result.decisions}회 · 토큰 {result.total_tokens:,}\n"
-            f"작업 공간: {repo}")
+    hops = list(getattr(result, "path", None) or
+                [f"{h['node_id']}:{h['transition']}" for h in result.node_history])
+    lines = [f"{icon} {execution_id} {result.status}",
+             f"경로: {' → '.join(hops) or '(없음)'}"]
+    reason = str(getattr(result, "reason", "") or "").strip()
+    if reason:
+        lines.append(f"사유: {reason}")
+    lines.append(f"결정 {result.decisions}회 · 토큰 {result.total_tokens:,}")
+    by_role = getattr(result, "role_tokens", None) or {}
+    if by_role:
+        lines.append("에이전트별: " + " · ".join(
+            f"{r} {t:,}" for r, t in sorted(by_role.items(), key=lambda kv: -kv[1])))
+    lines.append(f"작업 공간: {repo}")
+    return "\n".join(lines)
 
 
 class EngineRunner:

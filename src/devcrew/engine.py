@@ -13,11 +13,11 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .adapters.base import TurnOutcome
 from .config import HarnessConfig
-from .schema import AgentInstance, Usage
+from .schema import AgentInstance, Role, Usage
 from .workflow import (ALLOWED_BY_TRIGGER, DEFAULT_TEMPLATE, NodeSpec, Step,
                        WorkflowError, WorkflowTemplate, next_step)
 
@@ -50,6 +50,30 @@ def _tokens(u: Usage) -> int:
 
 def _follow_up_msg(structured: dict | None) -> str:
     return f"{FOLLOW_UP_MSG} 이전 결과: {json.dumps(structured, ensure_ascii=False)}"
+
+
+def _handoff_text(entries: list[dict], limit: int = 4) -> str:
+    """완료된 선행 노드들의 결과를 다음 노드 투입용 텍스트로 취합한다 (crew leader 취합).
+
+    엔진이 0토큰으로 조립한다 — LLM 결정 세션을 홉마다 띄우지 않고도 다음
+    에이전트가 선행 단계의 사실을 전제로 시작하게 만드는 것이 목적이다.
+    """
+    lines: list[str] = []
+    for e in entries[-limit:]:
+        st = e.get("structured") or {}
+        summary = str(st.get("summary") or "")[:600]
+        lines.append(f"- [{e['node_id']}/{e['role']}] {e['transition']}: {summary}")
+        changed = st.get("changed_files")
+        if isinstance(changed, list) and changed:
+            lines.append("    · 변경 파일: " + ", ".join(str(c) for c in changed[:10]))
+        findings = st.get("findings")
+        if isinstance(findings, list):
+            for f in findings[:5]:
+                if isinstance(f, dict):
+                    lines.append(
+                        f"    · {f.get('severity', '')} {f.get('file', '')}: "
+                        f"{str(f.get('description') or f.get('evidence') or '')[:200]}")
+    return "\n".join(lines)
 
 
 def _same_finding_signature(node_id: str, structured: dict | None) -> tuple:
@@ -87,6 +111,9 @@ class ExecutionResult:
     node_history: list[dict]     # [{node_id, transition, iteration}]
     decisions: int
     total_tokens: int
+    reason: str = ""             # 종료 사유 (예산 초과·loop guard·ASK_USER rationale)
+    path: list[str] = field(default_factory=list)        # leader 결정 홉까지 포함한 전체 경로
+    role_tokens: dict[str, int] = field(default_factory=dict)   # role별 누적 토큰
 
 
 class WorkflowEngine:
@@ -114,6 +141,13 @@ class WorkflowEngine:
         total_tokens = 0
         decisions = 0
         node_history: list[dict] = []
+        # 전체 경로(노드 전이 + leader 결정 홉) — Slack 회신에 그대로 렌더된다
+        path: list[str] = []
+        # role별 누적 토큰 — role 예산 guard의 근거
+        role_tokens: dict[str, int] = {}
+        # 완료된 노드 결과 취합분 — 다음 노드 최초 투입 메시지에 주입된다
+        completed: list[dict] = []
+        guard_reason = ""
         same_finding_sig = None
         same_finding_count = 0
         # finding #1 — 실행 전체 누적 카운터. 어떤 재진입/리셋 경로도 이 값들을
@@ -122,6 +156,26 @@ class WorkflowEngine:
         replan_count = 0
         retry_count = 0
         loop_guard_trigger_count = 0
+
+        def add_tokens(role_value: str, n: int) -> None:
+            """토큰을 실행 전체 합계와 role별 합계 양쪽에 반영한다."""
+            nonlocal total_tokens
+            total_tokens += n
+            role_tokens[role_value] = role_tokens.get(role_value, 0) + n
+
+        def over_budget(role_value: str) -> str | None:
+            limit = lp.role_budgets.get(role_value)
+            used = role_tokens.get(role_value, 0)
+            if limit and used > limit:
+                return f"{role_value} 예산 초과 ({used:,}/{limit:,})"
+            return None
+
+        def any_role_over_budget() -> str | None:
+            for rv in sorted(role_tokens):
+                msg = over_budget(rv)
+                if msg:
+                    return msg
+            return None
 
         def find_node(node_id: str | None) -> NodeRuntime | None:
             if node_id is None:
@@ -142,7 +196,10 @@ class WorkflowEngine:
                                "max_duration_minutes": lp.max_duration_minutes,
                                "max_token_budget": lp.max_token_budget,
                                "same_finding_escalation_threshold":
-                                   lp.same_finding_escalation_threshold},
+                                   lp.same_finding_escalation_threshold,
+                               "role_budgets": dict(lp.role_budgets)},
+                "spent_tokens": {"total": total_tokens, "by_role": dict(role_tokens)},
+                "guard_reason": guard_reason,
             }
 
         async def call_decide_fn(trigger: str, rt: NodeRuntime | None,
@@ -172,6 +229,7 @@ class WorkflowEngine:
                     and (result[1] is None or isinstance(result[1], str))
                     and isinstance(result[2], int) and not isinstance(result[2], bool)):
                 raw, producer_id, usage_tokens = result
+                add_tokens(Role.ORCHESTRATOR.value, usage_tokens)
                 return raw, producer_id, usage_tokens
             return ({"action": "ASK_USER", "target_node": None,
                      "rationale": f"decide_fn returned invalid result: {result!r}"}, None, 0)
@@ -191,15 +249,23 @@ class WorkflowEngine:
                 rt.inst = await self.orch.spawn(
                     rt.spec.role, rt.tier, execution_id=execution_id, node_id=rt.spec.node_id,
                     task_scope=task, worktree=worktree)
-                rt.session_id = await self.orch.start_worker(
-                    rt.inst, rt.spec.message.format(task=task))
+                # crew leader 취합 — 선행 노드 결과를 최초 투입 메시지에 함께 넘긴다.
+                # 이게 없으면 새 세션은 원본 task 문자열만 보고 시작해 앞 단계가
+                # 이미 밝힌 사실을 다시 조사하거나 모순된 산출물을 만든다.
+                intro = rt.spec.message.format(task=task)
+                if completed:
+                    intro += ("\n\n[선행 단계 결과 — crew leader 취합]\n"
+                              + _handoff_text(completed)
+                              + "\n\n위 결과를 전제로 진행해라. 이미 확인된 사실을 "
+                                "다시 조사하지 말고, 지적된 사항은 반영해라.")
+                rt.session_id = await self.orch.start_worker(rt.inst, intro)
                 adapter = self.orch.adapters[rt.inst.provider]
                 # finding #6 — start_worker의 최초 turn usage는 adapter.start_session
                 # 내부로 버려진다 (반환값은 session_id뿐). 첫 방문 직후 그 usage를
                 # 별도로 복구해 합산한다.
                 initial = await adapter.initial_usage(rt.session_id)
                 if initial is not None:
-                    total_tokens += _tokens(initial)
+                    add_tokens(rt.spec.role.value, _tokens(initial))
                 return await adapter.send(rt.session_id, REPORT_MSG)
             # 재진입(세션 기존) — ADVANCE는 follow_up_msg=None을 넘길 수 있으니
             # (LOOP/RETRY_NODE/REPLAN은 항상 non-None 메시지를 만든다) None이면
@@ -208,10 +274,13 @@ class WorkflowEngine:
             message = follow_up_msg if follow_up_msg is not None else REVISIT_MSG
             return await adapter.send(rt.session_id, message)
 
+        def done(status: str, reason: str) -> ExecutionResult:
+            return ExecutionResult(status, node_history, decisions, total_tokens,
+                                   reason=reason, path=path, role_tokens=dict(role_tokens))
+
         # 조건부 노드가 하나라도 있으면 CLASSIFY 결정을 1회만 호출한다 (SKIP_NODE는 target 1개만)
         if any(n.conditional for n in template.nodes):
-            raw, producer_id, usage_tokens = await call_decide_fn("CLASSIFY", None, None)
-            total_tokens += usage_tokens
+            raw, producer_id, _usage = await call_decide_fn("CLASSIFY", None, None)
             action = raw.get("action")
             if action == "SKIP_NODE":
                 target_rt = find_node(raw.get("target_node"))
@@ -220,16 +289,21 @@ class WorkflowEngine:
                     applied = {"action": "ASK_USER", "target_node": None,
                               "rationale": "invalid SKIP_NODE target"}
                     record_decision("CLASSIFY", raw, applied, producer_id, degraded=True)
-                    return ExecutionResult("NEEDS_HUMAN", node_history, decisions, total_tokens)
+                    path.append("leader:CLASSIFY→ASK_USER")
+                    return done("NEEDS_HUMAN", "CLASSIFY 결정 무효 — SKIP_NODE 대상이 "
+                                               "조건부 노드가 아니다")
                 target_rt.skipped = True
                 record_decision("CLASSIFY", raw, raw, producer_id, degraded=False)
+                path.append(f"leader:CLASSIFY→SKIP({target_rt.spec.node_id})")
             elif action == "PROCEED":
                 record_decision("CLASSIFY", raw, raw, producer_id, degraded=False)
+                path.append("leader:CLASSIFY→PROCEED")
             else:
                 applied = {"action": "ASK_USER", "target_node": None,
                           "rationale": f"invalid CLASSIFY action {action!r}"}
                 record_decision("CLASSIFY", raw, applied, producer_id, degraded=True)
-                return ExecutionResult("NEEDS_HUMAN", node_history, decisions, total_tokens)
+                path.append("leader:CLASSIFY→ASK_USER")
+                return done("NEEDS_HUMAN", f"CLASSIFY 결정 무효 — action {action!r}")
 
         async def process(rt: NodeRuntime, outcome: TurnOutcome):
             """rt의 실행 결과를 소비하고 다음 스텝을 계산한다.
@@ -238,11 +312,19 @@ class WorkflowEngine:
             """
             nonlocal total_tokens, same_finding_sig, same_finding_count
             nonlocal node_visits_total, replan_count, retry_count, loop_guard_trigger_count
-            total_tokens += _tokens(outcome.usage)
+            nonlocal guard_reason
+            add_tokens(rt.spec.role.value, _tokens(outcome.usage))
             transition = self.orch.consume_result(rt.inst, outcome)
             step = next_step(rt.spec, transition)
             node_history.append({"node_id": rt.spec.node_id, "transition": transition,
                                  "iteration": rt.iterations})
+            hop = f"{rt.spec.node_id}:{transition}"
+            if step.kind == "LOOP":
+                hop += f"↺{step.target}"
+            path.append(hop)
+            # crew leader 취합 목록 — 다음 노드 최초 투입 시 handoff로 주입된다
+            completed.append({"node_id": rt.spec.node_id, "role": rt.spec.role.value,
+                              "transition": transition, "structured": outcome.structured})
             self.orch.trace.append(
                 "NodeTransitionEvent", task_id=execution_id, execution_id=execution_id,
                 instance_id=rt.inst.instance_id,
@@ -252,10 +334,20 @@ class WorkflowEngine:
             # finding #1d — 토큰/duration/누적 방문수 guard는 LOOP 분기만이 아니라
             # 모든 노드 완료 시점에 검사한다 (ADVANCE라도 예산 초과분은 통과시키지 않는다).
             elapsed = self.clock() - started
-            accumulated_guard_exceeded = (
-                node_visits_total > lp.max_iterations * len(nodes)
-                or total_tokens > lp.max_token_budget
-                or elapsed > lp.max_duration_minutes * 60)
+            reasons: list[str] = []
+            visit_cap = lp.max_iterations * len(nodes)
+            if node_visits_total > visit_cap:
+                reasons.append(f"노드 방문 {node_visits_total}회 > 상한 {visit_cap}회")
+            if total_tokens > lp.max_token_budget:
+                reasons.append(
+                    f"실행 전체 토큰 예산 초과 ({total_tokens:,}/{lp.max_token_budget:,})")
+            if elapsed > lp.max_duration_minutes * 60:
+                reasons.append(
+                    f"경과 시간 초과 ({int(elapsed // 60)}분/{lp.max_duration_minutes}분)")
+            role_over = any_role_over_budget()
+            if role_over:
+                reasons.append("에이전트 " + role_over)
+            accumulated_guard_exceeded = bool(reasons)
 
             local_loop_guard_exceeded = False
             loop_target_idx = None
@@ -268,6 +360,11 @@ class WorkflowEngine:
                     same_finding_count += 1
                 else:
                     same_finding_sig, same_finding_count = sig, 1
+                if target_rt.iterations >= lp.max_iterations:
+                    reasons.append(f"{step.target} 루프 {target_rt.iterations}회 "
+                                   f"≥ 상한 {lp.max_iterations}회")
+                if same_finding_count >= lp.same_finding_escalation_threshold:
+                    reasons.append(f"동일 finding {same_finding_count}회 반복")
                 local_loop_guard_exceeded = (
                     target_rt.iterations >= lp.max_iterations
                     or same_finding_count >= lp.same_finding_escalation_threshold)
@@ -281,6 +378,8 @@ class WorkflowEngine:
                             "transition": transition})
 
             guard_exceeded = accumulated_guard_exceeded or local_loop_guard_exceeded
+            if reasons:
+                guard_reason = " / ".join(reasons)
 
             if not guard_exceeded:
                 if step.kind == "ADVANCE":
@@ -294,11 +393,20 @@ class WorkflowEngine:
                 # finding #1c — 이 트리거가 실행 전체에서 2회를 넘게 발생하면 더는
                 # decide_fn을 신뢰하지 않는다: 결정 없이 즉시 NEEDS_HUMAN으로 종료한다.
                 loop_guard_trigger_count += 1
+                path.append(f"leader:LOOP_GUARD_EXCEEDED[{loop_guard_trigger_count}]")
                 if loop_guard_trigger_count > MAX_LOOP_GUARD_TRIGGERS:
-                    return ("terminal", "NEEDS_HUMAN")
+                    return ("terminal", "NEEDS_HUMAN",
+                            f"loop guard {loop_guard_trigger_count}회 연속 — {guard_reason}")
+
+            # crew leader 자신의 예산이 소진된 상태에서 결정 세션을 또 띄우면
+            # 초과분이 더 커지는 악순환이 된다 — 결정 없이 즉시 사람에게 넘긴다.
+            orch_over = over_budget(Role.ORCHESTRATOR.value)
+            if orch_over:
+                return ("terminal", "NEEDS_HUMAN",
+                        f"crew leader {orch_over} — 결정 세션을 더 띄우지 않는다"
+                        + (f" · 직전 가드: {guard_reason}" if guard_reason else ""))
 
             raw, producer_id, usage_tokens = await call_decide_fn(trigger, rt, outcome.structured)
-            total_tokens += usage_tokens
             allowed = ALLOWED_BY_TRIGGER[trigger]
             action = raw.get("action")
             applied = dict(raw)
@@ -343,6 +451,8 @@ class WorkflowEngine:
                 degrade(f"no escalation tier beyond {rt.tier}")
 
             record_decision(trigger, raw, applied, producer_id, degraded=degraded)
+            _tgt = applied.get("target_node")
+            path.append(f"leader:{trigger}→{action}" + (f"({_tgt})" if _tgt else ""))
 
             if action == "RETRY_NODE":
                 target_idx = template.index(retry_target.spec.node_id)
@@ -352,6 +462,7 @@ class WorkflowEngine:
 
             if action == "ESCALATE_MODEL":
                 next_tier = ESCALATION_LADDER[rt.tier]
+                path.append(f"{rt.spec.node_id}:MODEL {rt.tier}→{next_tier}")
                 node_visits_total += 1
                 rt.inst = await self.orch.spawn(
                     rt.spec.role, next_tier, execution_id=execution_id, node_id=rt.spec.node_id,
@@ -363,7 +474,7 @@ class WorkflowEngine:
                     rt.inst, rt.spec.message.format(task=task))
                 initial = await adapter.initial_usage(rt.session_id)
                 if initial is not None:
-                    total_tokens += _tokens(initial)
+                    add_tokens(rt.spec.role.value, _tokens(initial))
                 rt.iterations = 0
                 same_finding_sig, same_finding_count = None, 0
                 outcome2 = await adapter.send(rt.session_id, REPORT_MSG)
@@ -376,24 +487,28 @@ class WorkflowEngine:
                 same_finding_sig, same_finding_count = None, 0
                 return ("goto", target_idx, _follow_up_msg(outcome.structured))
 
+            rationale = str(applied.get("rationale") or "").strip()
+            prefix = f"{guard_reason} → " if guard_reason and trigger == "LOOP_GUARD_EXCEEDED" else ""
             if action == "ASK_USER":
-                return ("terminal", "NEEDS_HUMAN")
+                return ("terminal", "NEEDS_HUMAN",
+                        f"{prefix}crew leader가 사람 확인 요청: {rationale}")
 
             # ABORT (그 외 action은 위에서 이미 ASK_USER로 강등됨)
-            return ("terminal", "ABORTED")
+            return ("terminal", "ABORTED", f"{prefix}crew leader ABORT: {rationale}")
 
         idx = 0
         follow_up: str | None = None
         while True:
             if idx >= len(nodes):
-                return ExecutionResult("COMPLETED", node_history, decisions, total_tokens)
+                return done("COMPLETED", "모든 노드 통과")
             rt = nodes[idx]
             if rt.skipped:
+                path.append(f"{rt.spec.node_id}:SKIPPED")
                 idx += 1
                 continue
             outcome = await run_node(rt, follow_up)
             follow_up = None
             kind, *rest = await process(rt, outcome)
             if kind == "terminal":
-                return ExecutionResult(rest[0], node_history, decisions, total_tokens)
+                return done(rest[0], rest[1])
             idx, follow_up = rest
