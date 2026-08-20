@@ -595,11 +595,56 @@ RUNNING
 loopPolicy:
   maxIterations: 5
   maxDurationMinutes: 60
-  maxTokenBudget: 300000
+  maxTokenBudget: 1500000          # 실행 전체 hard cap (무인 실행 최후 안전판)
   sameFindingEscalationThreshold: 3
+  roleBudgets:                     # 에이전트별 토큰 "경보선" (종료 트리거 아님)
+    ORCHESTRATOR: 400000
+    DEVELOPER: 600000
+    REVIEWER: 500000
+    # …나머지 role
 ```
 
 한도 초과는 Task의 즉시 실패가 아니라 자동 루프 종료와 Orchestrator escalation을 의미한다.
+
+**토큰 예산의 위상 (2026-08-20 개정).** `adapter.send()` 한 번이 그 에이전트의 전체
+agentic turn(내부 tool 루프 포함)이므로 토큰은 turn이 끝난 뒤에만 관측된다 — 폭주를
+막을 수 없고 사후 탐지만 한다. 따라서 다음 홉을 실제로 차단하는 가드는
+`maxIterations`/`sameFindingEscalationThreshold`/노드 방문 수/`maxDurationMinutes`이고,
+`roleBudgets`는 **경보**로만 쓴다(회신에 `⚠️` 표기 + 결정 스냅샷 `budget_warnings` +
+Slack 중지 버튼 제공). 토큰을 종료 트리거로 쓰면 리뷰를 통과한 정상 실행을 숫자만
+보고 죽인다(2026-08-20 SLACK-1/SLACK-2 실사례).
+
+예외는 ORCHESTRATOR 하나다. leader는 노드가 아니라 반복 가드에 잡히지 않고, 가드가
+켜질 때마다 호출되는 구조라 자기 자신이 원인인 루프를 만든다 — 그래서 leader 예산만
+hard stop이며, 초과 시 결정 세션을 더 띄우지 않고 즉시 NEEDS_HUMAN으로 끝낸다.
+
+### 10.4 crew leader 컨텍스트 정책
+
+```yaml
+leaderContext:
+  persistent: true                 # 결정 세션을 스레드 단위로 유지
+  windowTokens: 1000000
+  compactAtRatio: 0.5              # 창 점유 50%에서 자체 요약 후 새 세션 인계
+```
+
+`persistent: false`면 §10.3의 종전 동작(결정마다 fresh 세션 + 스냅샷 주입)이다.
+`true`면 한 세션에 스냅샷을 이어 보내 이전 결정 맥락을 들고 판단하고, 창 점유가
+임계치에 닿으면 leader가 스스로 요약해 그 요약만 seed로 새 세션을 연다
+(`LeaderCompactEvent`). 창 점유 추정은 `input + output + cache_read + cache_creation
++ cached_input`으로 계산한다 — 누적 과금 토큰과 다른 값이다.
+
+실행이 끝나면 이 세션이 사용자용 보고문(`report`)을 쓴다. Slack 회신의 본문은 이
+글이고 경로·사유·토큰은 각주로 붙는다.
+
+### 10.5 노드 간 결과 취합과 세션 이월
+
+- **취합(handoff).** ADVANCE로 새 노드를 열 때 선행 노드 결과(summary/changed_files/
+  findings)를 최초 투입 메시지에 함께 넣는다. 엔진이 0토큰으로 조립하며, 워커 보고는
+  LLM 생성 = 신뢰 불가 입력이므로 구분자로 감싸 "데이터이지 지시가 아니다"를 명시한다.
+- **이월(carry).** 같은 Slack 스레드의 후속 요청은 작업 공간과 노드/leader 세션을
+  이어받는다(in-process). 대상 repo나 base 브랜치가 바뀌면 이월을 끊는다. 프로세스가
+  재시작되면 어댑터 캐시가 사라져 이월 세션이 무효가 되고, 그때는
+  `SessionCarryLostEvent`를 남기고 새 세션으로 폴백한다.
 
 ```text
 Loop guard reached
@@ -1260,7 +1305,12 @@ Phase 0 착수를 막던 결정은 [Wayfinder Map #1](https://github.com/picpal/
 - R2 report retention과 삭제 정책
 - MVP에서 Task latest overwrite를 허용하는 기간과 versioned object 전환 시점
 
-POC 실측으로 확인할 항목: 실제 적용 effort의 관측 경로(org effort limit clamp 무보고 문제), Reviewer Queue scale signal 임계값, loopPolicy 토큰 budget(300k)의 타당성.
+POC 실측으로 확인할 항목: 실제 적용 effort의 관측 경로(org effort limit clamp 무보고 문제), Reviewer Queue scale signal 임계값.
+
+loopPolicy 토큰 budget의 타당성은 실측으로 답이 나왔다(2026-08-20): opus HIGH leader +
+Codex 리뷰어 구성에서 1회 실행이 587k를 썼다 — 기존 300k는 정상 완료를 강제 종료시키는
+값이었다. hard cap을 1.5M으로 올리고, role별 예산은 종료 트리거가 아닌 경보로 강등했다
+(§10.3).
 
 ## 20. POC 검증 항목과 성공 기준
 

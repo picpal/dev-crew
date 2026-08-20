@@ -343,3 +343,93 @@ def test_leader_report_cannot_broadcast_to_channel():
     assert "<!channel>" not in text and "<!here" not in text and "<!everyone>" not in text
     assert "@channel" in text and "@here" in text          # 내용은 남되 알림은 안 간다
     assert sanitize_slack("정상 `코드` *굵게*") == "정상 `코드` *굵게*"
+
+
+@pytest.mark.asyncio
+async def test_runner_passes_request_branch_to_worktree(tmp_path, monkeypatch):
+    """`repo@브랜치:` 접두가 실제 worktree 생성까지 도달해야 한다.
+
+    회귀 고정: 파싱만 테스트하면 slack_engine이 브랜치를 버리는 2-tuple 래퍼를
+    써도 통과한다 (실제로 그렇게 죽어 있었다)."""
+    import devcrew.decision as decision_mod
+    import devcrew.engine as engine_mod
+    import devcrew.slack_engine as se
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    created: list[tuple] = []
+
+    class FakeWT:
+        def __init__(self, root):
+            self.root = root
+
+        def create(self, name, base_ref="HEAD"):
+            created.append((name, base_ref))
+            d = tmp_path / "wt" / name
+            d.mkdir(parents=True)
+            return d
+
+    class NoopEngine:
+        def __init__(self, orch, cfg, **kw):
+            pass
+
+        async def run(self, *, execution_id, task, worktree=None, carry=None):
+            return engine_mod.ExecutionResult("COMPLETED", [], 0, 0)
+
+    monkeypatch.setattr(engine_mod, "WorkflowEngine", NoopEngine)
+    monkeypatch.setattr(decision_mod, "make_llm_decide", lambda *a, **k: None)
+    monkeypatch.setattr(se, "WorktreeManager", FakeWT)
+
+    runner = se.EngineRunner(runtime_dir=tmp_path / "rt")
+    runner.repos = {"demo": repo}
+    runner.repo_bases = {"demo": "main"}
+
+    await runner.run("demo: 기본 base", thread_key="A")
+    await runner.run("demo@feat/x: 요청 base", thread_key="B")
+
+    assert created[0][1] == "main"        # repos.yaml 고정 base
+    assert created[1][1] == "feat/x"      # 요청 접두가 덮어쓴다
+
+
+@pytest.mark.asyncio
+async def test_runner_breaks_carry_when_branch_changes_in_thread(tmp_path, monkeypatch):
+    """같은 스레드에서 base 브랜치를 바꾸면 세션 이월을 끊는다 (다른 커밋의 트리)."""
+    import devcrew.decision as decision_mod
+    import devcrew.engine as engine_mod
+    import devcrew.slack_engine as se
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    carries: list = []
+
+    class FakeWT:
+        def __init__(self, root):
+            pass
+
+        def create(self, name, base_ref="HEAD"):
+            d = tmp_path / "wt" / name
+            d.mkdir(parents=True)
+            return d
+
+    class NoopEngine:
+        def __init__(self, orch, cfg, **kw):
+            pass
+
+        async def run(self, *, execution_id, task, worktree=None, carry=None):
+            carries.append(carry)
+            carry["develop"] = {"inst": object(), "session_id": "s", "tier": "DEFAULT"}
+            return engine_mod.ExecutionResult("COMPLETED", [], 0, 0)
+
+    monkeypatch.setattr(engine_mod, "WorkflowEngine", NoopEngine)
+    monkeypatch.setattr(decision_mod, "make_llm_decide", lambda *a, **k: None)
+    monkeypatch.setattr(se, "WorktreeManager", FakeWT)
+
+    runner = se.EngineRunner(runtime_dir=tmp_path / "rt")
+    runner.repos = {"demo": repo}
+    runner.repo_bases = {"demo": "main"}
+
+    await runner.run("demo@feat/a: 1", thread_key="T")
+    await runner.run("demo@feat/a: 2", thread_key="T")     # 같은 base → 이월
+    await runner.run("demo@feat/b: 3", thread_key="T")     # base 변경 → 이월 끊김
+    assert carries[1] is carries[0]
+    assert carries[2] is not carries[0]

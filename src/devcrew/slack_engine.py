@@ -29,7 +29,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .repos import RepoRegistryError, load_repo_bases, load_repos, split_repo_prefix
+from .repos import RepoRegistryError, load_repo_bases, load_repos, split_repo_target
 from .worktree import WorktreeManager
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
@@ -203,19 +203,22 @@ class EngineRunner:
         from .engine import WorkflowEngine
         from .workflow import DEFAULT_TEMPLATE
 
-        repo_name, task = split_repo_prefix(task, self.repos)   # 오타는 여기서 fail-fast
+        # 오타·잘못된 브랜치는 여기서 fail-fast. `repo@브랜치:`의 브랜치는 이번
+        # 요청에 한해 repos.yaml의 고정 base를 덮어쓴다.
+        repo_name, req_branch, task = split_repo_target(task, self.repos)
         # 같은 repo는 직렬(worktree 브랜치 경합·리뷰 혼선 방지), 다른 repo·toy는 병렬
         async with self._lock_for(repo_name or "_toy"):
             n = next(self._seq)
             execution_id = f"SLACK-{n}"
             st = self._threads.get(thread_key) if thread_key else None
-            if st is not None and st["repo_name"] != repo_name:
-                # 스레드 중간에 대상 repo가 바뀌었다 — 세션/작업 공간을 이어받으면
-                # 다른 worktree를 가리키는 세션이 되므로 끊고 새로 시작한다.
+            if st is not None and (st["repo_name"] != repo_name
+                                   or (req_branch and st.get("base") != req_branch)):
+                # 스레드 중간에 대상 repo나 base 브랜치가 바뀌었다 — 세션/작업 공간을
+                # 이어받으면 다른 커밋의 worktree를 가리키는 세션이 되므로 끊는다.
                 st = None
             if st is None:
                 if repo_name:
-                    base = self.repo_bases.get(repo_name, "HEAD")
+                    base = req_branch or self.repo_bases.get(repo_name, "HEAD")
                     wt = WorktreeManager(self.repos[repo_name]).create(f"slack-{n}", base)
                     workspace = str(wt)
                     where = f"{repo_name} · wt/slack-{n} ({base} 기준)\n{wt}"
@@ -223,7 +226,7 @@ class EngineRunner:
                     workspace = os.environ.get("DEVCREW_TARGET_REPO") or str(make_toy_repo())
                     where = workspace
                 st = {"repo_name": repo_name, "workspace": workspace, "where": where,
-                      "nodes": {}, "leader": {}}
+                      "base": base if repo_name else None, "nodes": {}, "leader": {}}
                 if thread_key:
                     self._threads[thread_key] = st
             workspace, where = st["workspace"], st["where"]

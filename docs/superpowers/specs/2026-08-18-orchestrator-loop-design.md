@@ -27,9 +27,20 @@
 2. **템플릿은 Python 선언** (`src/devcrew/workflow.py`, dataclass). 기본 템플릿
    1개: `EXPLORE(조건부) → DEVELOP → REVIEW(Dev↔Review 루프) → QA(FAIL 시 DEVELOP
    복귀)`. loopPolicy 수치만 `config/harness.yaml`로: maxIterations 5,
-   maxDurationMinutes 60, maxTokenBudget 300000, sameFindingEscalationThreshold 3
+   maxDurationMinutes 60, maxTokenBudget 300000(→ 2026-08-20 실측 후 1500000으로
+   개정, DESIGN.md §10.3), sameFindingEscalationThreshold 3
    (§10.3). guard 초과는 Task 실패가 아니라 `LOOP_GUARD_EXCEEDED` 결정 지점 진입.
-3. **LLM 결정은 결정마다 fresh 세션 + 구조화 출력.** 엔진이 상태 스냅샷(실행
+3. **LLM 결정은 fresh 세션 + 구조화 출력.**
+
+   > **개정 2026-08-20.** 이 결정은 `leaderContext.persistent`로 선택 가능해졌다.
+   > 기본값은 `true`(스레드 단위 지속 세션 + 창 50%에서 자체 요약 compaction) —
+   > "이어서 고쳐줘" 류 후속 요청마다 leader가 맥락을 다시 쌓는 비용을 없애기
+   > 위해서다. `false`면 아래 원문대로 결정마다 fresh 세션이다. 스냅샷 주입·구조화
+   > 출력·허용 목록 대조 검증은 두 모드에서 동일하다. 결정 스키마에는
+   > `report`(nullable) 필드가 추가됐다 — 실행 종료 시 사용자용 보고문 전용이며
+   > 결정 turn에서는 항상 null이다. 상세는 DESIGN.md §10.4.
+
+   원문: 엔진이 상태 스냅샷(실행
    이력 요약, 트리거 Worker 결과 전문, 허용 action 목록)을 initial message로
    패키징해 새 ORCHESTRATOR instance를 spawn (기존 spawn/start_worker 배관 재사용).
    구조화 출력이 곧 결정 — 별도 제출 tool 없음. 결정 스키마:
