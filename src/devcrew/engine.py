@@ -149,6 +149,7 @@ class ExecutionResult:
     outcomes: list[dict] = field(default_factory=list)   # 노드별 결과 요약 (보고 재료)
     context_used: int = 0        # leader 세션의 컨텍스트 창 점유량 (Slack 표기용)
     context_window: int = 0      # 그 창의 크기 — 0이면 표기하지 않는다
+    context_pct: float = 0.0     # 어댑터가 실측한 점유율 (0이면 used/window로 추정)
 
 
 class WorkflowEngine:

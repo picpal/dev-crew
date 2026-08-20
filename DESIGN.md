@@ -679,6 +679,12 @@ Orchestrator
 않고, 그 이상부터 붙는다(brain은 인터뷰 세션, crew는 leader 세션 기준). 사용자가 압축을
 기다릴지 `/clear`로 끊을지 판단하는 근거다.
 
+점유율은 **어댑터 실측**이 원칙이다: Claude는 `ClaudeSDKClient.get_context_usage()`
+(CLI `/context`와 같은 데이터 — 실효 한도·autocompact 임계까지 준다), Codex는 turn마다
+오는 `modelContextWindow`. 토큰 합산 추정은 세션이 이 프로세스 밖이라 조회가 안 될 때의
+폴백이다 — 추정은 시스템 프롬프트·툴 정의·캐시 회계를 정확히 반영하지 못한다.
+leader 압축 시점(§10.4)도 같은 실측을 우선한다.
+
 crew 쪽 컨텍스트는 `@crew /clear`로 비운다 — 그 스레드의 leader·노드 세션을 모두 archive하고
 이월 상태를 지운다(`ThreadContextClearedEvent`). worktree와 커밋은 남긴다. 실행 중에는
 거부하고 중지 버튼을 먼저 쓰게 한다. 진짜 Slack 슬래시 커맨드가 아니라 멘션 뒤 토큰인

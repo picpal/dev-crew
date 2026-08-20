@@ -21,7 +21,7 @@ from .repos import RepoRegistryError, split_repo_prefix
 from .report.brain_report import render_brief, render_reply, report_id
 from .report.uploader import publish_report
 from .schema import AgentInstance, Role
-from .usage import context_badge, context_used
+from .usage import context_badge, context_used, measure
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 _OPTION_RE = re.compile(r"^([A-Z])\)\s+(.+)$")
@@ -269,7 +269,7 @@ class BrainHandler:
         """brain 응답 발신 — 선택형 질문이면 스레드 내 버튼(Block Kit), 아니면 텍스트
         (긴 응답은 리포트 링크)."""
         options = parse_options(text)
-        badge = context_badge(sess.context_used, self.cfg.leader_context.window_tokens)
+        badge = await self._context_badge(sess)
         guide = ("\n\n_(버튼 선택 또는 답글로 대화 — "
                  f"끝나면 '{HANDOFF_KEYWORD}'라고 하면 crew에 넘깁니다)_" if first else "")
         if restored:
@@ -365,6 +365,13 @@ class BrainHandler:
         sess.context_used = max(sess.context_used, context_used(out.usage))
         sess.transcript.append(f"[brain] {scrub(out.text)}")
         await self._say_reply(say, sess, out.text, sess.thread_ts)
+
+    async def _context_badge(self, sess: BrainSession) -> str:
+        """세션 창 점유 표기. 어댑터 실측을 우선하고, 없으면 turn usage 추정."""
+        real = await measure(self.orch.adapters[sess.inst.provider], sess.session_id)
+        if real:
+            return context_badge(real["used"], real["window"], pct=real.get("pct"))
+        return context_badge(sess.context_used, self.cfg.leader_context.window_tokens)
 
     async def _with_report(self, sess: BrainSession, full_text: str) -> str:
         """한 메시지에 못 담는 답변만 HTML 리포트로 흘리고 요약+링크를 반환.

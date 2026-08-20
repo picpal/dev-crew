@@ -848,3 +848,30 @@ async def test_brain_reply_shows_context_badge_when_window_fills(tmp_path):
     say = SaySpy()
     await h.on_mention(mention("<@U1> 결제 알림"), say)
     assert say.messages[0]["text"].startswith("[context usage : 45%]")
+
+
+@pytest.mark.asyncio
+async def test_badge_prefers_adapter_measurement_over_estimate(tmp_path):
+    """어댑터가 실제 창 점유(`/context`)를 알면 추정 대신 그 값을 쓴다."""
+    h, _, fake = make_handler(tmp_path)
+    fake.context = {"used": 720_000, "window": 1_000_000, "pct": 72.0, "source": "sdk"}
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    assert say.messages[0]["text"].startswith("[context usage : 72%]")
+    # 추정값(turn usage 합)은 0에 가깝다 — 실측을 안 쓰면 배지가 아예 안 붙는다
+    assert h.sessions["100.1"].context_used < 100
+
+
+@pytest.mark.asyncio
+async def test_badge_falls_back_when_adapter_cannot_measure(tmp_path):
+    from devcrew.usage import measure
+
+    class NoMeasure:
+        pass
+
+    assert await measure(NoMeasure(), "s") is None
+    h, _, fake = make_handler(tmp_path)
+    fake.context = None                      # 미지원·조회 실패
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    assert not say.messages[0]["text"].startswith("[context")

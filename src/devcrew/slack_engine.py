@@ -30,7 +30,7 @@ import tempfile
 from pathlib import Path
 
 from .repos import RepoRegistryError, load_repo_bases, load_repos, split_repo_target
-from .usage import context_badge
+from .usage import context_badge, measure
 from .worktree import WorktreeManager
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
@@ -109,7 +109,8 @@ def format_result(execution_id: str, result, repo: str) -> str:
             "STOPPED": "🛑"}.get(result.status, "❓")
     report = sanitize_slack(str(getattr(result, "report", "") or "").strip())
     badge = context_badge(getattr(result, "context_used", 0),
-                          getattr(result, "context_window", 0))
+                          getattr(result, "context_window", 0),
+                          pct=(getattr(result, "context_pct", 0.0) or None))
     blocks = [badge] if badge else []
     blocks.append(f"{icon} *{execution_id}*" if report
                   else f"{icon} *{execution_id} {result.status}*")
@@ -280,7 +281,8 @@ class EngineRunner:
             decide = make_llm_decide(
                 self.orch, self.cfg, mcp_servers=self.mcp,
                 leader_state=st["leader"] if lc.persistent else None,
-                compact_at=lc.compact_at if lc.persistent else None)
+                compact_at=lc.compact_at if lc.persistent else None,
+                compact_ratio=lc.compact_at_ratio if lc.persistent else None)
 
             async def _warn(warning: str) -> None:
                 if on_warning is not None:
@@ -326,10 +328,19 @@ class EngineRunner:
                     result, report=text or "", total_tokens=result.total_tokens + spent,
                     role_tokens={**result.role_tokens,
                                  "ORCHESTRATOR": result.role_tokens.get("ORCHESTRATOR", 0) + spent})
-            # leader 창 점유는 사용자가 /clear 시점을 판단하는 근거다 — 회신에 싣는다
+            # leader 창 점유는 사용자가 /clear 시점을 판단하는 근거다 — 회신에 싣는다.
+            # 어댑터가 실제 값(`/context`)을 알면 그걸 쓰고, 없을 때만 추정으로 폴백한다.
+            used, window, pct = int(st["leader"].get("context_used", 0)), 0, None
+            if lc.persistent:
+                window = lc.window_tokens
+                leader_inst, leader_sid = st["leader"].get("inst"), st["leader"].get("sid")
+                real = (await measure(self.orch.adapters[leader_inst.provider], leader_sid)
+                        if leader_inst and leader_sid else None)
+                if real:
+                    used, window, pct = real["used"], real["window"], real.get("pct")
             result = dataclasses.replace(
-                result, context_used=int(st["leader"].get("context_used", 0)),
-                context_window=lc.window_tokens if lc.persistent else 0)
+                result, context_used=used, context_window=window,
+                context_pct=pct if pct is not None else 0.0)
             return execution_id, result, where
 
 

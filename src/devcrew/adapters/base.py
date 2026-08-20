@@ -40,6 +40,7 @@ class ProviderAdapter(Protocol):
     async def archive(self, session_id: str) -> str: ...
     async def get_usage(self, session_id: str) -> Usage: ...
     async def initial_usage(self, session_id: str) -> Usage | None: ...
+    async def context_usage(self, session_id: str) -> dict | None: ...
 
 
 class FakeAdapter:
@@ -60,6 +61,8 @@ class FakeAdapter:
         self.initial_messages: list[str] = []
         # 이어진 turn의 투입 메시지 (session_id, message) — 세션 재개 맥락 주입 검증용
         self.sent: list[tuple[str, str]] = []
+        # context_usage()가 돌려줄 값 (None이면 미지원 어댑터처럼 동작)
+        self.context: dict | None = None
 
     async def start_session(self, inst: AgentInstance, initial_message: str, *,
                              system_prompt: str | None = None,
@@ -104,3 +107,6 @@ class FakeAdapter:
         # FakeAdapter.start_session은(실 어댑터와 달리) 최초 메시지에 대해 turn을
         # 실행하지 않는다 — 버릴 usage 자체가 없으므로 항상 None (finding #6).
         return None
+
+    async def context_usage(self, session_id: str) -> dict | None:
+        return self.context

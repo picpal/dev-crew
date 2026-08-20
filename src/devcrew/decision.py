@@ -7,7 +7,7 @@ from .config import HarnessConfig
 from .orchestrator import Orchestrator
 from .roles import load_bundle, missing_required_keys
 from .schema import Role, Usage
-from .usage import context_used as _context_used
+from .usage import context_used as _context_used, measure
 from .workflow import ALLOWED_BY_TRIGGER, DEFAULT_TEMPLATE, WorkflowError, WorkflowTemplate
 
 
@@ -91,7 +91,7 @@ def validate_decision(structured, trigger: str, template: WorkflowTemplate) -> d
 
 def make_llm_decide(orch: Orchestrator, cfg: HarnessConfig, *, mcp_servers=None,
                     template=None, leader_state: dict | None = None,
-                    compact_at: int | None = None):
+                    compact_at: int | None = None, compact_ratio: float | None = None):
     """엔진 decide_fn 팩토리. 결정마다 fresh ORCHESTRATOR instance를 spawn한다.
 
     반환하는 `decide`는 엔진의 decide_fn 계약(finding #5/#6)을 따른다:
@@ -103,6 +103,8 @@ def make_llm_decide(orch: Orchestrator, cfg: HarnessConfig, *, mcp_servers=None,
 
     `leader_state`(dict)를 넘기면 결정 세션을 **유지**한다: 결정마다 fresh spawn하는
     대신 한 세션에 스냅샷을 이어 보내 이전 결정의 맥락을 그대로 들고 판단한다.
+    `compact_ratio`(0~1)를 함께 주면 어댑터가 보고하는 **실측** 점유율(`/context`)로
+    시점을 판단하고, 실측이 없을 때만 `compact_at`(토큰) 추정치로 폴백한다.
     `compact_at`(토큰)을 함께 넘기면 그 세션의 컨텍스트 점유량이 임계치에 닿을 때
     leader가 스스로 요약하게 하고, 그 요약만 seed로 새 세션을 열어 창을 비운다
     (compaction). `leader_state`가 None이면 종전대로 결정마다 fresh 세션이다.
@@ -140,6 +142,15 @@ def make_llm_decide(orch: Orchestrator, cfg: HarnessConfig, *, mcp_servers=None,
         leader_state.update({"inst": None, "sid": None, "context_used": 0, "seed": seed})
         return spent
 
+    async def _full(state: dict) -> bool:
+        """압축 시점 판단 — 어댑터 실측 우선, 없으면 turn usage 누적 추정."""
+        inst, sid = state.get("inst"), state.get("sid")
+        if inst is not None and sid and compact_ratio:
+            real = await measure(orch.adapters[inst.provider], sid)
+            if real:
+                return (real.get("pct") or 0.0) >= compact_ratio * 100
+        return bool(compact_at) and state.get("context_used", 0) >= compact_at
+
     async def decide(trigger: str, snapshot: dict) -> tuple[dict, str, int]:
         execution_id = snapshot["execution_id"]
         msg = ("다음 스냅샷을 근거로 결정을 내려라.\n```json\n"
@@ -153,8 +164,7 @@ def make_llm_decide(orch: Orchestrator, cfg: HarnessConfig, *, mcp_servers=None,
             if initial is not None:
                 usage_tokens += _tokens(initial)
         else:
-            if (leader_state.get("sid") is not None and compact_at
-                    and leader_state.get("context_used", 0) >= compact_at):
+            if leader_state.get("sid") is not None and await _full(leader_state):
                 usage_tokens += await _compact(execution_id)
             if leader_state.get("sid") is None:
                 inst, sid = await _open(execution_id, trigger, msg,

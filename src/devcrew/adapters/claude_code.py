@@ -159,6 +159,26 @@ class ClaudeCodeAdapter:
     async def get_usage(self, session_id: str) -> Usage:
         raise NotImplementedError("usage는 각 TurnOutcome.usage로 수집한다")
 
+    async def context_usage(self, session_id: str) -> dict | None:
+        """세션의 **실제** 컨텍스트 창 점유 — CLI `/context`와 같은 데이터.
+
+        토큰 합산으로 창 점유를 추정할 필요가 없다: SDK가 실효 한도(autocompact
+        버퍼 반영)와 퍼센트를 직접 준다. 세션이 이 프로세스 밖이면 None.
+        """
+        client = self._clients.get(session_id)
+        if client is None:
+            return None
+        try:
+            raw = await client.get_context_usage()
+        except Exception:
+            return None                # 조회 실패가 답변을 막지 않는다 — 추정으로 폴백
+        window = raw.get("maxTokens") or raw.get("rawMaxTokens") or 0
+        return {"used": int(raw.get("totalTokens") or 0), "window": int(window),
+                "pct": float(raw.get("percentage") or 0.0),
+                "model": raw.get("model") or "",
+                "autocompact": raw.get("autoCompactThreshold"),
+                "source": "sdk"}
+
     async def initial_usage(self, session_id: str) -> Usage | None:
         """start_session이 소비한 최초 turn의 usage (finding #6). 캐시가 없으면 None
         (예: 이 session_id가 이 adapter 인스턴스의 start_session을 거치지 않음)."""

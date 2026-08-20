@@ -163,3 +163,29 @@ async def test_final_report_returns_none_without_leader_session(tmp_path):
     orch, _, _, _ = make_env(tmp_path, [GOOD])
     assert await make_final_report(orch, None)({"status": "COMPLETED"}) == (None, 0)
     assert await make_final_report(orch, {})({"status": "COMPLETED"}) == (None, 0)
+
+
+async def test_compaction_uses_adapter_measurement(tmp_path):
+    """압축 시점도 추정이 아니라 어댑터 실측 점유율(`/context`)로 판단한다."""
+    orch, trace, fake, cfg = make_env(tmp_path, [GOOD, {**GOOD, "summary": "요약"}, GOOD])
+    fake.context = {"used": 610_000, "window": 1_000_000, "pct": 61.0, "source": "sdk"}
+    state: dict = {}
+    # compact_at(추정 임계)은 절대 안 닿는 값 — 실측만이 압축을 부를 수 있다
+    decide = make_llm_decide(orch, cfg, leader_state=state,
+                             compact_at=10 ** 9, compact_ratio=0.5)
+    _, id1, _ = await decide("NEED_REPLAN", SNAP)
+    _, id2, _ = await decide("NEED_REPLAN", SNAP)
+    assert id1 != id2                                   # 61% > 50% → 세션 교체
+    assert trace.events(event_type="LeaderCompactEvent")
+
+
+async def test_no_compaction_when_measurement_is_low(tmp_path):
+    orch, trace, fake, cfg = make_env(tmp_path, [GOOD, GOOD, GOOD])
+    fake.context = {"used": 100_000, "window": 1_000_000, "pct": 10.0, "source": "sdk"}
+    state: dict = {}
+    decide = make_llm_decide(orch, cfg, leader_state=state, compact_at=1,
+                             compact_ratio=0.5)
+    _, id1, _ = await decide("NEED_REPLAN", SNAP)
+    _, id2, _ = await decide("NEED_REPLAN", SNAP)
+    assert id1 == id2                                   # 실측 10% — 추정 임계는 무시된다
+    assert not trace.events(event_type="LeaderCompactEvent")
