@@ -301,14 +301,22 @@ def make_crew_dispatch(post_handoff, post_crew, handler, roots: dict | None = No
 
     def _remembered(interview_ts: str) -> str | None:
         root = roots.get(interview_ts)
-        if root or trace is None:
+        if trace is None:
             return root
+        exec_id = f"BRAIN-{interview_ts}"
         try:
-            evs = trace.events(event_type="CrewHandoffThreadEvent",
-                               execution_id=f"BRAIN-{interview_ts}")
+            evs = trace.events(event_type="CrewHandoffThreadEvent", execution_id=exec_id)
+            closed = trace.events(event_type="BrainClosedEvent", execution_id=exec_id)
         except Exception:
+            return root
+        if not evs:
+            return root
+        if closed and closed[-1]["ts"] >= evs[-1]["ts"]:
+            # 종료 후 같은 Slack 스레드에서 새 인터뷰가 시작될 수 있다 — 그 brief를
+            # 이전 인터뷰의 crew 스레드에 붙이면 남의 작업 맥락을 물려받는다
+            roots.pop(interview_ts, None)
             return None
-        return evs[-1]["payload"].get("root") if evs else None
+        return root or evs[-1]["payload"].get("root")
 
     async def crew_dispatch(task: str, channel: str, interview_ts: str,
                             brief_text: str) -> None:
@@ -507,7 +515,7 @@ async def _amain() -> None:
                     text=(msg.get("text") or "질문")[:2800] + f"\n\n✅ 선택: {value}")
 
             await brain.on_answer(thread_ts=thread, value=value, say=bsay, strip=strip,
-                                  channel=ch)
+                                  channel=ch, user=(body.get("user") or {}).get("id", ""))
 
         tasks.append(AsyncSocketModeHandler(brain_app, brain_app_token).start_async())
         print("devcrew: @brain 인터뷰 앱 활성화")

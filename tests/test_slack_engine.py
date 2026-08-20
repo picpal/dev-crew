@@ -494,3 +494,30 @@ async def test_crew_dispatch_recovers_pinned_thread_from_trace(tmp_path):
 
     assert events == [("post", None), ("run", "300.1"),
                       ("post", "300.1"), ("run", "300.1")]
+
+
+@pytest.mark.asyncio
+async def test_crew_dispatch_drops_pin_after_interview_closed(tmp_path):
+    """종료 후 같은 스레드에서 시작된 새 인터뷰가 이전 crew 스레드를 물려받으면 안 된다."""
+    from devcrew.slack_engine import make_crew_dispatch
+    from devcrew.store.trace import TraceStore
+
+    trace = TraceStore(tmp_path / "t.db")
+    posts, ts_seq = [], iter(["400.1", "400.2"])
+
+    async def post_handoff(channel, text, thread_ts):
+        posts.append(thread_ts)
+        return next(ts_seq)
+
+    async def post_crew(channel, text, thread_ts, **kw):
+        pass
+
+    async def handler(body, say):
+        pass
+
+    dispatch = make_crew_dispatch(post_handoff, post_crew, handler, trace=trace)
+    await dispatch("작업1", "C1", "100.1", "brief1")
+    trace.append("BrainClosedEvent", task_id="BRAIN-100.1",
+                 execution_id="BRAIN-100.1", payload={"topic": "끝"})
+    await dispatch("작업2", "C1", "100.1", "brief2")
+    assert posts == [None, None]                  # 새 인터뷰는 새 crew 스레드로
