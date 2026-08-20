@@ -61,22 +61,44 @@ def parse_options(text: str) -> list[str]:
     return opts if len(opts) >= 2 else []
 
 
-def question_blocks(text: str, options: list[str]) -> list[dict]:
-    """질문 본문 + 선택지 버튼 Block Kit. '(권장)' 선택지는 primary 스타일."""
+def question_blocks(text: str, options: list[str], *, decided: int = 0) -> list[dict]:
+    """질문 Block Kit — header(질문) / 맥락 / divider / 선택지 상세 / 짧은 버튼 / 진행.
+
+    시각적 위계: 질문 한 줄은 header로 크게, 선택지 전문은 본문 리스트로,
+    버튼은 'A 선택'처럼 짧게 (75자 제한으로 긴 선택지가 잘리는 문제 방지).
+    '(권장)' 선택지는 primary 스타일."""
+    lines = [l for l in text.splitlines()]
+    non_empty = [l.strip() for l in lines if l.strip()]
+    # 질문 헤더: 물음표로 끝나는 첫 줄, 없으면 첫 줄
+    head = next((l for l in non_empty if l.endswith("?")), non_empty[0] if non_empty else "질문")
+    head = re.sub(r"[*_`]", "", head)[:150]
+    option_set = set(options)
+    context_lines = [l for l in lines
+                     if l.strip() and l.strip() != head and l.strip() not in option_set
+                     and not _OPTION_RE.match(l.strip())]
+    blocks: list[dict] = [
+        {"type": "header", "text": {"type": "plain_text", "text": head}}]
+    if context_lines:
+        blocks.append({"type": "section",
+                       "text": {"type": "mrkdwn", "text": "\n".join(context_lines)[:2900]}})
+    blocks.append({"type": "divider"})
+    detail = "\n".join(f"*{o[:2]}* {o[3:].strip()}" for o in options)
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": detail[:2900]}})
     buttons = []
     for opt in options[:10]:                      # actions block 버튼 한도
-        btn = {"type": "button", "action_id": f"brain_answer_{opt[0]}",
-               "text": {"type": "plain_text", "text": opt[:75]},
+        letter = opt[0]
+        btn = {"type": "button", "action_id": f"brain_answer_{letter}",
+               "text": {"type": "plain_text",
+                        "text": f"{letter} 선택" + (" ★" if "(권장)" in opt else "")},
                "value": opt[:2000]}
         if "(권장)" in opt:
             btn["style"] = "primary"
         buttons.append(btn)
-    return [
-        {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}},
-        {"type": "actions", "block_id": "brain_answers", "elements": buttons},
-        {"type": "context", "elements": [{"type": "mrkdwn",
-            "text": "버튼 선택 또는 답글로 직접 입력 · 끝나면 '전달'"}]},
-    ]
+    blocks.append({"type": "actions", "block_id": "brain_answers", "elements": buttons})
+    progress = f" · 닫힌 결정 {decided}개" if decided else ""
+    blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+        "text": f"버튼 선택 또는 답글로 직접 입력 · 끝나면 '전달'{progress}"}]})
+    return blocks
 
 
 def format_brief(brief: dict) -> str:
@@ -144,9 +166,10 @@ class BrainHandler:
                  f"끝나면 '{HANDOFF_KEYWORD}'라고 하면 crew에 넘깁니다)_" if first else "")
         slack_text = to_mrkdwn(text)
         if options:
+            decided = max(0, sum(1 for t in sess.transcript if t.startswith("[사용자]")) - 1)
             try:
                 await say(text=slack_text[:2900] + guide, thread_ts=thread_ts,
-                          blocks=question_blocks(slack_text + guide, options))
+                          blocks=question_blocks(slack_text, options, decided=decided))
                 return
             except TypeError:
                 pass                              # say가 blocks 미지원(테스트 대역 등)

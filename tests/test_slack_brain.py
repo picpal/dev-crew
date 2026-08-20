@@ -185,10 +185,17 @@ def test_parse_options_and_blocks():
     text = "범위를 정하죠.\nA) 최소 범위 (권장)\nB) 전체 재설계\n이유: ..."
     opts = parse_options(text)
     assert opts == ["A) 최소 범위 (권장)", "B) 전체 재설계"]
-    blocks = question_blocks(text, opts)
-    btns = blocks[1]["elements"]
+    blocks = question_blocks(text, opts, decided=2)
+    assert blocks[0]["type"] == "header" and "범위를 정하죠" in blocks[0]["text"]["text"]
+    actions = next(b for b in blocks if b["type"] == "actions")
+    btns = actions["elements"]
     assert btns[0]["style"] == "primary" and "style" not in btns[1]
     assert btns[0]["value"] == "A) 최소 범위 (권장)"
+    assert btns[0]["text"]["text"] == "A 선택 ★"              # 짧은 라벨
+    detail = [b for b in blocks if b["type"] == "section"]
+    assert any("전체 재설계" in b["text"]["text"] for b in detail)  # 선택지 상세는 본문에
+    ctx = next(b for b in blocks if b["type"] == "context")
+    assert "닫힌 결정 2개" in ctx["elements"][0]["text"]
     assert parse_options("A) 하나뿐") == []                    # 1개는 무효
 
 
