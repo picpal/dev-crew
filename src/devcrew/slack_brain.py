@@ -37,6 +37,23 @@ class BrainSession:
     transcript: list[str] = field(default_factory=list)
 
 
+def to_mrkdwn(text: str) -> str:
+    """표준 마크다운 → Slack mrkdwn 방어적 변환 (모델이 규칙을 어겨도 가독성 유지).
+
+    HTML 리포트는 원문 마크다운을 그대로 쓰므로 Slack 발신 직전에만 적용한다."""
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^\s*#{1,6}\s+(.+)$", line)
+        if m:
+            out.append(f"*{m.group(1).strip()}*")
+            continue
+        out.append(line)
+    t = "\n".join(out)
+    t = re.sub(r"\*\*(.+?)\*\*", r"*\1*", t)          # **bold** → *bold*
+    t = re.sub(r"(?m)^(\s*)\* ", r"\1- ", t)             # "* " 불릿 → "- "
+    return t
+
+
 def parse_options(text: str) -> list[str]:
     """`A) 내용` 형식 줄들을 선택지로 추출 (2개 이상일 때만 유효)."""
     opts = [m.group(0).strip() for line in text.splitlines()
@@ -125,14 +142,16 @@ class BrainHandler:
         options = parse_options(text)
         guide = ("\n\n_(버튼 선택 또는 답글로 대화 — "
                  f"끝나면 '{HANDOFF_KEYWORD}'라고 하면 crew에 넘깁니다)_" if first else "")
+        slack_text = to_mrkdwn(text)
         if options:
             try:
-                await say(text=text[:2900] + guide, thread_ts=thread_ts,
-                          blocks=question_blocks(text + guide, options))
+                await say(text=slack_text[:2900] + guide, thread_ts=thread_ts,
+                          blocks=question_blocks(slack_text + guide, options))
                 return
             except TypeError:
                 pass                              # say가 blocks 미지원(테스트 대역 등)
-        await say(text=await self._with_report(sess, text) + guide, thread_ts=thread_ts)
+        body = await self._with_report(sess, text)
+        await say(text=to_mrkdwn(body) + guide, thread_ts=thread_ts)
 
     async def on_answer(self, *, thread_ts: str, value: str, say, strip=None) -> None:
         """스레드 내 버튼 클릭 → 선택지를 사용자 답변으로 처리."""

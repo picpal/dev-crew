@@ -216,3 +216,12 @@ async def test_report_form_marker_accepted_from_bot(tmp_path):
     await h.on_thread_message(reply(f"{ANSWER_MARKER} B) 전체 재설계",
                                     event_id="EvMk", bot=True), say)
     assert "[사용자] B) 전체 재설계" in h.sessions["100.1"].transcript
+
+
+def test_to_mrkdwn_conversion():
+    from devcrew.slack_brain import to_mrkdwn
+    src = "## 범위 결정\n**핵심**은 이것.\n* 항목1\n- 항목2\n`code` 유지"
+    out = to_mrkdwn(src)
+    assert "*범위 결정*" in out and "##" not in out
+    assert "*핵심*은" in out and "**" not in out
+    assert "- 항목1" in out and "`code`" in out
