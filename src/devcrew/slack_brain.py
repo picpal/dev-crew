@@ -23,10 +23,12 @@ _OPTION_RE = re.compile(r"^([A-Z])\)\s+(.+)$")
 ANSWER_MARKER = "\U0001F4E9 선택 답변:"     # 리포트 폼(worker)이 게시하는 답변 접두
 REDISCUSS_VALUE = "__REDISCUSS__"           # 재협의 버튼 sentinel
 REDISCUSS_PROMPT = (
-    "방금 질문에 대해 재협의를 요청한다. 선택지를 아직 고르지 않겠다. "
-    "이 질문의 배경, 각 선택지의 트레이드오프와 리스크, 혹시 빠뜨린 대안을 더 깊게 "
-    "설명하고, 내가 결정하는 데 필요한 판단 기준을 제시하라. 논의 후 같은 형식"
-    "(`A) 내용` 각 줄)으로 선택지를 다시(필요하면 수정해서) 제시하라.")
+    "지금부터 이 질문에 대한 재협의 모드다 — 사용자가 이 주제를 붙잡고 여러 turn에 "
+    "걸쳐 자유롭게 질문할 것이다. 규칙: (1) 사용자가 결정 의사를 밝히기 전까지 "
+    "선택지(`A) 내용` 형식)를 다시 제시하지 마라. (2) 각 질문에 대화체로 깊이 있게 "
+    "답하라 — 트레이드오프, 리스크, 근거. (3) 사용자가 '결정할게', '정리해줘' 등 "
+    "결정 신호를 보내면 그때 논의를 반영한 선택지를 다시 제시하라. "
+    "먼저 이 질문에서 무엇이 걸리는지 1문장으로 되물으며 시작하라.")
 HANDOFF_KEYWORD = "전달"
 TURN_TIMEOUT = 300.0
 REPORT_THRESHOLD = 500      # 이보다 긴 응답은 HTML 리포트 링크로 제공
@@ -197,7 +199,7 @@ class BrainHandler:
         if value == REDISCUSS_VALUE:
             # 재협의: 버튼은 남겨둔다 — 논의 후 원 메시지에서 바로 선택 가능
             sess.transcript.append("[사용자] (재협의 요청)")
-            await self._set_status(sess.channel, sess.thread_ts, "재협의 정리 중…")
+            await self._set_status(sess.channel, sess.thread_ts, "재협의 모드 진입 중…")
             try:
                 async with self._lock:
                     adapter = self.orch.adapters[sess.inst.provider]
