@@ -5,12 +5,16 @@
 스키마 강제로 brief 산출 → 채널(스레드 밖)에 🧠→🛠 핸드오프 게시 + crew 실행 트리거.
 
 컨텍스트 경계: crew로 넘어가는 것은 구조화 brief 텍스트뿐 — 인터뷰 대화 이력은
-brain 세션에 남고 세션은 핸드오프 후 archive된다.
+brain 세션에 남는다. 핸드오프해도 세션은 살려둔다: 같은 스레드에서 이어지는 논의는
+이미 확정된 결정을 다시 묻지 않고 그 위에서 계속된다. 세션이 유실(프로세스 재시작)돼도
+직전 인계 brief를 trace에서 찾아 seed로 심어 새 세션을 열므로 그릴링이 처음부터 다시
+시작되지 않는다. 정리는 명시적 종료(`종료`)나 유휴 세션 축출에서만 한다.
 """
 from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass, field
 
 from .repos import RepoRegistryError, split_repo_prefix
@@ -30,8 +34,25 @@ REDISCUSS_PROMPT = (
     "결정 신호를 보내면 그때 논의를 반영한 선택지를 다시 제시하라. "
     "먼저 이 질문에서 무엇이 걸리는지 1문장으로 되물으며 시작하라.")
 HANDOFF_KEYWORD = "전달"
+END_KEYWORDS = ("종료", "인터뷰 종료", "세션 종료")   # 정확히 이 말일 때만 세션 정리
 TURN_TIMEOUT = 300.0
 REPORT_THRESHOLD = 500      # 이보다 긴 응답은 HTML 리포트 링크로 제공
+MAX_SESSIONS = 50           # 초과 시 가장 오래된 인계 완료 세션부터 축출
+
+START_NUDGE = "인터뷰를 시작해라. 첫 질문 하나를 권장안과 함께 던져라."
+RESUME_NUDGE = ("직전 인계 이후 이어지는 논의다. 무엇을 바꾸거나 더하려는지 확인하는 "
+                "질문 하나를 권장안과 함께 던져라.")
+SEED_BLOCK = ("[이 스레드에서 이미 crew에 인계한 brief — 확정된 사실이다]\n{brief}\n\n"
+              "지금부터는 이 인계 이후의 추가 논의다. 이미 확정된 결정은 다시 묻지 마라 — "
+              "바꾸거나 새로 더할 부분만 짚어라.")
+RESUME_PREFIX = ("직전 논의는 이미 crew에 인계했다. 지금부터는 그 인계 이후의 추가 "
+                 "논의다 — 확정된 결정을 다시 묻지 말고 바뀌는 부분만 짚어라.\n\n"
+                 "[사용자] ")
+DELTA_BRIEF_INTRO = ("다음은 이미 crew에 인계한 brief와, 그 뒤로 이어진 추가 논의다. "
+                     "추가 논의에서 새로 정해진 것만 담은 brief를 만들어라 — 이미 인계된 "
+                     "작업을 다시 요청하지 마라. goal은 '무엇을 바꾼다/더한다'로 쓴다.\n\n"
+                     "[이미 인계된 brief]\n{prev}\n\n[추가 논의]\n{delta}")
+FIRST_BRIEF_INTRO = "다음 인터뷰 대화록을 읽고 crew에 전달할 최종 brief를 만들어라.\n\n{delta}"
 
 
 @dataclass
@@ -43,6 +64,10 @@ class BrainSession:
     repo_name: str | None
     topic: str = ""
     transcript: list[str] = field(default_factory=list)
+    handed_off: bool = False          # 직전 turn이 crew 인계였다 — 다음 발화에 재개 지시를 붙인다
+    last_brief: dict | None = None    # 마지막으로 인계한 brief (다음 인계의 delta 기준)
+    handoff_at: int = 0               # transcript 인덱스 — 이 뒤가 인계 이후의 논의
+    touched: float = field(default_factory=time.monotonic)
 
 
 def to_mrkdwn(text: str) -> str:
@@ -221,15 +246,23 @@ class BrainHandler:
         await self._process_answer(sess, value, say)
 
     async def _process_answer(self, sess: BrainSession, text: str, say) -> None:
+        sess.touched = time.monotonic()
+        if text.strip() in END_KEYWORDS:
+            await self._close(sess, say)
+            return
         sess.transcript.append(f"[사용자] {text}")
         if HANDOFF_KEYWORD in text:
             await self._finalize(sess, say)
             return
+        msg = text
+        if sess.handed_off:            # 인계 후 첫 발화 — 재개 맥락을 앞에 붙인다
+            msg = RESUME_PREFIX + text
+            sess.handed_off = False
         await self._set_status(sess.channel, sess.thread_ts, "생각 중…")
         try:
             async with self._lock:
                 adapter = self.orch.adapters[sess.inst.provider]
-                out = await asyncio.wait_for(adapter.send(sess.session_id, text),
+                out = await asyncio.wait_for(adapter.send(sess.session_id, msg),
                                              timeout=TURN_TIMEOUT)
         except Exception as e:
             await say(text=f"💥 인터뷰 turn 실패: {type(e).__name__}: {e}",
@@ -274,6 +307,83 @@ class BrainHandler:
         self._seen.add(event_id)
         return False
 
+    def _prior_handoff(self, thread_ts: str) -> dict | None:
+        """이 스레드의 마지막 인계 기록. 명시적 종료가 더 나중이면 없는 것으로 본다.
+
+        세션 객체는 인메모리라 프로세스 재시작에 못 살아남는다 — 그때 그릴링을 처음부터
+        다시 하지 않도록 trace(append-only)에 남긴 brief를 seed로 되살린다."""
+        exec_id = f"BRAIN-{thread_ts}"
+        try:
+            hs = self.orch.trace.events(event_type="BrainHandoffEvent", execution_id=exec_id)
+            cs = self.orch.trace.events(event_type="BrainClosedEvent", execution_id=exec_id)
+        except Exception:
+            return None
+        if not hs:
+            return None
+        if cs and cs[-1]["ts"] >= hs[-1]["ts"]:
+            return None                     # 종료 이후 — 새 인터뷰로 시작한다
+        return hs[-1]["payload"]
+
+    async def _open_session(self, *, thread_ts: str, channel: str, topic: str,
+                            repo_name: str | None, seed_brief: dict | None = None,
+                            user_text: str | None = None) -> tuple[BrainSession, str]:
+        """인터뷰 세션 1개를 연다. seed_brief가 있으면 직전 인계 brief를 컨텍스트로 심어
+        '이어지는 논의'로 시작한다 — 그릴링을 처음부터 반복하지 않는다."""
+        async with self._lock:
+            tier = self.cfg.role_defaults[Role.BRAIN].tier
+            worktree = str(self.repos[repo_name]) if repo_name else None
+            inst = await self.orch.spawn(Role.BRAIN, tier,
+                                         execution_id=f"BRAIN-{thread_ts}",
+                                         node_id="interview", task_scope=topic,
+                                         worktree=worktree)
+            first = f"인터뷰 주제: {topic}"
+            nudge = START_NUDGE
+            if seed_brief:
+                first += "\n\n" + SEED_BLOCK.format(brief=format_brief(seed_brief))
+                nudge = RESUME_PREFIX + user_text if user_text else RESUME_NUDGE
+            sid = await self.orch.start_worker(inst, first, conversational=True)
+            adapter = self.orch.adapters[inst.provider]
+            out = await asyncio.wait_for(adapter.send(sid, nudge), timeout=TURN_TIMEOUT)
+        sess = BrainSession(inst=inst, session_id=sid, channel=channel,
+                            thread_ts=thread_ts, repo_name=repo_name, topic=topic,
+                            last_brief=seed_brief)
+        sess.transcript.append(f"[사용자] {user_text or topic}")
+        sess.transcript.append(f"[brain] {out.text}")
+        self.sessions[thread_ts] = sess
+        await self._evict()
+        return sess, out.text
+
+    async def _evict(self) -> None:
+        """세션 상한 초과 시 가장 오래 방치된 '인계 완료' 세션부터 축출 (best-effort)."""
+        while len(self.sessions) > MAX_SESSIONS:
+            done = [s for s in self.sessions.values() if s.last_brief is not None]
+            victim = min(done or list(self.sessions.values()), key=lambda s: s.touched)
+            await self._drop(victim)
+
+    async def _drop(self, sess: BrainSession) -> None:
+        try:
+            adapter = self.orch.adapters[sess.inst.provider]
+            await adapter.archive(sess.session_id)
+        except Exception:
+            pass
+        try:
+            self.orch.registry.finish(sess.inst.instance_id)
+        except Exception:
+            pass
+        self.sessions.pop(sess.thread_ts, None)
+
+    async def _close(self, sess: BrainSession, say) -> None:
+        """명시적 종료 — 세션을 정리하고, 이후 이 스레드는 새 인터뷰로 시작한다."""
+        exec_id = f"BRAIN-{sess.thread_ts}"
+        try:
+            self.orch.trace.append("BrainClosedEvent", task_id=exec_id,
+                                   execution_id=exec_id, payload={"topic": sess.topic})
+        except Exception:
+            pass
+        await self._drop(sess)
+        await say(text="🧹 인터뷰 세션을 정리했습니다. 새 주제는 `@brain <내용>`으로 시작하세요.",
+                  thread_ts=sess.thread_ts)
+
     async def on_mention(self, body: dict, say) -> None:
         """@brain 멘션 — 새 인터뷰 시작."""
         if self._dedupe(body):
@@ -295,26 +405,14 @@ class BrainHandler:
             return
         await self._ack(event)
         await self._set_status(event.get("channel", ""), thread_ts, "생각 중…")
-
-        async with self._lock:
-            tier = self.cfg.role_defaults[Role.BRAIN].tier
-            worktree = str(self.repos[repo_name]) if repo_name else None
-            inst = await self.orch.spawn(Role.BRAIN, tier,
-                                         execution_id=f"BRAIN-{thread_ts}",
-                                         node_id="interview", task_scope=topic,
-                                         worktree=worktree)
-            sid = await self.orch.start_worker(
-                inst, f"인터뷰 주제: {topic}", conversational=True)
-            adapter = self.orch.adapters[inst.provider]
-            out = await asyncio.wait_for(
-                adapter.send(sid, "인터뷰를 시작해라. 첫 질문 하나를 권장안과 함께 던져라."),
-                timeout=TURN_TIMEOUT)
-        sess = BrainSession(inst=inst, session_id=sid, channel=event.get("channel", ""),
-                            thread_ts=thread_ts, repo_name=repo_name, topic=topic)
-        sess.transcript.append(f"[사용자] {topic}")
-        sess.transcript.append(f"[brain] {out.text}")
-        self.sessions[thread_ts] = sess
-        await self._say_reply(say, sess, out.text, thread_ts, first=True)
+        prior = self._prior_handoff(thread_ts) or {}
+        seed = prior.get("brief")
+        if seed and not repo_name and prior.get("repo_name") in self.repos:
+            repo_name = prior["repo_name"]         # 재개는 원래 repo를 이어받는다
+        sess, text = await self._open_session(
+            thread_ts=thread_ts, channel=event.get("channel", ""), topic=topic,
+            repo_name=repo_name, seed_brief=seed)
+        await self._say_reply(say, sess, text, thread_ts, first=True)
 
     async def on_thread_message(self, body: dict, say, *, deduped: bool = False) -> None:
         """진행 중 인터뷰 스레드의 답글 — 세션 지속 또는 핸드오프."""
@@ -328,25 +426,52 @@ class BrainHandler:
                 return
             text = text[len(ANSWER_MARKER):].strip()
         thread_ts = event.get("thread_ts")
-        sess = self.sessions.get(thread_ts)
-        if sess is None or not text:
+        if not thread_ts or not text:
             return
+        sess = self.sessions.get(thread_ts)
+        if sess is None:
+            await self._recover(thread_ts, event, text, say)
+            return                       # 복구가 이 발화를 첫 turn으로 이미 처리했다
         await self._ack(event)
         await self._process_answer(sess, text, say)
 
+    async def _recover(self, thread_ts: str, event: dict, text: str, say) -> None:
+        """세션이 사라진 스레드의 답글 — 직전 인계 brief를 seed로 세션을 되살리고 이
+        발화를 그 첫 turn으로 처리한다. 인계 기록이 없으면 조용히 무시한다(무관한 스레드)."""
+        prior = self._prior_handoff(thread_ts) or {}
+        seed = prior.get("brief")
+        if not seed:
+            return
+        await self._ack(event)
+        await self._set_status(event.get("channel", ""), thread_ts, "이전 논의 복원 중…")
+        repo_name = prior.get("repo_name") if prior.get("repo_name") in self.repos else None
+        try:
+            sess, reply_text = await self._open_session(
+                thread_ts=thread_ts, channel=event.get("channel", ""),
+                topic=prior.get("topic") or "이어지는 논의", repo_name=repo_name,
+                seed_brief=seed, user_text=text)
+        except Exception as e:
+            await say(text=f"💥 이전 논의 복원 실패: {type(e).__name__}: {e}",
+                      thread_ts=thread_ts)
+            return
+        await self._say_reply(say, sess, reply_text, thread_ts)
+
     async def _finalize(self, sess: BrainSession, say) -> None:
-        """대화 transcript → 스키마 강제 brief → 채널 핸드오프 → crew 실행."""
+        """대화 transcript → 스키마 강제 brief → 채널 핸드오프 → crew 실행.
+
+        이미 한 번 넘긴 스레드의 재인계는 **delta만** 넘긴다 — 직전 brief를 기준으로
+        그 뒤 논의에서 새로 정해진 것만 담아야 crew가 같은 일을 다시 하지 않는다."""
         await self._set_status(sess.channel, sess.thread_ts, "brief 정리 중…")
-        transcript = "\n".join(sess.transcript)
+        delta = "\n".join(sess.transcript[sess.handoff_at:])
+        intro = (DELTA_BRIEF_INTRO.format(prev=format_brief(sess.last_brief), delta=delta)
+                 if sess.last_brief else FIRST_BRIEF_INTRO.format(delta=delta))
         try:
             async with self._lock:
                 tier = self.cfg.role_defaults[Role.BRAIN].tier
                 summ = await self.orch.spawn(Role.BRAIN, tier,
                                              execution_id=f"BRAIN-{sess.thread_ts}",
                                              node_id="brief", task_scope="brief 산출")
-                sid = await self.orch.start_worker(
-                    summ, "다음 인터뷰 대화록을 읽고 crew에 전달할 최종 brief를 만들어라.\n\n"
-                          + transcript)
+                sid = await self.orch.start_worker(summ, intro)
                 adapter = self.orch.adapters[summ.provider]
                 out = await asyncio.wait_for(
                     adapter.send(sid, "이제 최종 brief를 스키마대로 제출해라."),
@@ -369,25 +494,38 @@ class BrainHandler:
         brief_url = None
         try:
             html = render_brief(brief=brief, repo=sess.repo_name)
+            # 재인계마다 다른 리포트 id — 같은 id면 이전 brief 페이지를 덮어써서
+            # 먼저 게시된 Slack 메시지의 링크가 다른 내용을 가리키게 된다
             brief_url = await asyncio.to_thread(
-                self.publish, report_id(f"brief:{sess.thread_ts}"), html)
+                self.publish, report_id(f"brief:{sess.thread_ts}:{len(sess.transcript)}"), html)
         except Exception:
             brief_url = None
-        confirm = "✅ brief 확정:\n" + format_brief(brief)
+        again = sess.last_brief is not None
+        confirm = ("✅ 추가 brief 확정:\n" if again else "✅ brief 확정:\n") + format_brief(brief)
         if brief_url:
             confirm += f"\n\n📄 리포트: {brief_url}"
+        confirm += ("\n\n_(이 스레드에서 계속 논의할 수 있습니다 — 이미 정한 것은 다시 "
+                    "묻지 않습니다. 정리하려면 '종료')_")
         await say(text=confirm, thread_ts=sess.thread_ts)
         task = brief_to_task(brief, sess.repo_name)
         link = sess.thread_ts
         handoff_text = format_brief(brief)
         if brief_url:
             handoff_text += f"\n📄 리포트: {brief_url}"
-        await self.crew_dispatch(task, sess.channel, link, handoff_text)
-        # 핸드오프 완료 — 세션 정리 (대화 이력은 crew로 넘어가지 않는다)
+        # 인계해도 세션은 살려둔다 — 같은 스레드의 다음 논의가 이 맥락 위에서 이어진다.
+        # 상태 갱신은 dispatch 전에: crew 실행은 길고, 실패해도 인계 사실은 남아야 한다.
+        exec_id = f"BRAIN-{sess.thread_ts}"
         try:
-            adapter = self.orch.adapters[sess.inst.provider]
-            await adapter.archive(sess.session_id)
+            self.orch.trace.append("BrainHandoffEvent", task_id=exec_id,
+                                   execution_id=exec_id,
+                                   instance_id=sess.inst.instance_id,
+                                   payload={"brief": brief, "repo_name": sess.repo_name,
+                                            "topic": sess.topic})
         except Exception:
-            pass
-        self.orch.registry.finish(sess.inst.instance_id)
-        del self.sessions[sess.thread_ts]
+            pass                        # trace 실패가 인계를 막지 않는다 (복구만 포기)
+        sess.transcript.append(f"[crew 인계] {brief.get('goal', '')}")
+        sess.last_brief = brief
+        sess.handoff_at = len(sess.transcript)
+        sess.handed_off = True
+        sess.touched = time.monotonic()
+        await self.crew_dispatch(task, sess.channel, link, handoff_text)

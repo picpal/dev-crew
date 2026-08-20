@@ -91,7 +91,7 @@ async def test_bot_messages_ignored(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_handoff_keyword_dispatches_to_crew_and_closes_session(tmp_path):
+async def test_handoff_keyword_dispatches_to_crew_and_keeps_session(tmp_path):
     h, dispatch, _ = make_handler(tmp_path)
     say = SaySpy()
     await h.on_mention(mention("<@U1> 결제 알림"), say)
@@ -99,8 +99,96 @@ async def test_handoff_keyword_dispatches_to_crew_and_closes_session(tmp_path):
     assert len(dispatch.calls) == 1
     assert "결제 알림 발송" in dispatch.calls[0]["task"]
     assert dispatch.calls[0]["channel"] == "C1"
-    assert "100.1" not in h.sessions                     # 세션 정리됨
+    # 인계해도 세션은 살아 있어야 한다 — 같은 스레드의 다음 논의가 이어진다
+    sess = h.sessions["100.1"]
+    assert sess.handed_off and sess.last_brief == BRIEF_PASS
     assert any("brief 확정" in m["text"] for m in say.messages)
+
+
+@pytest.mark.asyncio
+async def test_turn_after_handoff_resumes_same_session_with_context(tmp_path):
+    """인계 후 첫 발화는 같은 세션에 '재개' 맥락과 함께 들어간다 (재그릴링 방지)."""
+    h, _, fake = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    sid = h.sessions["100.1"].session_id
+    await h.on_thread_message(reply("전달", event_id="EvR6"), say)
+    starts = len(fake.initial_messages)
+    await h.on_thread_message(reply("문구를 바꾸고 싶어", event_id="EvR7"), say)
+    assert h.sessions["100.1"].session_id == sid          # 새 세션을 열지 않았다
+    assert len(fake.initial_messages) == starts           # spawn 없음
+    last_sid, last_msg = fake.sent[-1]
+    assert last_sid == sid
+    assert "인계 이후의 추가 논의" in last_msg
+    assert "문구를 바꾸고 싶어" in last_msg
+    assert h.sessions["100.1"].handed_off is False        # 1회만 붙인다
+
+
+@pytest.mark.asyncio
+async def test_second_handoff_sends_delta_brief_only(tmp_path):
+    """재인계는 직전 brief + 그 이후 논의만 요약 세션에 넣는다."""
+    h, dispatch, fake = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvR8"), say)
+    await h.on_thread_message(reply("문구를 바꾸고 싶어", event_id="EvR9"), say)
+    await h.on_thread_message(reply("전달", event_id="EvR10"), say)
+    assert len(dispatch.calls) == 2
+    brief_intro = fake.initial_messages[-1]
+    assert "[이미 인계된 brief]" in brief_intro
+    assert "문구를 바꾸고 싶어" in brief_intro
+    assert "결제 알림" not in brief_intro.split("[추가 논의]")[1]   # 인계 전 대화는 제외
+
+
+@pytest.mark.asyncio
+async def test_lost_session_recovers_from_prior_brief(tmp_path):
+    """프로세스 재시작(세션 유실) 후 답글 — 직전 brief를 seed로 이어서 논의한다."""
+    h, _, fake = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvR11"), say)
+    h.sessions.clear()                                    # 재시작 시뮬레이션
+    await h.on_thread_message(reply("알림 문구만 바꾸자", event_id="EvR12"), say)
+    assert "100.1" in h.sessions                          # 되살아났다
+    seeded = fake.initial_messages[-1]
+    assert "이미 crew에 인계한 brief" in seeded
+    assert "결제 알림 발송" in seeded                       # brief 내용이 심겼다
+    assert "알림 문구만 바꾸자" in fake.sent[-1][1]          # 이 발화가 첫 turn
+
+
+@pytest.mark.asyncio
+async def test_mention_in_handed_off_thread_resumes_not_regrills(tmp_path):
+    h, _, fake = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvR13"), say)
+    h.sessions.clear()
+    await h.on_mention(mention("<@U1> 이어서 문구 수정", ts="100.1", event_id="EvB2"), say)
+    seeded = fake.initial_messages[-1]
+    assert "이미 crew에 인계한 brief" in seeded
+    assert "직전 인계 이후 이어지는 논의" in fake.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_thread_reply_is_ignored(tmp_path):
+    """인계 이력이 없는 스레드의 답글은 세션을 만들지 않는다 (브레인 앱은 채널 전체를 본다)."""
+    h, _, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_thread_message(reply("아무 스레드 잡담", thread_ts="900.9", event_id="EvR14"), say)
+    assert h.sessions == {} and say.messages == []
+
+
+@pytest.mark.asyncio
+async def test_end_keyword_closes_session_and_disables_recovery(tmp_path):
+    h, _, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvR15"), say)
+    await h.on_thread_message(reply("종료", event_id="EvR16"), say)
+    assert "100.1" not in h.sessions
+    assert any("정리했습니다" in m["text"] for m in say.messages)
+    await h.on_thread_message(reply("다시 뭐 좀", event_id="EvR17"), say)
+    assert h.sessions == {}                               # 종료 후엔 복구하지 않는다
 
 
 @pytest.mark.asyncio

@@ -283,6 +283,36 @@ class EngineRunner:
             return execution_id, result, where
 
 
+def make_crew_dispatch(post_handoff, post_crew, handler, roots: dict | None = None):
+    """brain → crew 핸드오프 디스패처 (bolt 클라이언트와 분리된 순수 로직).
+
+    같은 인터뷰의 재인계는 **첫 핸드오프 스레드로 되돌린다**. crew의 leader 세션 이월은
+    thread_ts를 키로 하므로 재인계마다 새 채널 메시지를 만들면 컨텍스트가 매번 끊긴다 —
+    스레드를 고정하면 재인계도, 그 스레드에 사용자가 직접 다는 후속 멘션도 같은 키가 된다.
+
+    post_handoff: async (channel, text, thread_ts|None) -> ts   (brain 봇이 게시)
+    post_crew:    async (channel, text, thread_ts, **kw) -> any (crew 봇이 게시)
+    """
+    roots = {} if roots is None else roots
+
+    async def crew_dispatch(task: str, channel: str, interview_ts: str,
+                            brief_text: str) -> None:
+        root = roots.get(interview_ts)
+        head = "🧠→🛠 *brain → crew 추가 인계*" if root else "🧠→🛠 *brain → crew 작업 인계*"
+        ts = await post_handoff(
+            channel, f"{head}\n{brief_text}\n_(인터뷰 스레드: {interview_ts})_", root)
+        root = root or ts
+        roots[interview_ts] = root
+
+        async def crew_say(*, text: str, thread_ts=None, **kw):
+            return await post_crew(channel, text, root, **kw)
+
+        await handler({"event": {"text": task, "ts": root, "thread_ts": root,
+                                 "channel": channel}}, crew_say)
+
+    return crew_dispatch
+
+
 class MentionHandler:
     """app_mention 이벤트 처리 — bolt와 분리된 순수 로직 (테스트 대상)."""
 
@@ -402,24 +432,18 @@ async def _amain() -> None:
 
         brain_app = AsyncApp(token=brain_bot)
 
-        async def crew_dispatch(task: str, channel: str, interview_ts: str,
-                                brief_text: str) -> None:
-            """핸드오프: 채널(스레드 밖)에 🧠→🛠 게시 후 crew를 in-process로 실행.
-
-            실제 <@crew> 멘션 이벤트에 의존하지 않는다 — 봇 메시지의 이벤트 전달은
-            보장이 없고, 전달되면 이중 실행이 된다. 게시는 기록용, 실행은 직접 호출."""
+        # 핸드오프는 채널에 게시하되 crew 실행은 in-process 직접 호출이다 — 봇 메시지의
+        # 멘션 이벤트 전달은 보장이 없고, 전달되면 이중 실행이 된다.
+        async def post_handoff(channel: str, text: str, thread_ts) -> str:
             resp = await brain_app.client.chat_postMessage(
-                channel=channel,
-                text=f"🧠→🛠 *brain → crew 작업 인계*\n{brief_text}\n"
-                     f"_(인터뷰 스레드: {interview_ts})_")
-            handoff_ts = resp["ts"]
+                channel=channel, text=text, thread_ts=thread_ts)
+            return resp["ts"]
 
-            async def crew_say(*, text: str, thread_ts=None, **kw):
-                return await app.client.chat_postMessage(
-                    channel=channel, text=text, thread_ts=thread_ts or handoff_ts, **kw)
+        async def post_crew(channel: str, text: str, thread_ts: str, **kw):
+            return await app.client.chat_postMessage(
+                channel=channel, text=text, thread_ts=thread_ts, **kw)
 
-            await handler({"event": {"text": task, "ts": handoff_ts,
-                                     "channel": channel}}, crew_say)
+        crew_dispatch = make_crew_dispatch(post_handoff, post_crew, handler)
 
         async def brain_react(channel: str, ts: str) -> None:
             await brain_app.client.reactions_add(channel=channel, timestamp=ts, name="eyes")

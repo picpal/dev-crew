@@ -433,3 +433,34 @@ async def test_runner_breaks_carry_when_branch_changes_in_thread(tmp_path, monke
     await runner.run("demo@feat/b: 3", thread_key="T")     # base 변경 → 이월 끊김
     assert carries[1] is carries[0]
     assert carries[2] is not carries[0]
+
+
+@pytest.mark.asyncio
+async def test_crew_dispatch_pins_rehandoff_to_first_thread():
+    """재인계는 첫 핸드오프 스레드로 되돌아가야 crew leader 컨텍스트가 이어진다."""
+    from devcrew.slack_engine import make_crew_dispatch
+
+    posted, events = [], []
+    ts_seq = iter(["200.1", "200.2"])
+
+    async def post_handoff(channel, text, thread_ts):
+        posted.append({"channel": channel, "text": text, "thread_ts": thread_ts})
+        return next(ts_seq)
+
+    async def post_crew(channel, text, thread_ts, **kw):
+        posted.append({"crew": text, "thread_ts": thread_ts})
+
+    async def handler(body, say):
+        events.append(body["event"])
+        await say(text="결과")
+
+    dispatch = make_crew_dispatch(post_handoff, post_crew, handler)
+    await dispatch("작업1", "C1", "100.1", "brief1")
+    await dispatch("작업2", "C1", "100.1", "brief2")
+
+    assert posted[0]["thread_ts"] is None                  # 첫 인계는 채널 최상위
+    assert posted[2]["thread_ts"] == "200.1"               # 재인계는 그 스레드 안으로
+    assert "추가 인계" in posted[2]["text"]
+    # crew thread_key(= event.thread_ts)가 두 번 다 같아야 세션 이월이 산다
+    assert [e["thread_ts"] for e in events] == ["200.1", "200.1"]
+    assert all(p["thread_ts"] == "200.1" for p in posted if "crew" in p)

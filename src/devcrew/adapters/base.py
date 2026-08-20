@@ -58,6 +58,8 @@ class FakeAdapter:
         self.last_mcp_servers: dict | None = None
         # 노드 최초 투입 메시지 기록 — crew leader 취합(handoff) 주입을 unit이 검증한다
         self.initial_messages: list[str] = []
+        # 이어진 turn의 투입 메시지 (session_id, message) — 세션 재개 맥락 주입 검증용
+        self.sent: list[tuple[str, str]] = []
 
     async def start_session(self, inst: AgentInstance, initial_message: str, *,
                              system_prompt: str | None = None,
@@ -80,6 +82,7 @@ class FakeAdapter:
         if self.fail_after is not None and n >= self.fail_after:
             raise RuntimeError("scripted failure")
         self.turns[session_id] = n + 1
+        self.sent.append((session_id, message))
         text = self.script[n] if n < len(self.script) else "done"
         structured = self.structured_script[n] if n < len(self.structured_script) else None
         return TurnOutcome(text=text, usage=Usage(output_tokens=1, raw={"fake": True}),
