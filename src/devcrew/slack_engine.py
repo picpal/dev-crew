@@ -283,25 +283,50 @@ class EngineRunner:
             return execution_id, result, where
 
 
-def make_crew_dispatch(post_handoff, post_crew, handler, roots: dict | None = None):
+def make_crew_dispatch(post_handoff, post_crew, handler, roots: dict | None = None,
+                       trace=None):
     """brain → crew 핸드오프 디스패처 (bolt 클라이언트와 분리된 순수 로직).
 
     같은 인터뷰의 재인계는 **첫 핸드오프 스레드로 되돌린다**. crew의 leader 세션 이월은
     thread_ts를 키로 하므로 재인계마다 새 채널 메시지를 만들면 컨텍스트가 매번 끊긴다 —
     스레드를 고정하면 재인계도, 그 스레드에 사용자가 직접 다는 후속 멘션도 같은 키가 된다.
 
+    `trace`를 주면 그 고정을 append-only trace에도 남긴다 — 프로세스가 재시작돼도
+    같은 인터뷰의 재인계가 새 채널 메시지로 갈라지지 않는다.
+
     post_handoff: async (channel, text, thread_ts|None) -> ts   (brain 봇이 게시)
     post_crew:    async (channel, text, thread_ts, **kw) -> any (crew 봇이 게시)
     """
     roots = {} if roots is None else roots
 
+    def _remembered(interview_ts: str) -> str | None:
+        root = roots.get(interview_ts)
+        if root or trace is None:
+            return root
+        try:
+            evs = trace.events(event_type="CrewHandoffThreadEvent",
+                               execution_id=f"BRAIN-{interview_ts}")
+        except Exception:
+            return None
+        return evs[-1]["payload"].get("root") if evs else None
+
     async def crew_dispatch(task: str, channel: str, interview_ts: str,
                             brief_text: str) -> None:
-        root = roots.get(interview_ts)
+        root = _remembered(interview_ts)
         head = "🧠→🛠 *brain → crew 추가 인계*" if root else "🧠→🛠 *brain → crew 작업 인계*"
         ts = await post_handoff(
             channel, f"{head}\n{brief_text}\n_(인터뷰 스레드: {interview_ts})_", root)
-        root = root or ts
+        if root is None:
+            root = ts
+            if trace is not None:
+                try:
+                    trace.append("CrewHandoffThreadEvent", task_id=f"BRAIN-{interview_ts}",
+                                 execution_id=f"BRAIN-{interview_ts}",
+                                 payload={"root": root, "channel": channel})
+                except Exception:
+                    pass                   # 기록 실패는 이번 인계를 막지 않는다
+        if len(roots) > 500:               # 프로세스 캐시일 뿐 — 진실은 trace에 있다
+            roots.clear()
         roots[interview_ts] = root
 
         async def crew_say(*, text: str, thread_ts=None, **kw):
@@ -443,7 +468,8 @@ async def _amain() -> None:
             return await app.client.chat_postMessage(
                 channel=channel, text=text, thread_ts=thread_ts, **kw)
 
-        crew_dispatch = make_crew_dispatch(post_handoff, post_crew, handler)
+        crew_dispatch = make_crew_dispatch(post_handoff, post_crew, handler,
+                                           trace=runner.orch.trace)
 
         async def brain_react(channel: str, ts: str) -> None:
             await brain_app.client.reactions_add(channel=channel, timestamp=ts, name="eyes")
@@ -480,7 +506,8 @@ async def _amain() -> None:
                     channel=ch, ts=msg["ts"], blocks=[],
                     text=(msg.get("text") or "질문")[:2800] + f"\n\n✅ 선택: {value}")
 
-            await brain.on_answer(thread_ts=thread, value=value, say=bsay, strip=strip)
+            await brain.on_answer(thread_ts=thread, value=value, say=bsay, strip=strip,
+                                  channel=ch)
 
         tasks.append(AsyncSocketModeHandler(brain_app, brain_app_token).start_async())
         print("devcrew: @brain 인터뷰 앱 활성화")

@@ -464,3 +464,33 @@ async def test_crew_dispatch_pins_rehandoff_to_first_thread():
     # crew thread_key(= event.thread_ts)가 두 번 다 같아야 세션 이월이 산다
     assert [e["thread_ts"] for e in events] == ["200.1", "200.1"]
     assert all(p["thread_ts"] == "200.1" for p in posted if "crew" in p)
+
+
+@pytest.mark.asyncio
+async def test_crew_dispatch_recovers_pinned_thread_from_trace(tmp_path):
+    """재시작으로 in-memory roots가 비어도 같은 인터뷰는 같은 crew 스레드로 간다."""
+    from devcrew.slack_engine import make_crew_dispatch
+    from devcrew.store.trace import TraceStore
+
+    trace = TraceStore(tmp_path / "t.db")
+    events = []
+    ts_seq = iter(["300.1", "300.2"])
+
+    async def post_handoff(channel, text, thread_ts):
+        events.append(("post", thread_ts))
+        return next(ts_seq)
+
+    async def post_crew(channel, text, thread_ts, **kw):
+        pass
+
+    async def handler(body, say):
+        events.append(("run", body["event"]["thread_ts"]))
+
+    await make_crew_dispatch(post_handoff, post_crew, handler, trace=trace)(
+        "작업1", "C1", "100.1", "brief1")
+    # 새 프로세스: roots 캐시가 비어 있다
+    await make_crew_dispatch(post_handoff, post_crew, handler, trace=trace)(
+        "작업2", "C1", "100.1", "brief2")
+
+    assert events == [("post", None), ("run", "300.1"),
+                      ("post", "300.1"), ("run", "300.1")]

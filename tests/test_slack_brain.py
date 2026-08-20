@@ -354,3 +354,169 @@ async def test_rediscuss_keeps_buttons_and_deepens(tmp_path):
     assert stripped == []                                    # 버튼 유지
     assert "[사용자] (재협의 요청)" in sess.transcript
     assert "질문2" in say.messages[-1]["text"]               # 심화 논의 응답 발신
+
+
+# --- 리뷰 지적 수정에 대한 회귀 테스트 (2026-08-20) ------------------------
+
+@pytest.mark.parametrize("text,expected", [
+    ("전달", "HANDOFF"), ("좋아, 전달해줘", "HANDOFF"), ("이제 전달할게", "HANDOFF"),
+    ("전달해주세요.", "HANDOFF"),
+    ("알림을 사내 메신저로 전달하는 방식은 어때?", None),   # 평문 — 발동 금지
+    ("전달 여부는 나중에 정하자", None),
+    ("종료", "END"), ("종료할게", "END"), ("인터뷰 종료", "END"),
+    ("이 기능은 세션 종료 시 정리돼야 해", None),           # 평문 — 발동 금지
+    ("최소 범위로 가자", None),
+])
+def test_command_of_only_matches_imperative_forms(text, expected):
+    from devcrew.slack_brain import command_of
+    assert command_of(text) == expected
+
+
+@pytest.mark.asyncio
+async def test_plain_sentence_with_전달_does_not_redispatch(tmp_path):
+    """인계 후에도 스레드가 살아 있으므로 평문 '전달'이 crew를 또 실행하면 안 된다."""
+    h, dispatch, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvC1"), say)
+    await h.on_thread_message(
+        reply("알림을 사내 메신저로 전달하는 방식은 어때?", event_id="EvC2"), say)
+    assert len(dispatch.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_lost_session_end_command_is_not_swallowed(tmp_path):
+    """세션 유실 스레드에서 '종료'는 대화가 아니라 명령으로 처리돼야 한다."""
+    h, _, fake = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvC3"), say)
+    h.sessions.clear()
+    spawns = len(fake.initial_messages)
+    await h.on_thread_message(reply("종료", event_id="EvC4"), say)
+    assert h.sessions == {}                               # 되살리지 않는다
+    assert len(fake.initial_messages) == spawns           # LLM을 부르지 않는다
+    assert any("정리했습니다" in m["text"] for m in say.messages)
+    await h.on_thread_message(reply("다시 시작", event_id="EvC5"), say)
+    assert h.sessions == {}                               # 종료가 실제로 기록됐다
+
+
+@pytest.mark.asyncio
+async def test_lost_session_handoff_command_says_nothing_new(tmp_path):
+    h, dispatch, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvC6"), say)
+    h.sessions.clear()
+    await h.on_thread_message(reply("전달", event_id="EvC7"), say)
+    assert len(dispatch.calls) == 1                       # 빈 delta를 넘기지 않는다
+    assert any("새로 논의된 내용이 없습니다" in m["text"] for m in say.messages)
+
+
+@pytest.mark.asyncio
+async def test_redelivery_keeps_target_repo_from_first_brief(tmp_path):
+    """delta brief는 target_repo를 못 채운다 — 세션이 첫 brief의 repo를 붙들어야
+    crew 쪽 이월이 끊기지 않는다."""
+    first = {**BRIEF_PASS, "target_repo": "demo"}
+    delta = {**BRIEF_PASS, "goal": "문구 변경", "target_repo": None}
+    trace = TraceStore(tmp_path / "t.db")
+    fake = FakeAdapter(script=["질문1", "질문2", "질문3"],
+                       structured_script=[first, delta, delta])
+    orch = Orchestrator(trace, SessionRegistry(tmp_path / "h.db"),
+                        {Provider.CLAUDE_CODE: fake, Provider.CODEX: fake})
+    dispatch = DispatchSpy()
+    h = BrainHandler(orch, load_config(), {"demo": tmp_path}, dispatch)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)      # repo 접두 없이 시작
+    await h.on_thread_message(reply("전달", event_id="EvC8"), say)
+    await h.on_thread_message(reply("문구만 바꾸자", event_id="EvC9"), say)
+    await h.on_thread_message(reply("전달", event_id="EvC10"), say)
+    assert dispatch.calls[0]["task"].startswith("demo: ")
+    assert dispatch.calls[1]["task"].startswith("demo: ")   # 재인계도 같은 repo
+
+
+@pytest.mark.asyncio
+async def test_evict_never_drops_live_interview(tmp_path):
+    """진행 중 인터뷰를 말없이 죽이면 사용자는 답 없는 스레드만 보게 된다."""
+    import devcrew.slack_brain as sb
+    h, _, _ = make_handler(tmp_path)
+    say = SaySpy()
+    for i in range(3):
+        await h.on_mention(mention(f"<@U1> 주제{i}", ts=f"20{i}.1", event_id=f"EvE{i}"), say)
+    assert len(h.sessions) == 3
+    orig, sb.MAX_SESSIONS = sb.MAX_SESSIONS, 1
+    try:
+        await h._evict()
+    finally:
+        sb.MAX_SESSIONS = orig
+    assert len(h.sessions) == 3               # 인계 완료 세션이 없으므로 아무도 못 쫓아낸다
+
+
+@pytest.mark.asyncio
+async def test_evict_reclaims_idle_handed_off_session(tmp_path):
+    import devcrew.slack_brain as sb
+    h, _, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvE9"), say)
+    h.sessions["100.1"].touched -= sb.IDLE_TTL + 1
+    await h._evict()
+    assert h.sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_unrecoverable_interview_thread_tells_the_user_once(tmp_path):
+    """이 기능 이전에 인계된 스레드 — 침묵하면 봇이 죽은 것처럼 보인다."""
+    h, _, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    h.sessions.clear()                        # 인계 기록 없이 세션만 사라진 상태
+    await h.on_thread_message(reply("이어서 해줘", event_id="EvD1"), say)
+    warned = [m for m in say.messages if "이어받을 수 없습니다" in m["text"]]
+    assert len(warned) == 1
+    await h.on_thread_message(reply("여보세요", event_id="EvD2"), say)
+    warned = [m for m in say.messages if "이어받을 수 없습니다" in m["text"]]
+    assert len(warned) == 1                   # 반복 안내로 스레드를 도배하지 않는다
+
+
+@pytest.mark.asyncio
+async def test_button_click_after_session_loss_recovers(tmp_path):
+    """답글은 복원되는데 버튼만 죽으면 같은 의도에 두 가지 답을 주는 셈이다."""
+    h, _, fake = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvB9"), say)
+    h.sessions.clear()
+    await h.on_answer(thread_ts="100.1", value="A) 최소 범위", say=say, channel="C1")
+    assert "100.1" in h.sessions
+    assert "이미 crew에 인계한 brief" in fake.initial_messages[-1]
+    assert h.sessions["100.1"].channel == "C1"
+
+
+@pytest.mark.asyncio
+async def test_recovered_reply_is_labeled_as_restored(tmp_path):
+    h, _, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvL1"), say)
+    h.sessions.clear()
+    await h.on_thread_message(reply("문구 바꾸자", event_id="EvL2"), say)
+    assert "복원했습니다" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_stale_handoff_is_not_resumed(tmp_path):
+    """오래된 brief로 되살리면 그 사이 바뀐 코드를 사실로 믿게 된다."""
+    import devcrew.slack_brain as sb
+    h, _, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvS1"), say)
+    h.sessions.clear()
+    orig, sb.RESUME_MAX_AGE = sb.RESUME_MAX_AGE, -1.0
+    try:
+        await h.on_thread_message(reply("이어서", event_id="EvS2"), say)
+    finally:
+        sb.RESUME_MAX_AGE = orig
+    assert h.sessions == {}
+    assert any("이어받을 수 없습니다" in m["text"] for m in say.messages)
