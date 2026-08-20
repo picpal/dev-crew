@@ -38,6 +38,8 @@ HANDOFF_KEYWORD = "전달"
 # 부분 문자열 매칭이면 "…메신저로 전달하는 방식은?" 같은 평문이 crew를 또 실행시킨다.
 _HANDOFF_RE = re.compile(r"(?:^|[\s,.:;!?~])전달(?:해\S{0,4}|하자|할게|해라|)\s*[.!~…]*$")
 _END_RE = re.compile(r"^\s*(?:인터뷰\s*|세션\s*)?종료(?:해\S{0,4}|하자|할게|)\s*[.!~…]*$")
+# crew 쪽 `/clear`와 이름을 맞춘다 (Claude Code의 /clear와 같은 뜻)
+_CLEAR_RE = re.compile(r"^\s*/?(?:clear|초기화)\s*$", re.I)
 IDLE_TTL = 6 * 3600.0        # 인계 완료 후 이만큼 방치되면 세션을 반납한다
 RESUME_MAX_AGE = 14 * 86400.0  # 이보다 오래된 인계는 seed로 되살리지 않는다 (코드가 변했다)
 TURN_TIMEOUT = 300.0
@@ -114,7 +116,7 @@ class BrainSession:
 def command_of(text: str) -> str | None:
     """사용자 발화가 하네스 명령인지 판정. 평문은 None."""
     t = text.strip()
-    if _END_RE.match(t):
+    if _END_RE.match(t) or _CLEAR_RE.match(t):
         return "END"
     if _HANDOFF_RE.search(t):
         return "HANDOFF"
@@ -494,6 +496,9 @@ class BrainHandler:
             await self.on_thread_message(body, say, deduped=True)
             return
         topic = _MENTION_RE.sub("", event.get("text") or "").strip()
+        if command_of(topic) == "END":     # 비울 게 없다 — 새 인터뷰를 열지 않는다
+            await say(text="ℹ️ 이 스레드에는 정리할 인터뷰가 없습니다.", thread_ts=thread_ts)
+            return
         if not topic:
             await say(text="⚠️ 주제가 비어 있습니다. `@brain [repo명:] <기능 요청>` 형식으로 시작하세요.",
                       thread_ts=thread_ts)

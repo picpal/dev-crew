@@ -546,3 +546,74 @@ async def test_slack_posters_route_and_pin_threads():
     assert crew.calls[0]["thread_ts"] == "500.1"          # crew 회신은 고정 root로
     assert crew.calls[0]["blocks"] == [{"x": 1}]
     assert len(brain.calls) == 1                          # 서로의 봇 토큰을 섞지 않는다
+
+
+class ClearSpy:
+    """clear_thread/busy_for만 필요한 최소 러너 대역."""
+
+    def __init__(self, has_state=True, busy=False):
+        self.state = {"repo_name": "demo", "nodes": {}, "leader": {}} if has_state else None
+        self.busy_flag, self.cleared = busy, []
+        self.timeout = 600.0
+
+    def busy_for(self, thread_key):
+        return self.busy_flag
+
+    async def clear_thread(self, thread_key):
+        self.cleared.append(thread_key)
+        return self.state
+
+
+@pytest.mark.asyncio
+async def test_crew_slash_clear_drops_thread_context():
+    from devcrew.slack_engine import MentionHandler
+    runner = ClearSpy()
+    say = SaySpy()
+    await MentionHandler(runner)({"event": {"text": "<@U1> /clear", "ts": "T1",
+                                            "channel": "C1"}}, say)
+    assert runner.cleared == ["T1"]
+    assert "컨텍스트를 비웠습니다" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_crew_clear_refused_while_running():
+    from devcrew.slack_engine import MentionHandler
+    runner = ClearSpy(busy=True)
+    say = SaySpy()
+    await MentionHandler(runner)({"event": {"text": "<@U1> /clear", "ts": "T1",
+                                            "channel": "C1"}}, say)
+    assert runner.cleared == []                     # 진행 중 실행을 끊지 않는다
+    assert "실행 중지" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_clear_thread_archives_carried_sessions(tmp_path, monkeypatch):
+    """이월 세션을 안 닫고 상태만 지우면 SDK 프로세스가 그대로 남는다."""
+    import devcrew.slack_engine as se
+    from devcrew.schema import AgentInstance, EffortLevel, Provider, Role
+
+    runner = se.EngineRunner(runtime_dir=tmp_path / "rt")
+    archived = []
+
+    class Adapter:
+        async def archive(self, sid):
+            archived.append(sid)
+            return "ARCHIVED"
+
+    runner.orch.adapters[Provider.CLAUDE_CODE] = Adapter()
+    inst = AgentInstance(
+        instance_id="DEV-1", role=Role.DEVELOPER, provider=Provider.CLAUDE_CODE,
+        adapter="fake", model="m", effort_level=EffortLevel.HIGH, reasoning_level=None,
+        routing_policy_version="v1", routing_reason="test", session_id=None,
+        execution_id="SLACK-1", workflow_id="wf", node_id="develop", task_scope="s",
+        worktree=None)
+    runner._threads["T9"] = {
+        "repo_name": "demo", "workspace": "/tmp/x", "where": "demo", "base": "main",
+        "nodes": {"develop": {"inst": inst, "session_id": "sid-node"}},
+        "leader": {"inst": inst, "sid": "sid-leader"}}
+
+    assert await runner.clear_thread("T9") is not None
+    assert sorted(archived) == ["sid-leader", "sid-node"]
+    assert "T9" not in runner._threads
+    assert runner.trace.events(event_type="ThreadContextClearedEvent")
+    assert await runner.clear_thread("T9") is None      # 두 번째는 비울 게 없다

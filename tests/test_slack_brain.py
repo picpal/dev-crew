@@ -786,3 +786,28 @@ async def test_mid_length_prose_stays_in_slack(tmp_path):
     await h.on_mention(mention("<@U1> 결제 알림"), say)
     assert prose[:40] in say.messages[0]["text"]
     assert "📄" not in say.messages[0]["text"]
+
+
+@pytest.mark.parametrize("text", ["/clear", "clear", "/초기화", "초기화", "/CLEAR"])
+def test_clear_command_is_recognized(text):
+    from devcrew.slack_brain import command_of
+    assert command_of(text) == "END"
+
+
+@pytest.mark.asyncio
+async def test_brain_slash_clear_closes_session(tmp_path):
+    h, _, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(owner_mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(u("EvX1", "/clear"), say)
+    assert h.sessions == {}
+    assert any("정리했습니다" in m["text"] for m in say.messages)
+
+
+@pytest.mark.asyncio
+async def test_brain_clear_on_empty_thread_does_not_start_interview(tmp_path):
+    h, _, fake = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(owner_mention("<@U1> /clear", ts="777.1", event_id="EvX2"), say)
+    assert h.sessions == {} and fake.initial_messages == []
+    assert "정리할 인터뷰가 없습니다" in say.messages[0]["text"]

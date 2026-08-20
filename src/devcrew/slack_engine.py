@@ -186,6 +186,48 @@ class EngineRunner:
     def request_stop(self, execution_id: str) -> None:
         self._stop_requests.add(execution_id)
 
+    def busy_for(self, thread_key: str) -> bool:
+        """이 스레드가 쓰는 repo에서 실행이 도는 중인가 (초기화 거부 판단용)."""
+        st = self._threads.get(thread_key)
+        if st is None:
+            return False
+        lock = self._locks.get(st.get("repo_name") or "_toy")
+        return bool(lock and lock.locked())
+
+    async def clear_thread(self, thread_key: str) -> dict | None:
+        """스레드의 이월 컨텍스트를 버린다 — 노드 세션·leader 세션을 archive하고
+        스레드 상태를 지운다. 다음 요청은 새 작업 공간과 새 세션에서 시작한다.
+
+        worktree와 그 안의 커밋은 지우지 않는다 — 이미 만든 산출물은 사용자 자산이다.
+        비운 적이 있다는 사실은 trace에 남긴다 (토큰 급감의 원인 추적용)."""
+        st = self._threads.pop(thread_key, None)
+        if st is None:
+            return None
+        carried = list((st.get("nodes") or {}).values())
+        leader = st.get("leader") or {}
+        if leader.get("sid"):
+            carried.append({"inst": leader.get("inst"), "session_id": leader["sid"]})
+        for entry in carried:
+            inst, sid = entry.get("inst"), entry.get("session_id")
+            if not (inst and sid):
+                continue
+            try:
+                await self.orch.adapters[inst.provider].archive(sid)
+            except Exception:
+                pass                      # 이미 죽은 세션 — 정리는 best-effort
+            try:
+                self.orch.registry.finish(inst.instance_id)
+            except Exception:
+                pass
+        try:
+            self.trace.append("ThreadContextClearedEvent", task_id=thread_key,
+                              payload={"repo": st.get("repo_name"),
+                                       "sessions": len(carried),
+                                       "where": st.get("where")})
+        except Exception:
+            pass
+        return st
+
     def _lock_for(self, key: str) -> asyncio.Lock:
         return self._locks.setdefault(key, asyncio.Lock())
 
@@ -364,6 +406,11 @@ def make_crew_dispatch(post_handoff, post_crew, handler, roots: dict | None = No
     return crew_dispatch
 
 
+# `/clear`는 진짜 Slack 슬래시 커맨드가 아니라 멘션 뒤에 붙이는 토큰이다 — 슬래시
+# 커맨드 페이로드에는 thread_ts가 없어 어느 스레드를 비울지 알 수 없다.
+CLEAR_RE = re.compile(r"^/?(?:clear|초기화)$", re.I)
+
+
 class MentionHandler:
     """app_mention 이벤트 처리 — bolt와 분리된 순수 로직 (테스트 대상)."""
 
@@ -374,6 +421,20 @@ class MentionHandler:
         self.status = status          # async (channel, thread_ts, text) — AI 앱 상태 (선택)
         self._seen: set[str] = set()
         self._max_seen = max_seen
+
+    async def _clear(self, thread_ts: str, say) -> None:
+        if self.runner.busy_for(thread_ts):
+            await say(text="⏳ 이 스레드에서 실행이 진행 중입니다. `🛑 실행 중지`로 먼저 "
+                           "멈춘 뒤 다시 `/clear` 해주세요.", thread_ts=thread_ts)
+            return
+        st = await self.runner.clear_thread(thread_ts)
+        if st is None:
+            await say(text="ℹ️ 이 스레드에는 비울 crew 컨텍스트가 없습니다.",
+                      thread_ts=thread_ts)
+            return
+        await say(text="🧹 이 스레드의 crew 컨텍스트를 비웠습니다 — leader와 각 단계 세션을 "
+                       "모두 닫았습니다.\n다음 요청은 새 작업 공간에서 처음부터 시작합니다 "
+                       "_(기존 worktree와 커밋은 그대로 둡니다)_.", thread_ts=thread_ts)
 
     async def __call__(self, body: dict, say) -> None:
         event_id = body.get("event_id")
@@ -387,6 +448,9 @@ class MentionHandler:
         event = body.get("event") or {}
         thread_ts = event.get("thread_ts") or event.get("ts")
         task = _MENTION_RE.sub("", event.get("text") or "").strip()
+        if CLEAR_RE.match(task):
+            await self._clear(thread_ts, say)
+            return
         if not task:
             await say(text="⚠️ 작업 내용이 비어 있습니다. `@bot <작업 설명>` 형식으로 요청하세요.",
                       thread_ts=thread_ts)
