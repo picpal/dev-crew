@@ -999,3 +999,124 @@ def test_scrollable_code_blocks_are_reachable_by_keyboard():
     """가로로 구르는 코드 블록에 진입점이 없으면 마우스 없이는 가려진 코드를 못 본다."""
     from devcrew.report.brain_report import md_lite
     assert '<pre tabindex="0">' in md_lite("```\nx\n```")
+# ── crew 인계 버튼 (READY 마커) ──────────────────────────────────────────────
+class BlockSaySpy:
+    """blocks까지 받는 발신 대역 — 버튼 유무를 검증할 때 쓴다."""
+
+    def __init__(self):
+        self.messages = []
+
+    async def __call__(self, *, text, thread_ts=None, blocks=None):
+        self.messages.append({"text": text, "thread_ts": thread_ts, "blocks": blocks})
+
+
+def buttons_of(msg):
+    for b in msg.get("blocks") or []:
+        if b["type"] == "actions":
+            return b["elements"]
+    return []
+
+
+def test_strip_ready_removes_marker_and_reports_it():
+    from devcrew.slack_brain import strip_ready
+    text, ready = strip_ready("결정이 모두 닫혔습니다.\n\n[[READY]]")
+    assert ready and text == "결정이 모두 닫혔습니다."
+    text, ready = strip_ready("아직 물어볼 게 남았습니다.")
+    assert not ready and text == "아직 물어볼 게 남았습니다."
+
+
+def test_handoff_button_absent_until_brain_says_ready():
+    from devcrew.slack_brain import HANDOFF_VALUE, parse_options, question_blocks
+    text = "질문?\nA) 하나 (권장)\nB) 둘"
+    opts = parse_options(text)
+    plain = next(b for b in question_blocks(text, opts) if b["type"] == "actions")
+    assert all(e["value"] != HANDOFF_VALUE for e in plain["elements"])
+    ready = next(b for b in question_blocks(text, opts, ready=True)
+                 if b["type"] == "actions")
+    assert ready["elements"][-1]["value"] == HANDOFF_VALUE
+
+
+@pytest.mark.asyncio
+async def test_ready_marker_never_reaches_user_or_transcript(tmp_path):
+    """마커는 하네스 신호다 — 화면에도, 대화록(요약 세션 입력)에도 남으면 안 된다."""
+    h, _, fake = make_handler(tmp_path)
+    fake.script = ["결정이 모두 닫혔습니다.\n[[READY]]"]
+    say = BlockSaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    assert "[[READY]]" not in say.messages[-1]["text"]
+    assert all("[[READY]]" not in t for t in h.sessions["100.1"].transcript)
+
+
+@pytest.mark.asyncio
+async def test_ready_prose_reply_carries_handoff_button(tmp_path):
+    """선택지 없는 마무리 응답에도 버튼이 붙는다 (그 turn에만)."""
+    h, _, fake = make_handler(tmp_path)
+    fake.script = ["아직 질문이 남았습니다.", "결정이 모두 닫혔습니다.\n[[READY]]"]
+    say = BlockSaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    assert buttons_of(say.messages[-1]) == []                 # 토론 중엔 없다
+    await h.on_thread_message(reply("좋아", event_id="EvRB1"), say)
+    btns = buttons_of(say.messages[-1])
+    from devcrew.slack_brain import HANDOFF_VALUE
+    assert [b["value"] for b in btns] == [HANDOFF_VALUE]
+
+
+@pytest.mark.asyncio
+async def test_handoff_button_click_dispatches_to_crew(tmp_path):
+    from devcrew.slack_brain import HANDOFF_VALUE
+    h, dispatch, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(owner_mention("<@U1> 결제 알림"), say)
+    stripped = []
+
+    async def strip():
+        stripped.append(True)
+
+    await h.on_answer(thread_ts="100.1", value=HANDOFF_VALUE, say=say, strip=strip,
+                      channel="C1", user="U-OWNER")
+    assert len(dispatch.calls) == 1
+    assert "결제 알림 발송" in dispatch.calls[0]["task"]
+    assert stripped == [True]                                 # 소비된 버튼은 걷는다
+    # 버튼 클릭이 대화 내용으로 기록되면 안 된다 (타이핑 '전달'과 같은 취급)
+    assert all(HANDOFF_VALUE not in t for t in h.sessions["100.1"].transcript)
+
+
+@pytest.mark.asyncio
+async def test_handoff_button_click_by_stranger_is_refused(tmp_path):
+    from devcrew.slack_brain import HANDOFF_VALUE
+    h, dispatch, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(owner_mention("<@U1> 결제 알림"), say)
+    await h.on_answer(thread_ts="100.1", value=HANDOFF_VALUE, say=say,
+                      channel="C1", user="U-STRANGER")
+    assert dispatch.calls == []
+    assert any("시작한 사람만" in m["text"] for m in say.messages)
+
+
+@pytest.mark.asyncio
+async def test_handoff_button_on_lost_session_neither_recovers_nor_dispatches(tmp_path):
+    """세션이 없는 스레드의 버튼 클릭은 안내만 — 되살려서 발주하지 않는다."""
+    from devcrew.slack_brain import HANDOFF_VALUE
+    h, dispatch, fake = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(owner_mention("<@U1> 결제 알림"), say)
+    h.sessions.clear()
+    spawns = len(fake.initial_messages)
+    await h.on_answer(thread_ts="100.1", value=HANDOFF_VALUE, say=say,
+                      channel="C1", user="U-OWNER")
+    assert dispatch.calls == [] and len(fake.initial_messages) == spawns
+    assert "세션이 남아 있지 않습니다" in say.messages[-1]["text"]
+
+
+def test_answer_mark_labels_handoff_not_as_a_choice():
+    """버튼을 걷을 때 원 메시지에 남기는 표기 — sentinel이 그대로 노출되면 안 된다."""
+    from devcrew.slack_brain import HANDOFF_VALUE, answer_mark
+    assert answer_mark(HANDOFF_VALUE) == "🛠 crew에 전달했습니다"
+    assert answer_mark("A) 최소 범위 (권장)") == "✅ 선택: A) 최소 범위 (권장)"
+
+
+def test_long_ready_reply_keeps_body_over_button():
+    """블록에 안 들어가는 길이면 버튼을 포기하고 평문으로 보낸다 — 본문이 먼저다."""
+    from devcrew.slack_brain import ready_blocks
+    assert ready_blocks("짧은 마무리")                       # 정상 길이는 블록
+    assert ready_blocks("가" * 9000) == []                   # 잘라내느니 평문으로
