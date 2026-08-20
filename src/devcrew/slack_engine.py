@@ -408,7 +408,7 @@ def make_crew_dispatch(post_handoff, post_crew, handler, roots: dict | None = No
 
 # `/clear`는 진짜 Slack 슬래시 커맨드가 아니라 멘션 뒤에 붙이는 토큰이다 — 슬래시
 # 커맨드 페이로드에는 thread_ts가 없어 어느 스레드를 비울지 알 수 없다.
-CLEAR_RE = re.compile(r"^/?(?:clear|초기화)$", re.I)
+CLEAR_RE = re.compile(r"^/clear$", re.I)
 
 
 class MentionHandler:

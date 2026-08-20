@@ -183,12 +183,12 @@ async def test_unrelated_thread_reply_is_ignored(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_end_keyword_closes_session_and_disables_recovery(tmp_path):
+async def test_clear_closes_session_and_disables_recovery(tmp_path):
     h, _, _ = make_handler(tmp_path)
     say = SaySpy()
     await h.on_mention(mention("<@U1> 결제 알림"), say)
     await h.on_thread_message(reply("전달", event_id="EvR15"), say)
-    await h.on_thread_message(reply("종료", event_id="EvR16"), say)
+    await h.on_thread_message(reply("/clear", event_id="EvR16"), say)
     assert "100.1" not in h.sessions
     assert any("정리했습니다" in m["text"] for m in say.messages)
     await h.on_thread_message(reply("다시 뭐 좀", event_id="EvR17"), say)
@@ -367,8 +367,9 @@ async def test_rediscuss_keeps_buttons_and_deepens(tmp_path):
     ("전달해주세요.", "HANDOFF"),
     ("알림을 사내 메신저로 전달하는 방식은 어때?", None),   # 평문 — 발동 금지
     ("전달 여부는 나중에 정하자", None),
-    ("종료", "END"), ("종료할게", "END"), ("인터뷰 종료", "END"),
-    ("이 기능은 세션 종료 시 정리돼야 해", None),           # 평문 — 발동 금지
+    ("/clear", "END"), ("  /clear  ", "END"), ("/CLEAR", "END"),
+    ("종료", None), ("종료할게", None), ("초기화", None),   # 평범한 낱말 — 발동 금지
+    ("이 기능은 세션 종료 시 정리돼야 해", None),
     ("최소 범위로 가자", None),
 ])
 def test_command_of_only_matches_imperative_forms(text, expected):
@@ -390,14 +391,14 @@ async def test_plain_sentence_with_전달_does_not_redispatch(tmp_path):
 
 @pytest.mark.asyncio
 async def test_lost_session_end_command_is_not_swallowed(tmp_path):
-    """세션 유실 스레드에서 '종료'는 대화가 아니라 명령으로 처리돼야 한다."""
+    """세션 유실 스레드에서 '/clear'는 대화가 아니라 명령으로 처리돼야 한다."""
     h, _, fake = make_handler(tmp_path)
     say = SaySpy()
     await h.on_mention(mention("<@U1> 결제 알림"), say)
     await h.on_thread_message(reply("전달", event_id="EvC3"), say)
     h.sessions.clear()
     spawns = len(fake.initial_messages)
-    await h.on_thread_message(reply("종료", event_id="EvC4"), say)
+    await h.on_thread_message(reply("/clear", event_id="EvC4"), say)
     assert h.sessions == {}                               # 되살리지 않는다
     assert len(fake.initial_messages) == spawns           # LLM을 부르지 않는다
     assert any("정리했습니다" in m["text"] for m in say.messages)
@@ -577,7 +578,7 @@ async def test_only_owner_can_hand_off_or_close(tmp_path):
     await h.on_thread_message(u("EvS12", "전달", user="U-STRANGER"), say)
     assert dispatch.calls == []
     assert any("시작한 사람만" in m["text"] for m in say.messages)
-    await h.on_thread_message(u("EvS13", "종료", user="U-STRANGER"), say)
+    await h.on_thread_message(u("EvS13", "/clear", user="U-STRANGER"), say)
     assert "100.1" in h.sessions                              # 남이 못 닫는다
     await h.on_thread_message(u("EvS14", "전달"), say)          # 주인은 된다
     assert len(dispatch.calls) == 1
@@ -636,7 +637,7 @@ async def test_close_records_failure_is_surfaced(tmp_path):
         raise RuntimeError("disk full")
 
     h.orch.trace.append = boom
-    await h.on_thread_message(u("EvS22", "종료"), say)
+    await h.on_thread_message(u("EvS22", "/clear"), say)
     assert any("종료 기록에 실패" in m["text"] for m in say.messages)
 
 
@@ -764,7 +765,7 @@ async def test_close_ordering_uses_rowid_not_wall_clock(tmp_path):
 
     h.orch.trace._con.execute("DROP TRIGGER events_no_update")
     h.orch.trace.append = back_in_time
-    await h.on_thread_message(u("EvW11", "종료"), say)
+    await h.on_thread_message(u("EvW11", "/clear"), say)
     h.orch.trace.append = real
     await h.on_thread_message(u("EvW12", "이어서 하자"), say)
     assert h.sessions == {}                          # 종료가 여전히 최신으로 인식된다
@@ -788,10 +789,14 @@ async def test_mid_length_prose_stays_in_slack(tmp_path):
     assert "📄" not in say.messages[0]["text"]
 
 
-@pytest.mark.parametrize("text", ["/clear", "clear", "/초기화", "초기화", "/CLEAR"])
-def test_clear_command_is_recognized(text):
+@pytest.mark.parametrize("text,expected", [
+    ("/clear", "END"), ("/CLEAR", "END"),
+    ("clear", None), ("초기화", None), ("/초기화", None),   # 슬래시 형태 하나만 명령이다
+    ("이 값을 초기화해줘", None),
+])
+def test_only_slash_clear_is_a_command(text, expected):
     from devcrew.slack_brain import command_of
-    assert command_of(text) == "END"
+    assert command_of(text) == expected
 
 
 @pytest.mark.asyncio
