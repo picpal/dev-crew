@@ -29,7 +29,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .repos import RepoRegistryError, load_repos, split_repo_prefix
+from .repos import RepoRegistryError, load_repo_bases, load_repos, split_repo_prefix
 from .worktree import WorktreeManager
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
@@ -148,6 +148,7 @@ class EngineRunner:
         self.mcp = {"harness": build_harness_mcp(self.trace)}
         self.timeout = float(os.environ.get("DEVCREW_TASK_TIMEOUT", "600"))
         self.repos = load_repos()
+        self.repo_bases = load_repo_bases()
         self._locks: dict[str, asyncio.Lock] = {}
         # execution_id는 프로세스 재시작 때 1부터 리셋되면 trace에서 과거 실행과
         # 충돌한다 — 기존 trace의 최대 번호 다음부터 이어 붙인다.
@@ -197,8 +198,10 @@ class EngineRunner:
                 st = None
             if st is None:
                 if repo_name:
-                    wt = WorktreeManager(self.repos[repo_name]).create(f"slack-{n}")
-                    workspace, where = str(wt), f"{repo_name} · 브랜치 wt/slack-{n}\n{wt}"
+                    base = self.repo_bases.get(repo_name, "HEAD")
+                    wt = WorktreeManager(self.repos[repo_name]).create(f"slack-{n}", base)
+                    workspace = str(wt)
+                    where = f"{repo_name} · wt/slack-{n} ({base} 기준)\n{wt}"
                 else:
                     workspace = os.environ.get("DEVCREW_TARGET_REPO") or str(make_toy_repo())
                     where = workspace

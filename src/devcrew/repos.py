@@ -2,10 +2,22 @@
 
 파일이 없으면 빈 registry (toy repo 전용 모드). 등록된 경로가 없거나 git repo가
 아니면 로딩 시 RepoRegistryError로 fail-fast — 조용한 기본값 금지.
+
+각 repo는 두 형태 중 하나로 쓴다:
+
+    work-note: ~/Desktop/workspace/work-note          # base = 그 repo의 HEAD
+    dev-crew:
+      path: ~/Desktop/workspace/dev-crew
+      branch: feat/orchestrator-loop                  # base = 이 브랜치
+
+`branch`는 실행용 worktree(`wt/slack-N`)를 어느 커밋에서 딸지 정한다. 작업 코드가
+아직 병합되지 않은 브랜치에 있으면 이걸 지정해야 한다 — HEAD(main)에서 따면
+워커가 그 코드가 없는 트리에서 작업하게 된다 (2026-08-20 SLACK-3).
 """
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -17,21 +29,45 @@ class RepoRegistryError(Exception):
     pass
 
 
+def _entry(name: str, loc) -> tuple[Path, str]:
+    """registry 항목 → (경로, base ref). 문자열이면 base는 HEAD."""
+    if isinstance(loc, dict):
+        raw_path = loc.get("path")
+        if not raw_path:
+            raise RepoRegistryError(f"repo {name!r}: path 누락")
+        base = str(loc.get("branch") or "HEAD")
+    else:
+        raw_path, base = str(loc), "HEAD"
+    rp = Path(str(raw_path)).expanduser().resolve()
+    if not rp.is_dir():
+        raise RepoRegistryError(f"repo {name!r}: 경로 없음 — {rp}")
+    if not (rp / ".git").exists():
+        raise RepoRegistryError(f"repo {name!r}: git repo 아님 — {rp}")
+    if base != "HEAD":
+        r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"],
+                           cwd=rp, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RepoRegistryError(f"repo {name!r}: 브랜치 {base!r}가 {rp}에 없다")
+    return rp, base
+
+
 def load_repos(path: str | Path | None = None) -> dict[str, Path]:
     p = Path(path) if path else DEFAULT_PATH
     if not p.exists():
         return {}
     raw = yaml.safe_load(p.read_text()) or {}
-    repos = raw.get("repos") or {}
-    out: dict[str, Path] = {}
-    for name, loc in repos.items():
-        rp = Path(str(loc)).expanduser().resolve()
-        if not rp.is_dir():
-            raise RepoRegistryError(f"repo {name!r}: 경로 없음 — {rp}")
-        if not (rp / ".git").exists():
-            raise RepoRegistryError(f"repo {name!r}: git repo 아님 — {rp}")
-        out[str(name)] = rp
-    return out
+    return {str(n): _entry(str(n), loc)[0]
+            for n, loc in (raw.get("repos") or {}).items()}
+
+
+def load_repo_bases(path: str | Path | None = None) -> dict[str, str]:
+    """repo 이름 → worktree base ref. 지정 없으면 "HEAD"."""
+    p = Path(path) if path else DEFAULT_PATH
+    if not p.exists():
+        return {}
+    raw = yaml.safe_load(p.read_text()) or {}
+    return {str(n): _entry(str(n), loc)[1]
+            for n, loc in (raw.get("repos") or {}).items()}
 
 
 def split_repo_prefix(task: str, repos: dict[str, Path]) -> tuple[str | None, str]:

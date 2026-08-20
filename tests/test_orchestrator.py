@@ -198,3 +198,26 @@ async def test_consume_result_as_role_override(tmp_path):
     evs = trace.events(event_type="WorkerResultEvent")
     assert evs[0]["payload"] == {"role": "REVIEWER", "status": "PASS", "verdict": "NOT_PASS",
                                  "structured": outcome.structured}
+
+
+@pytest.mark.asyncio
+async def test_worker_system_prompt_pins_worktree_as_authoritative(tmp_path):
+    """워커가 자기 worktree 밖의 코드를 보고 '내 대상은 저쪽인데 여기 묶였다'며
+    BLOCKED로 자폭하던 사례(2026-08-20 SLACK-3) 회귀 고정."""
+    from devcrew.adapters.base import FakeAdapter
+    from devcrew.orchestrator import Orchestrator
+    from devcrew.schema import Provider, Role
+    from devcrew.store.registry import SessionRegistry
+    from devcrew.store.trace import TraceStore
+
+    fake = FakeAdapter()
+    orch = Orchestrator(TraceStore(tmp_path / "t.db"), SessionRegistry(tmp_path / "h.db"),
+                        {Provider.CLAUDE_CODE: fake, Provider.CODEX: fake})
+    inst = await orch.spawn(Role.DEVELOPER, "DEFAULT", execution_id="E", node_id="develop",
+                            task_scope="calc.py에 mul 추가", worktree="/tmp/wt/slack-9")
+    await orch.start_worker(inst, "go")
+    sp = fake.last_system_prompt
+    assert "/tmp/wt/slack-9" in sp
+    assert "정본" in sp
+    assert "격리 설계" in sp and "중단하지" in sp
+    assert "calc.py에 mul 추가" in sp          # 기존 할당 Scope 주입은 유지

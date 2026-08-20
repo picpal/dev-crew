@@ -55,3 +55,57 @@ def test_split_prefix_typo_fails():
 
 def test_split_prefix_no_colon():
     assert split_repo_prefix("그냥 작업", {"alpha": None}) == (None, "그냥 작업")
+
+
+def _init_repo(path):
+    import subprocess
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    (path / "a.txt").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=path, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "init"], cwd=path, check=True)
+    return path
+
+
+def test_repo_entry_accepts_branch_and_reports_base(tmp_path):
+    """작업 코드가 미병합 브랜치에 있으면 worktree base를 그 브랜치로 지정한다
+    (미지정 시 HEAD에서 따 워커가 코드 없는 트리에서 작업한다 — SLACK-3)."""
+    import subprocess
+    from devcrew.repos import load_repo_bases, load_repos
+    repo = _init_repo(tmp_path / "r")
+    subprocess.run(["git", "branch", "feature/x"], cwd=repo, check=True)
+    cfg = tmp_path / "repos.yaml"
+    cfg.write_text(f"repos:\n  plain: {repo}\n  pinned:\n    path: {repo}\n"
+                   f"    branch: feature/x\n")
+    assert load_repos(cfg) == {"plain": repo.resolve(), "pinned": repo.resolve()}
+    assert load_repo_bases(cfg) == {"plain": "HEAD", "pinned": "feature/x"}
+
+
+def test_unknown_branch_fails_fast(tmp_path):
+    from devcrew.repos import RepoRegistryError, load_repos
+    repo = _init_repo(tmp_path / "r")
+    cfg = tmp_path / "repos.yaml"
+    cfg.write_text(f"repos:\n  x:\n    path: {repo}\n    branch: 없는브랜치\n")
+    with pytest.raises(RepoRegistryError, match="없는브랜치"):
+        load_repos(cfg)
+
+
+def test_worktree_created_from_given_base_ref(tmp_path):
+    import subprocess
+    from devcrew.worktree import WorktreeManager
+    repo = _init_repo(tmp_path / "r")
+    (repo / "only-on-branch.txt").write_text("y")
+    subprocess.run(["git", "checkout", "-qb", "feature/x"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "branch work"], cwd=repo, check=True)
+    subprocess.run(["git", "checkout", "-q", "master" if
+                    subprocess.run(["git", "rev-parse", "--verify", "-q", "master"],
+                                   cwd=repo, capture_output=True).returncode == 0
+                    else "main"], cwd=repo, check=True)
+
+    wt = WorktreeManager(repo).create("t1", "feature/x")
+    assert (wt / "only-on-branch.txt").exists()      # 브랜치 커밋이 들어있다
+    plain = WorktreeManager(repo).create("t2")       # 기본 HEAD
+    assert not (plain / "only-on-branch.txt").exists()

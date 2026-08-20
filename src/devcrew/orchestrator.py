@@ -127,6 +127,17 @@ class Orchestrator:
         system_prompt = bundle.prompt
         if inst.task_scope:
             system_prompt = f"{bundle.prompt}\n\n## 할당 Scope\n{inst.task_scope}"
+        if inst.worktree:
+            # 워커가 자기 worktree 밖(부모 repo·다른 worktree)의 코드를 읽고 "내
+            # 작업 대상은 저쪽인데 여기에 묶여 있다"고 오판해 BLOCKED로 자폭하는
+            # 사례(2026-08-20 SLACK-3) 차단. 격리는 결함이 아니라 설계다.
+            system_prompt += (
+                f"\n\n## 작업 디렉토리 (정본)\n{inst.worktree}\n"
+                "이 디렉토리가 네 과업의 정본이다. 이 repo의 다른 경로(부모 repo, "
+                "다른 worktree)에 비슷하거나 더 최신인 코드가 보이더라도 그것은 네 "
+                "과업 대상이 아니다. 쓰기가 이 디렉토리로 제한되는 것은 하네스의 "
+                "격리 설계이지 구성 결함이 아니므로, 그걸 이유로 작업을 중단하지 "
+                "마라. 필요한 파일이 여기 없으면 여기서 만들면 된다.")
         # conversational=True는 대화형 role(BRAIN 인터뷰) 전용: provider 구조화 출력이
         # 매 turn을 JSON으로 강제하면 자연어 인터뷰가 불가능하므로 output_schema 주입만
         # 생략한다. role prompt/tool policy/cwd 강제는 그대로 유지된다. 최종 brief는
