@@ -101,6 +101,7 @@ class BrainSession:
     topic: str = ""
     owner: str = ""                   # 인터뷰를 시작한 Slack 사용자 — 명령 권한자
     transcript: list[str] = field(default_factory=list)
+    busy: bool = False                # turn/인계 진행 중 — 축출하면 그 turn이 죽는다
     handed_off: bool = False          # 직전 turn이 crew 인계였다 — 다음 발화에 재개 지시를 붙인다
     last_brief: dict | None = None    # 마지막으로 인계한 brief (다음 인계의 delta 기준)
     handoff_at: int = 0               # transcript 인덱스 — 이 뒤가 인계 이후의 논의
@@ -235,6 +236,7 @@ class BrainHandler:
         self._seen: set[str] = set()
         self._max_seen = max_seen
         self._opening: set[str] = set()      # 개시 진행 중인 스레드 (중복 spawn 방지)
+        self._finalizing: set[str] = set()   # 인계 진행 중인 스레드 (이중 발주 방지)
         self._explained: set[str] = set()    # 되살릴 수 없다고 이미 안내한 스레드
         self._lock = asyncio.Lock()          # 인터뷰 turn 직렬화 (세션당 동시 1 turn)
 
@@ -319,16 +321,17 @@ class BrainHandler:
         if cmd == "END":
             await self._close(sess, say)
             return
-        sess.transcript.append(f"[사용자] {scrub(text)}")
-        if cmd == "HANDOFF":
+        if cmd == "HANDOFF":           # 명령은 논의 내용이 아니다 — 대화록에 넣지 않는다
             await self._finalize(sess, say)
             return
+        sess.transcript.append(f"[사용자] {scrub(text)}")
         # 사용자 발화도 하네스 프레임을 위조할 수 있다 — 머리글만 무력화하고 내용은 둔다
         msg = scrub(text)
         if sess.handed_off:            # 인계 후 첫 발화 — 재개 맥락을 앞에 붙인다
             msg = RESUME_PREFIX.format(msg=fence("user-message", msg))
             sess.handed_off = False
         await self._set_status(sess.channel, sess.thread_ts, "생각 중…")
+        sess.busy = True
         try:
             async with self._lock:
                 adapter = self.orch.adapters[sess.inst.provider]
@@ -338,6 +341,8 @@ class BrainHandler:
             await say(text=f"💥 인터뷰 turn 실패: {type(e).__name__}: {e}",
                       thread_ts=sess.thread_ts)
             return
+        finally:
+            sess.busy = False
         sess.transcript.append(f"[brain] {scrub(out.text)}")
         await self._say_reply(say, sess, out.text, sess.thread_ts)
 
@@ -390,7 +395,7 @@ class BrainHandler:
             return None
         if not hs:
             return None
-        if cs and cs[-1]["ts"] >= hs[-1]["ts"]:
+        if cs and cs[-1]["id"] >= hs[-1]["id"]:
             return None                     # 종료 이후 — 새 인터뷰로 시작한다
         if time.time() - hs[-1]["ts"] > RESUME_MAX_AGE:
             return None                     # 너무 오래된 brief — 코드가 이미 변했다
@@ -433,7 +438,8 @@ class BrainHandler:
         죽이면 사용자에겐 답이 끊긴 스레드만 남고, 인계 기록이 없어 복구도 안 된다.
         인계 완료 세션만 대상이며 그건 trace의 brief로 되살릴 수 있다."""
         now = time.monotonic()
-        done = sorted((s for s in self.sessions.values() if s.last_brief is not None),
+        done = sorted((s for s in self.sessions.values()
+                       if s.last_brief is not None and not s.busy),
                       key=lambda s: s.touched)
         for sess in list(done):
             if now - sess.touched <= IDLE_TTL:
@@ -510,7 +516,8 @@ class BrainHandler:
             sess, text = await self._open_session(
                 thread_ts=thread_ts, channel=event.get("channel", ""), topic=topic,
                 repo_name=repo_name, seed_brief=seed,
-                owner=prior.get("owner") or user)
+                owner=prior.get("owner") or user,
+                user_text=topic if seed else None)
         finally:
             self._opening.discard(thread_ts)
         await self._say_reply(say, sess, text, thread_ts, first=True,
@@ -623,8 +630,29 @@ class BrainHandler:
 
         이미 한 번 넘긴 스레드의 재인계는 **delta만** 넘긴다 — 직전 brief를 기준으로
         그 뒤 논의에서 새로 정해진 것만 담아야 crew가 같은 일을 다시 하지 않는다."""
+        if sess.thread_ts in self._finalizing:
+            await say(text="⏳ 이미 brief를 정리해 crew에 넘기는 중입니다.",
+                      thread_ts=sess.thread_ts)
+            return
+        # 요약이 도는 동안 사용자가 덧붙인 말이 유실되지 않도록 인계 지점을 여기서 고정한다
+        mark = len(sess.transcript)
+        window = sess.transcript[sess.handoff_at:mark]
+        if sess.last_brief and not any(l.startswith("[사용자] ") for l in window):
+            await say(text="🙋 직전 인계 이후 새로 논의된 내용이 없습니다. 바꾸거나 더할 "
+                           "내용을 말씀해 주시면 그때 넘기겠습니다.", thread_ts=sess.thread_ts)
+            return
+        self._finalizing.add(sess.thread_ts)
+        sess.busy = True
+        try:
+            await self._do_finalize(sess, say, mark, window)
+        finally:
+            self._finalizing.discard(sess.thread_ts)
+            sess.busy = False
+
+    async def _do_finalize(self, sess: BrainSession, say, mark: int,
+                           window: list[str]) -> None:
         await self._set_status(sess.channel, sess.thread_ts, "brief 정리 중…")
-        delta = "\n".join(sess.transcript[sess.handoff_at:])
+        delta = "\n".join(window)
         intro = (DELTA_BRIEF_INTRO.format(
                     prev=fence("prior-brief", scrub(format_brief(sess.last_brief))),
                     delta=fence("thread-log", delta))
@@ -646,6 +674,10 @@ class BrainHandler:
                       thread_ts=sess.thread_ts)
             return
 
+        try:
+            self.orch.registry.finish(summ.instance_id)   # 1회용 요약 인스턴스 반납
+        except Exception:
+            pass
         brief = out.structured
         if not isinstance(brief, dict) or brief.get("status") != "PASS":
             reason = (brief or {}).get("summary", "구조화 출력 없음") if isinstance(brief, dict) else "구조화 출력 없음"
@@ -693,9 +725,21 @@ class BrainHandler:
                                             "channel": sess.channel})
         except Exception:
             pass                        # trace 실패가 인계를 막지 않는다 (복구만 포기)
-        sess.transcript.append(f"[crew 인계] {brief.get('goal', '')}")
+        marker = f"[crew 인계] {brief.get('goal', '')}"
+        sess.transcript.insert(mark, marker)   # 요약 중 들어온 발화는 다음 delta에 남는다
+        prev = (sess.last_brief, sess.handoff_at, sess.handed_off)
         sess.last_brief = brief
-        sess.handoff_at = len(sess.transcript)
+        sess.handoff_at = mark + 1
         sess.handed_off = True
         sess.touched = time.monotonic()
-        await self.crew_dispatch(task, sess.channel, link, handoff_text)
+        try:
+            await self.crew_dispatch(task, sess.channel, link, handoff_text)
+        except Exception as e:
+            # 게시·실행이 실패했는데 인계된 것처럼 두면 다음 '전달'이 빈 delta로 막힌다
+            sess.last_brief, sess.handoff_at, sess.handed_off = prev
+            try:
+                sess.transcript.remove(marker)
+            except ValueError:
+                pass
+            await say(text=f"💥 crew 인계에 실패했습니다: {type(e).__name__}. "
+                           "잠시 후 다시 '전달'해 주세요.", thread_ts=sess.thread_ts)

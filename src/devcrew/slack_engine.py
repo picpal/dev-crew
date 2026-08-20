@@ -283,6 +283,24 @@ class EngineRunner:
             return execution_id, result, where
 
 
+def slack_posters(brain_client, crew_client):
+    """핸드오프 게시(brain 봇) / crew 회신 게시(crew 봇) 어댑터.
+
+    _amain의 bolt 클로저 안에 있으면 테스트가 닿지 못한다 — 이 저장소는 그런 배선을
+    두 번 조용히 잃었다(2026-08-20). crew 회신은 **항상 고정된 root 스레드**로 간다:
+    호출자가 넘긴 thread_ts를 따르면 재인계 때 스레드가 갈라진다."""
+    async def post_handoff(channel: str, text: str, thread_ts) -> str:
+        resp = await brain_client.chat_postMessage(channel=channel, text=text,
+                                                   thread_ts=thread_ts)
+        return resp["ts"]
+
+    async def post_crew(channel: str, text: str, thread_ts: str, **kw):
+        return await crew_client.chat_postMessage(channel=channel, text=text,
+                                                  thread_ts=thread_ts, **kw)
+
+    return post_handoff, post_crew
+
+
 def make_crew_dispatch(post_handoff, post_crew, handler, roots: dict | None = None,
                        trace=None):
     """brain → crew 핸드오프 디스패처 (bolt 클라이언트와 분리된 순수 로직).
@@ -467,17 +485,9 @@ async def _amain() -> None:
 
         # 핸드오프는 채널에 게시하되 crew 실행은 in-process 직접 호출이다 — 봇 메시지의
         # 멘션 이벤트 전달은 보장이 없고, 전달되면 이중 실행이 된다.
-        async def post_handoff(channel: str, text: str, thread_ts) -> str:
-            resp = await brain_app.client.chat_postMessage(
-                channel=channel, text=text, thread_ts=thread_ts)
-            return resp["ts"]
-
-        async def post_crew(channel: str, text: str, thread_ts: str, **kw):
-            return await app.client.chat_postMessage(
-                channel=channel, text=text, thread_ts=thread_ts, **kw)
-
-        crew_dispatch = make_crew_dispatch(post_handoff, post_crew, handler,
-                                           trace=runner.orch.trace)
+        crew_dispatch = make_crew_dispatch(
+            *slack_posters(brain_app.client, app.client), handler,
+            trace=runner.orch.trace)
 
         async def brain_react(channel: str, ts: str) -> None:
             await brain_app.client.reactions_add(channel=channel, timestamp=ts, name="eyes")

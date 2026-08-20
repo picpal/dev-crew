@@ -1,4 +1,6 @@
 """slack_brain — 인터뷰 세션·핸드오프 로직 (FakeAdapter, LLM·Slack 없음)."""
+import asyncio
+
 import pytest
 
 from devcrew.adapters.base import FakeAdapter
@@ -166,7 +168,9 @@ async def test_mention_in_handed_off_thread_resumes_not_regrills(tmp_path):
     await h.on_mention(mention("<@U1> 이어서 문구 수정", ts="100.1", event_id="EvB2"), say)
     seeded = fake.initial_messages[-1]
     assert "이미 crew에 인계한 brief" in seeded
-    assert "직전 인계 이후 이어지는 논의" in fake.sent[-1][1]
+    # 멘션 본문이 곧 첫 발화 — 이미 말한 걸 다시 묻지 않는다
+    assert "이어서 문구 수정" in fake.sent[-1][1]
+    assert "인계 이후의 추가 논의" in fake.sent[-1][1]
 
 
 @pytest.mark.asyncio
@@ -634,3 +638,133 @@ async def test_close_records_failure_is_surfaced(tmp_path):
     h.orch.trace.append = boom
     await h.on_thread_message(u("EvS22", "종료"), say)
     assert any("종료 기록에 실패" in m["text"] for m in say.messages)
+
+
+# --- 정합성 리뷰 지적 수정에 대한 회귀 테스트 (2026-08-20) ------------------
+
+class GatedAdapter(FakeAdapter):
+    """특정 메시지에서 turn을 멈춰 세워 경합 구간을 재현하는 대역."""
+
+    def __init__(self, *a, gate_on: str = "", **kw):
+        super().__init__(*a, **kw)
+        self.gate_on, self.gate = gate_on, asyncio.Event()
+        self.reached = asyncio.Event()
+
+    async def send(self, session_id, message):
+        if self.gate_on and self.gate_on in (message or ""):
+            self.reached.set()
+            await self.gate.wait()
+        return await super().send(session_id, message)
+
+
+@pytest.mark.asyncio
+async def test_message_during_brief_generation_is_not_lost(tmp_path):
+    """요약이 도는 동안 덧붙인 결정이 어느 brief에도 안 들어가면 안 된다."""
+    import asyncio as aio
+    fake = GatedAdapter(script=["질문1", "질문2", "질문3", "질문4"],
+                        structured_script=[BRIEF_PASS] * 4,
+                        gate_on="최종 brief를 스키마대로")
+    orch = Orchestrator(TraceStore(tmp_path / "t.db"), SessionRegistry(tmp_path / "h.db"),
+                        {Provider.CLAUDE_CODE: fake, Provider.CODEX: fake})
+    h = BrainHandler(orch, load_config(), {}, DispatchSpy())
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    task = aio.create_task(h.on_thread_message(reply("전달", event_id="EvW1"), say))
+    await aio.wait_for(fake.reached.wait(), 2)
+    fake.gate.set()
+    await aio.wait_for(h.on_thread_message(reply("타임아웃은 30초로 하자", event_id="EvW2"), say), 2)
+    await aio.wait_for(task, 2)
+    sess = h.sessions["100.1"]
+    assert any("타임아웃" in l for l in sess.transcript[sess.handoff_at:])
+
+
+@pytest.mark.asyncio
+async def test_back_to_back_handoff_refuses_empty_delta(tmp_path):
+    h, dispatch, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvW3"), say)
+    await h.on_thread_message(reply("전달", event_id="EvW4"), say)
+    assert len(dispatch.calls) == 1
+    assert any("새로 논의된 내용이 없습니다" in m["text"] for m in say.messages)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_handoff_dispatches_once(tmp_path):
+    """사용자 발화와 리포트 폼 응답이 동시에 도착해도 crew를 두 번 발주하면 안 된다."""
+    import asyncio as aio
+    fake = GatedAdapter(script=["질문1", "질문2"], structured_script=[BRIEF_PASS] * 2,
+                        gate_on="최종 brief를 스키마대로")
+    orch = Orchestrator(TraceStore(tmp_path / "t.db"), SessionRegistry(tmp_path / "h.db"),
+                        {Provider.CLAUDE_CODE: fake, Provider.CODEX: fake})
+    dispatch = DispatchSpy()
+    h = BrainHandler(orch, load_config(), {}, dispatch)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    first = aio.create_task(h.on_thread_message(reply("전달", event_id="EvW5"), say))
+    await aio.wait_for(fake.reached.wait(), 2)
+    await aio.wait_for(h.on_thread_message(reply("전달해줘", event_id="EvW6"), say), 2)
+    fake.gate.set()
+    await aio.wait_for(first, 2)
+    assert len(dispatch.calls) == 1
+    assert any("넘기는 중입니다" in m["text"] for m in say.messages)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_failure_rolls_back_handoff_state(tmp_path):
+    """게시 실패를 인계 성공으로 두면 다음 '전달'이 빈 delta로 막힌다."""
+    class Boom:
+        async def __call__(self, *a):
+            raise RuntimeError("not_in_channel")
+
+    h, _, _ = make_handler(tmp_path, dispatch=Boom())
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvW7"), say)
+    sess = h.sessions["100.1"]
+    assert sess.last_brief is None and sess.handoff_at == 0    # 되돌아왔다
+    assert not any(l.startswith("[crew 인계]") for l in sess.transcript)
+    assert any("crew 인계에 실패" in m["text"] for m in say.messages)
+
+
+@pytest.mark.asyncio
+async def test_evict_skips_session_in_flight(tmp_path):
+    import asyncio as aio
+    import devcrew.slack_brain as sb
+    fake = GatedAdapter(script=["질문1", "질문2", "질문3"],
+                        structured_script=[BRIEF_PASS] * 3, gate_on="느린 답변")
+    orch = Orchestrator(TraceStore(tmp_path / "t.db"), SessionRegistry(tmp_path / "h.db"),
+                        {Provider.CLAUDE_CODE: fake, Provider.CODEX: fake})
+    h = BrainHandler(orch, load_config(), {}, DispatchSpy())
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(reply("전달", event_id="EvW8"), say)
+    turn = aio.create_task(h.on_thread_message(reply("느린 답변", event_id="EvW9"), say))
+    await aio.wait_for(fake.reached.wait(), 2)
+    h.sessions["100.1"].touched -= sb.IDLE_TTL + 1
+    await h._evict()
+    assert "100.1" in h.sessions                    # 진행 중인 turn을 끊지 않는다
+    fake.gate.set()
+    await aio.wait_for(turn, 2)
+
+
+@pytest.mark.asyncio
+async def test_close_ordering_uses_rowid_not_wall_clock(tmp_path):
+    """시계가 역행해도 '종료 이후'라는 사실이 뒤집히면 안 된다."""
+    h, _, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(owner_mention("<@U1> 결제 알림"), say)
+    await h.on_thread_message(u("EvW10", "전달"), say)
+    real = h.orch.trace.append
+
+    def back_in_time(event_type, **kw):
+        rowid = real(event_type, **kw)
+        h.orch.trace._con.execute("UPDATE events SET ts = 1.0 WHERE id = ?", (rowid,))
+        return rowid
+
+    h.orch.trace._con.execute("DROP TRIGGER events_no_update")
+    h.orch.trace.append = back_in_time
+    await h.on_thread_message(u("EvW11", "종료"), say)
+    h.orch.trace.append = real
+    await h.on_thread_message(u("EvW12", "이어서 하자"), say)
+    assert h.sessions == {}                          # 종료가 여전히 최신으로 인식된다

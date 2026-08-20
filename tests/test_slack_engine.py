@@ -521,3 +521,28 @@ async def test_crew_dispatch_drops_pin_after_interview_closed(tmp_path):
                  execution_id="BRAIN-100.1", payload={"topic": "끝"})
     await dispatch("작업2", "C1", "100.1", "brief2")
     assert posts == [None, None]                  # 새 인터뷰는 새 crew 스레드로
+
+
+@pytest.mark.asyncio
+async def test_slack_posters_route_and_pin_threads():
+    """_amain의 게시 어댑터 — 클로저 안에 두면 테스트가 못 닿는 자리였다."""
+    from devcrew.slack_engine import slack_posters
+
+    class Client:
+        def __init__(self, name):
+            self.name, self.calls = name, []
+
+        async def chat_postMessage(self, **kw):
+            self.calls.append(kw)
+            return {"ts": "500.1"}
+
+    brain, crew = Client("brain"), Client("crew")
+    post_handoff, post_crew = slack_posters(brain, crew)
+
+    assert await post_handoff("C1", "brief", None) == "500.1"
+    assert brain.calls[0]["thread_ts"] is None and crew.calls == []
+
+    await post_crew("C1", "결과", "500.1", blocks=[{"x": 1}])
+    assert crew.calls[0]["thread_ts"] == "500.1"          # crew 회신은 고정 root로
+    assert crew.calls[0]["blocks"] == [{"x": 1}]
+    assert len(brain.calls) == 1                          # 서로의 봇 토큰을 섞지 않는다
