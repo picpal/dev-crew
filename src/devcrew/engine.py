@@ -113,7 +113,7 @@ class NodeRuntime:
 
 @dataclass(frozen=True)
 class ExecutionResult:
-    status: str                  # COMPLETED | NEEDS_HUMAN | ABORTED
+    status: str                  # COMPLETED | NEEDS_HUMAN | ABORTED | STOPPED
     node_history: list[dict]     # [{node_id, transition, iteration}]
     decisions: int
     total_tokens: int
@@ -125,7 +125,12 @@ class ExecutionResult:
 
 class WorkflowEngine:
     def __init__(self, orch, cfg: HarnessConfig, *, template: WorkflowTemplate = DEFAULT_TEMPLATE,
-                 decide_fn=None, clock=time.monotonic):
+                 decide_fn=None, clock=time.monotonic, on_warning=None, stop_check=None):
+        """`on_warning`: async (warning: str) — 새 예산 경보가 생길 때마다 호출된다
+        (Slack이 중지 버튼과 함께 알리는 데 쓴다). `stop_check`: () -> bool —
+        노드 경계마다 확인해 True면 STOPPED로 협조적 종료한다. 진행 중인 에이전트
+        turn은 중간에 끊지 않는다 (worktree가 반쯤 쓰인 채 남는 것을 피한다).
+        """
         # ESCALATION_LADDER가 참조하는 모든 tier가 cfg에 존재하는지 init에서 검증
         # (fail-fast — 런타임 escalation 시점에 KeyError로 조용히 죽는 것을 방지)
         for src, dst in ESCALATION_LADDER.items():
@@ -137,6 +142,8 @@ class WorkflowEngine:
         self.template = template
         self.decide_fn = decide_fn
         self.clock = clock
+        self.on_warning = on_warning
+        self.stop_check = stop_check
 
     async def run(self, *, execution_id: str, task: str, worktree: str | None = None,
                   carry: dict | None = None) -> ExecutionResult:
@@ -199,11 +206,27 @@ class WorkflowEngine:
                 return f"{role_value} 예산 초과 ({used:,}/{limit:,})"
             return None
 
-        def note_budget_warnings() -> None:
+        def note_budget_warnings() -> list[str]:
+            """새로 생긴 경보만 반환 (이미 알린 것은 다시 알리지 않는다)."""
+            fresh = []
             for rv in sorted(role_tokens):
                 msg = over_budget(rv)
                 if msg and msg not in warnings:
                     warnings.append(msg)
+                    fresh.append(msg)
+            return fresh
+
+        async def emit_budget_warnings() -> None:
+            for msg in note_budget_warnings():
+                self.orch.trace.append(
+                    "BudgetWarningEvent", task_id=execution_id, execution_id=execution_id,
+                    instance_id=None, payload={"warning": msg,
+                                               "role_tokens": dict(role_tokens)})
+                if self.on_warning is not None:
+                    try:
+                        await self.on_warning(msg)
+                    except Exception:
+                        pass                    # 알림 실패가 실행을 막지 않는다
 
         def find_node(node_id: str | None) -> NodeRuntime | None:
             if node_id is None:
@@ -401,7 +424,7 @@ class WorkflowEngine:
             if elapsed > lp.max_duration_minutes * 60:
                 reasons.append(
                     f"경과 시간 초과 ({int(elapsed // 60)}분/{lp.max_duration_minutes}분)")
-            note_budget_warnings()      # role 예산은 경보만 — 종료시키지 않는다
+            await emit_budget_warnings()   # role 예산은 경보만 — 종료시키지 않는다
             accumulated_guard_exceeded = bool(reasons)
 
             local_loop_guard_exceeded = False
@@ -562,6 +585,10 @@ class WorkflowEngine:
         while True:
             if idx >= len(nodes):
                 return done("COMPLETED", "모든 노드 통과")
+            # 협조적 중지 — 노드 경계에서만 확인한다 (진행 중인 turn은 끝까지 둔다)
+            if self.stop_check is not None and self.stop_check():
+                path.append("STOPPED")
+                return done("STOPPED", "사용자가 실행을 중지했다")
             rt = nodes[idx]
             if rt.skipped:
                 path.append(f"{rt.spec.node_id}:SKIPPED")

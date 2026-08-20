@@ -18,16 +18,24 @@ class FakeResult:
 
 
 class FakeRunner:
-    def __init__(self, *, error: Exception | None = None, timeout: bool = False):
+    def __init__(self, *, error: Exception | None = None, timeout: bool = False,
+                 warnings: list[str] | None = None):
         self.error, self.timeout_flag = error, timeout
+        self.warnings = list(warnings or [])
+        self.stopped: list[str] = []
         self.timeout = 600.0
         self.busy = False
         self.calls: list[str] = []
         self.thread_keys: list = []
 
-    async def run(self, task: str, *, on_progress=None, thread_key=None):
+    def request_stop(self, execution_id: str) -> None:
+        self.stopped.append(execution_id)
+
+    async def run(self, task: str, *, on_progress=None, on_warning=None, thread_key=None):
         self.calls.append(task)
         self.thread_keys.append(thread_key)
+        for w in self.warnings:                       # 실행 중 예산 경보 재현
+            await on_warning("SLACK-1", w)
         if self.timeout_flag:
             raise asyncio.TimeoutError
         if self.error:
@@ -39,8 +47,8 @@ class SaySpy:
     def __init__(self):
         self.messages: list[dict] = []
 
-    async def __call__(self, *, text: str, thread_ts=None):
-        self.messages.append({"text": text, "thread_ts": thread_ts})
+    async def __call__(self, *, text: str, thread_ts=None, blocks=None):
+        self.messages.append({"text": text, "thread_ts": thread_ts, "blocks": blocks})
 
 
 def body(text: str, event_id: str = "Ev1", ts: str = "111.222") -> dict:
@@ -163,3 +171,128 @@ def test_format_result_renders_budget_warnings_separately_from_reason():
     assert text.startswith("✅ SLACK-3 COMPLETED")
     assert "⚠️ DEVELOPER 예산 초과 (700,000/600,000)" in text
     assert "사유: 모든 노드 통과" in text
+
+
+@pytest.mark.asyncio
+async def test_budget_warning_posts_stop_button_and_run_continues():
+    """예산 경보가 뜨면 중지 버튼이 달린 메시지를 스레드에 올리되, 실행은 계속돼
+    최종 결과가 그대로 회신된다 (경보 ≠ 종료)."""
+    from devcrew.slack_engine import STOP_ACTION
+    runner = FakeRunner(warnings=["DEVELOPER 예산 초과 (700,000/600,000)"])
+    say = SaySpy()
+    await MentionHandler(runner)(body("<@U123> t"), say)
+
+    warn_msg, final_msg = say.messages[0], say.messages[-1]
+    assert "예산 경보" in warn_msg["text"]
+    button = warn_msg["blocks"][-1]["elements"][0]
+    assert button["action_id"] == STOP_ACTION
+    assert button["value"] == "SLACK-1"
+    assert button["style"] == "danger"
+    assert warn_msg["thread_ts"] == "111.222"
+    assert "✅ SLACK-1 COMPLETED" in final_msg["text"]      # 실행은 완주했다
+
+
+def test_stop_blocks_and_stopped_blocks_shape():
+    from devcrew.slack_engine import STOP_ACTION, stop_blocks, stopped_blocks
+    blocks = stop_blocks("SLACK-7", "DEVELOPER 예산 초과 (1/0)")
+    assert blocks[0]["type"] == "section" and "SLACK-7" in blocks[0]["text"]["text"]
+    assert blocks[-1]["elements"][0]["action_id"] == STOP_ACTION
+    # 중지 요청 후에는 버튼이 사라진다 (중복 클릭 방지)
+    after = stopped_blocks("SLACK-7")
+    assert all(b["type"] != "actions" for b in after)
+    assert "중지 요청됨" in after[0]["text"]["text"]
+
+
+def test_format_result_stopped_icon():
+    @dataclass
+    class R:
+        status: str = "STOPPED"
+        node_history: list = field(default_factory=list)
+        decisions: int = 0
+        total_tokens: int = 1000
+        reason: str = "사용자가 실행을 중지했다"
+        path: list = field(default_factory=lambda: ["develop:PASS", "STOPPED"])
+        role_tokens: dict = field(default_factory=dict)
+        warnings: list = field(default_factory=list)
+
+    text = format_result("SLACK-4", R(), "/tmp/repo")
+    assert text.startswith("🛑 SLACK-4 STOPPED")
+    assert "사유: 사용자가 실행을 중지했다" in text
+
+
+# ---------------------------------------------------------------------------
+# EngineRunner 배선 회귀 고정 — 스레드 이월/중지가 실제로 엔진까지 전달되는가
+# (이 배선이 조용히 빠져도 엔진 단위 테스트는 전부 통과한다 — 여기서 잡는다)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_runner_reuses_workspace_and_carry_per_thread(tmp_path, monkeypatch):
+    import devcrew.decision as decision_mod
+    import devcrew.engine as engine_mod
+    from devcrew.slack_engine import EngineRunner
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("DEVCREW_TARGET_REPO", str(repo))
+
+    seen: list[dict] = []
+
+    class RecordingEngine:
+        def __init__(self, orch, cfg, **kw):
+            self.kw = kw
+
+        async def run(self, *, execution_id, task, worktree=None, carry=None):
+            seen.append({"execution_id": execution_id, "worktree": worktree,
+                         "carry": carry, "stop_check": self.kw.get("stop_check")})
+            carry["develop"] = {"inst": object(), "session_id": f"s-{execution_id}",
+                                "tier": "DEFAULT"}
+            return engine_mod.ExecutionResult("COMPLETED", [], 0, 0)
+
+    monkeypatch.setattr(engine_mod, "WorkflowEngine", RecordingEngine)
+    monkeypatch.setattr(decision_mod, "make_llm_decide", lambda *a, **k: None)
+
+    runner = EngineRunner(runtime_dir=tmp_path / "rt")
+    await runner.run("첫 요청", thread_key="T1")
+    await runner.run("이어서", thread_key="T1")
+    await runner.run("다른 스레드", thread_key="T2")
+
+    # 같은 스레드: 작업 공간과 carry(노드 세션)를 그대로 이어받는다
+    assert seen[0]["worktree"] == seen[1]["worktree"]
+    assert seen[1]["carry"] is seen[0]["carry"]
+    assert "develop" in seen[1]["carry"]
+    # 다른 스레드: 새 carry (앞 스레드 세션을 물려받지 않는다)
+    assert seen[2]["carry"] is not seen[0]["carry"]
+    assert seen[2]["carry"] == {"develop": seen[2]["carry"]["develop"]}
+    # execution_id는 요청마다 새로 발급된다
+    assert len({s["execution_id"] for s in seen}) == 3
+
+
+@pytest.mark.asyncio
+async def test_runner_stop_request_reaches_engine(tmp_path, monkeypatch):
+    import devcrew.decision as decision_mod
+    import devcrew.engine as engine_mod
+    from devcrew.slack_engine import EngineRunner
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("DEVCREW_TARGET_REPO", str(repo))
+    box: dict = {}
+
+    class RecordingEngine:
+        def __init__(self, orch, cfg, **kw):
+            self.kw = kw
+
+        async def run(self, *, execution_id, task, worktree=None, carry=None):
+            box["stop_check"] = self.kw["stop_check"]
+            box["before"] = self.kw["stop_check"]()
+            runner.request_stop(execution_id)                # 사용자가 버튼 클릭
+            box["after"] = self.kw["stop_check"]()
+            return engine_mod.ExecutionResult("STOPPED", [], 0, 0)
+
+    monkeypatch.setattr(engine_mod, "WorkflowEngine", RecordingEngine)
+    monkeypatch.setattr(decision_mod, "make_llm_decide", lambda *a, **k: None)
+
+    runner = EngineRunner(runtime_dir=tmp_path / "rt")
+    await runner.run("t", thread_key="T1")
+    assert box["before"] is False and box["after"] is True
+    assert runner._stop_requests == set()                    # 실행 종료 후 정리된다

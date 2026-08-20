@@ -693,3 +693,56 @@ async def test_run_without_carry_is_unchanged(tmp_path):
     await engine.run(execution_id="C4", task="t")
     await engine.run(execution_id="C5", task="t")
     assert len(dev.initial_messages) == 2
+
+
+# ---------------------------------------------------------------------------
+# 예산 경보 알림 + 협조적 중지 (사용자 결정 2026-08-20)
+# ---------------------------------------------------------------------------
+
+async def test_budget_warning_is_emitted_once_per_warning(tmp_path):
+    """새 경보가 생길 때만 on_warning이 불린다 (같은 경보를 매 노드 반복 알리지 않는다)."""
+    seen: list[str] = []
+
+    async def on_warning(w):
+        seen.append(w)
+
+    trace = TraceStore(tmp_path / "trace.db")
+    registry = SessionRegistry(tmp_path / "harness.db")
+    orch = Orchestrator(trace, registry, {
+        Provider.CLAUDE_CODE: FakeAdapter(structured_script=[PASS_DEV] * 3),
+        Provider.CODEX: FakeAdapter(structured_script=[FAIL_REVIEW, PASS_REVIEW])})
+    engine = WorkflowEngine(orch, _cfg_with(role_budgets={"DEVELOPER": 1}),
+                            template=SIM, on_warning=on_warning)
+    r = await engine.run(execution_id="W1", task="t")
+    assert r.status == "COMPLETED"
+    assert seen == ["DEVELOPER 예산 초과 (2/1)"]          # 3회 방문해도 1번만
+    assert r.warnings == seen
+    assert trace.events(event_type="BudgetWarningEvent")
+
+
+async def test_stop_check_stops_at_next_node_boundary(tmp_path):
+    """중지 요청은 노드 경계에서 반영된다 — 진행 중인 turn은 끝까지 두고 멈춘다."""
+    calls = {"n": 0}
+
+    def stop_check():
+        calls["n"] += 1
+        return calls["n"] > 1          # develop 완료 후 경계에서 True
+
+    trace = TraceStore(tmp_path / "trace.db")
+    registry = SessionRegistry(tmp_path / "harness.db")
+    dev = _Recording(structured_script=[PASS_DEV] * 3)
+    orch = Orchestrator(trace, registry, {
+        Provider.CLAUDE_CODE: dev,
+        Provider.CODEX: _Recording(structured_script=[PASS_REVIEW])})
+    engine = WorkflowEngine(orch, load_config(), template=SIM, stop_check=stop_check)
+    r = await engine.run(execution_id="S1", task="t")
+    assert r.status == "STOPPED"
+    assert r.reason == "사용자가 실행을 중지했다"
+    assert r.path == ["develop:PASS", "STOPPED"]     # develop은 끝까지 수행됐다
+    assert [h["node_id"] for h in r.node_history] == ["develop"]
+
+
+async def test_no_stop_check_runs_to_completion(tmp_path):
+    engine, _, _ = make_engine(tmp_path, [PASS_DEV], [PASS_REVIEW])
+    r = await engine.run(execution_id="S2", task="t")
+    assert r.status == "COMPLETED"
