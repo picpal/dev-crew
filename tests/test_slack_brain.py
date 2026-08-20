@@ -241,3 +241,28 @@ def test_question_blocks_preserves_paragraph_breaks():
     blocks = question_blocks(text, parse_options(text))
     ctx = blocks[1]["text"]["text"]
     assert "architectural\n\n맥락 설명입니다.\n\n*권장 이유:*" in ctx  # 빈 줄 보존
+
+
+def test_rediscuss_button_always_present():
+    from devcrew.slack_brain import REDISCUSS_VALUE, parse_options, question_blocks
+    text = "질문?\nA) 하나 (권장)\nB) 둘"
+    blocks = question_blocks(text, parse_options(text))
+    btns = next(b for b in blocks if b["type"] == "actions")["elements"]
+    assert btns[-1]["value"] == REDISCUSS_VALUE
+    assert btns[-1]["text"]["text"] == "🔄 재협의"
+
+
+@pytest.mark.asyncio
+async def test_rediscuss_keeps_buttons_and_deepens(tmp_path):
+    from devcrew.slack_brain import REDISCUSS_VALUE
+    h, _, _ = make_handler(tmp_path)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    stripped = []
+    async def strip():
+        stripped.append(True)
+    await h.on_answer(thread_ts="100.1", value=REDISCUSS_VALUE, say=say, strip=strip)
+    sess = h.sessions["100.1"]
+    assert stripped == []                                    # 버튼 유지
+    assert "[사용자] (재협의 요청)" in sess.transcript
+    assert "질문2" in say.messages[-1]["text"]               # 심화 논의 응답 발신

@@ -21,6 +21,12 @@ from .schema import AgentInstance, Role
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 _OPTION_RE = re.compile(r"^([A-Z])\)\s+(.+)$")
 ANSWER_MARKER = "\U0001F4E9 선택 답변:"     # 리포트 폼(worker)이 게시하는 답변 접두
+REDISCUSS_VALUE = "__REDISCUSS__"           # 재협의 버튼 sentinel
+REDISCUSS_PROMPT = (
+    "방금 질문에 대해 재협의를 요청한다. 선택지를 아직 고르지 않겠다. "
+    "이 질문의 배경, 각 선택지의 트레이드오프와 리스크, 혹시 빠뜨린 대안을 더 깊게 "
+    "설명하고, 내가 결정하는 데 필요한 판단 기준을 제시하라. 논의 후 같은 형식"
+    "(`A) 내용` 각 줄)으로 선택지를 다시(필요하면 수정해서) 제시하라.")
 HANDOFF_KEYWORD = "전달"
 TURN_TIMEOUT = 300.0
 REPORT_THRESHOLD = 500      # 이보다 긴 응답은 HTML 리포트 링크로 제공
@@ -96,6 +102,9 @@ def question_blocks(text: str, options: list[str], *, decided: int = 0) -> list[
         if "(권장)" in opt:
             btn["style"] = "primary"
         buttons.append(btn)
+    buttons.append({"type": "button", "action_id": "brain_answer_rediscuss",
+                    "text": {"type": "plain_text", "text": "🔄 재협의"},
+                    "value": REDISCUSS_VALUE})
     blocks.append({"type": "actions", "block_id": "brain_answers", "elements": buttons})
     progress = f" · 닫힌 결정 {decided}개" if decided else ""
     blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
@@ -184,6 +193,23 @@ class BrainHandler:
         if sess is None:
             await say(text="⚠️ 이 인터뷰 세션은 종료됐습니다. 새로 @brain 멘션으로 시작하세요.",
                       thread_ts=thread_ts)
+            return
+        if value == REDISCUSS_VALUE:
+            # 재협의: 버튼은 남겨둔다 — 논의 후 원 메시지에서 바로 선택 가능
+            sess.transcript.append("[사용자] (재협의 요청)")
+            await self._set_status(sess.channel, sess.thread_ts, "재협의 정리 중…")
+            try:
+                async with self._lock:
+                    adapter = self.orch.adapters[sess.inst.provider]
+                    out = await asyncio.wait_for(
+                        adapter.send(sess.session_id, REDISCUSS_PROMPT),
+                        timeout=TURN_TIMEOUT)
+            except Exception as e:
+                await say(text=f"💥 재협의 turn 실패: {type(e).__name__}: {e}",
+                          thread_ts=sess.thread_ts)
+                return
+            sess.transcript.append(f"[brain] {out.text}")
+            await self._say_reply(say, sess, out.text, sess.thread_ts)
             return
         if strip:
             try:
