@@ -232,3 +232,12 @@ def test_to_mrkdwn_conversion():
     assert "*범위 결정*" in out and "##" not in out
     assert "*핵심*은" in out and "**" not in out
     assert "- 항목1" in out and "`code`" in out
+
+
+def test_question_blocks_preserves_paragraph_breaks():
+    from devcrew.slack_brain import parse_options, question_blocks
+    text = ("요청 분류: architectural\n\n질문 1은 무엇으로 할까요?\n\n맥락 설명입니다.\n\n"
+            "A) 로컬 저장 (권장)\nB) 서버 동기화\n\n*권장 이유:* A가 요구에 맞음")
+    blocks = question_blocks(text, parse_options(text))
+    ctx = blocks[1]["text"]["text"]
+    assert "architectural\n\n맥락 설명입니다.\n\n*권장 이유:*" in ctx  # 빈 줄 보존

@@ -73,14 +73,16 @@ def question_blocks(text: str, options: list[str], *, decided: int = 0) -> list[
     head = next((l for l in non_empty if l.endswith("?")), non_empty[0] if non_empty else "질문")
     head = re.sub(r"[*_`]", "", head)[:150]
     option_set = set(options)
+    # 빈 줄(문단 구분)은 보존한다 — 섹션 구분 가독성 (사용자 피드백 2026-08-20)
     context_lines = [l for l in lines
-                     if l.strip() and l.strip() != head and l.strip() not in option_set
+                     if l.strip() != head and l.strip() not in option_set
                      and not _OPTION_RE.match(l.strip())]
+    context = re.sub(r"\n{3,}", "\n\n", "\n".join(context_lines)).strip()
     blocks: list[dict] = [
         {"type": "header", "text": {"type": "plain_text", "text": head}}]
-    if context_lines:
+    if context:
         blocks.append({"type": "section",
-                       "text": {"type": "mrkdwn", "text": "\n".join(context_lines)[:2900]}})
+                       "text": {"type": "mrkdwn", "text": context[:2900]}})
     blocks.append({"type": "divider"})
     detail = "\n".join(f"*{o[:2]}* {o[3:].strip()}" for o in options)
     blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": detail[:2900]}})
