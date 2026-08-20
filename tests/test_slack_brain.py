@@ -227,7 +227,7 @@ def test_brief_to_task_falls_back_to_session_repo():
 
 @pytest.mark.asyncio
 async def test_long_reply_becomes_report_link(tmp_path):
-    long_answer = "긴 검토 내용입니다. " * 60          # > REPORT_THRESHOLD
+    long_answer = "긴 검토 내용입니다. " * 400        # > REPLY_LIMIT (한 메시지 초과)
     trace_dir = tmp_path
     from devcrew.store.trace import TraceStore
     from devcrew.store.registry import SessionRegistry
@@ -768,3 +768,21 @@ async def test_close_ordering_uses_rowid_not_wall_clock(tmp_path):
     h.orch.trace.append = real
     await h.on_thread_message(u("EvW12", "이어서 하자"), say)
     assert h.sessions == {}                          # 종료가 여전히 최신으로 인식된다
+
+
+@pytest.mark.asyncio
+async def test_mid_length_prose_stays_in_slack(tmp_path):
+    """논의를 이어갈 산문은 링크가 아니라 본문으로 온다 — 링크는 결론 리포트의 신호다."""
+    prose = "이 부분은 이렇게 보는 게 맞습니다. " * 90          # ≈1,800자
+    fake = FakeAdapter(script=[prose], structured_script=[BRIEF_PASS])
+    orch = Orchestrator(TraceStore(tmp_path / "t.db"), SessionRegistry(tmp_path / "h.db"),
+                        {Provider.CLAUDE_CODE: fake, Provider.CODEX: fake})
+
+    def publish(task_id, html):                 # 호출되면 실패
+        raise AssertionError("인터뷰 답변을 리포트로 밀어냈다")
+
+    h = BrainHandler(orch, load_config(), {}, DispatchSpy(), publish=publish)
+    say = SaySpy()
+    await h.on_mention(mention("<@U1> 결제 알림"), say)
+    assert prose[:40] in say.messages[0]["text"]
+    assert "📄" not in say.messages[0]["text"]

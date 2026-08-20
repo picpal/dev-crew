@@ -41,7 +41,10 @@ _END_RE = re.compile(r"^\s*(?:인터뷰\s*|세션\s*)?종료(?:해\S{0,4}|하자
 IDLE_TTL = 6 * 3600.0        # 인계 완료 후 이만큼 방치되면 세션을 반납한다
 RESUME_MAX_AGE = 14 * 86400.0  # 이보다 오래된 인계는 seed로 되살리지 않는다 (코드가 변했다)
 TURN_TIMEOUT = 300.0
-REPORT_THRESHOLD = 500      # 이보다 긴 응답은 HTML 리포트 링크로 제공
+# HTML 리포트는 **결론 문서**(최종 brief) 자리다. 인터뷰 도중의 답변은 길든 짧든
+# Slack 본문으로 준다 — 링크가 오면 "읽고 넘어갈 결론", 본문이면 "이어서 답할 논의"로
+# 사용자가 한눈에 구분한다. 한 메시지에 못 담는 길이일 때만 링크로 흘린다.
+REPLY_LIMIT = 3000          # Slack 한 메시지에 담는 인터뷰 답변 상한
 MAX_SESSIONS = 50           # 초과 시 가장 오래된 인계 완료 세션부터 축출
 
 # 주입 방어: 아래 프레임 머리글/울타리는 하네스만 쓸 수 있다. 사용자·워커·brief에서 온
@@ -347,8 +350,11 @@ class BrainHandler:
         await self._say_reply(say, sess, out.text, sess.thread_ts)
 
     async def _with_report(self, sess: BrainSession, full_text: str) -> str:
-        """긴 응답은 HTML 리포트로 업로드하고 요약+링크를 반환. 실패·미설정 시 원문 유지."""
-        if len(full_text) < REPORT_THRESHOLD:
+        """한 메시지에 못 담는 답변만 HTML 리포트로 흘리고 요약+링크를 반환.
+
+        REPLY_LIMIT 이내면 원문 그대로다 — 논의를 이어갈 답변까지 링크로 보내면
+        매번 브라우저를 열어야 하고, 결론 리포트와 구분도 사라진다."""
+        if len(full_text) <= REPLY_LIMIT:
             return full_text
         try:
             html = render_reply(topic=sess.topic or "인터뷰", mode_hint="BRAIN 인터뷰",
