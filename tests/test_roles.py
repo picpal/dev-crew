@@ -92,7 +92,7 @@ def test_tutor_question_schema_is_strict_and_carries_evidence():
     assert q["additionalProperties"] is False
     assert set(q["required"]) == set(q["properties"])
     for key in ("area", "type", "stem", "options", "answer_index",
-                "evidence", "explanation", "diagram"):
+                "evidence", "explanation", "diagram", "source_key"):
         assert key in q["properties"]
     ev = q["properties"]["evidence"]["items"]
     assert set(ev["required"]) == {"path", "start_line", "end_line", "quote"}

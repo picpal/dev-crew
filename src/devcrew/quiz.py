@@ -70,17 +70,19 @@ def _evidence_of(raw) -> list[Evidence] | None:
 
 
 def parse_questions(raw: list[dict],
-                    carried_keys: dict[int, str] | None = None) -> list[Question]:
+                    allowed_keys: set[str] | None = None) -> list[Question]:
     """모델 출력 → 문항. 형태가 어긋난 항목은 조용히 버린다.
 
-    `carried_keys`는 재출제 문항의 **원래 키**다 (인덱스 → key). 키를 매번 재계산하면
-    인용 줄이 흔들리는 순간 오답 해소가 끊기므로, 이월된 키를 그대로 들고 다닌다.
+    재출제 문항은 `source_key`로 **원래 키를 이월**한다. 키를 매번 재계산하면 모델이
+    같은 지점을 40–52로 인용했다가 38–55로 인용하는 순간 오답 해소가 끊긴다.
+    다만 이월은 **하네스가 발급한 키**(`allowed_keys`)일 때만 받는다 — 모델이 키를
+    지어내도 남의 오답을 해소하지 못한다.
 
     근거가 **비어 있는** 문항은 여기서 버리지 않는다 — 인용 대조가 사유와 함께 버려야
     사용자에게 "왜 문항이 줄었는지" 설명할 수 있다."""
-    carried_keys = carried_keys or {}
+    allowed_keys = allowed_keys or set()
     out: list[Question] = []
-    for i, r in enumerate(raw or []):
+    for r in (raw or []):
         if not isinstance(r, dict):
             continue
         options, ev = r.get("options"), _evidence_of(r.get("evidence"))
@@ -97,7 +99,8 @@ def parse_questions(raw: list[dict],
         if not 0 <= idx < OPTION_COUNT:
             continue
         diagram = r.get("diagram")
-        carried = carried_keys.get(i)
+        src = r.get("source_key")
+        carried = src if isinstance(src, str) and src in allowed_keys else None
         out.append(Question(
             area=area, type=r["type"], stem=stem, options=[str(o) for o in options],
             answer_index=idx, evidence=ev, explanation=explanation,

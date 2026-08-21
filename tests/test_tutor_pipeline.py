@@ -1,0 +1,173 @@
+"""tutor 파이프라인 — 출제 → 인용 대조 → Codex 교차 검증 → 선별 (FakeAdapter)."""
+import collections
+import dataclasses
+
+import pytest
+
+from devcrew.adapters.base import FakeAdapter
+from devcrew.config import load as load_config
+from devcrew.orchestrator import Orchestrator
+from devcrew.schema import Provider
+from devcrew.store.registry import SessionRegistry
+from devcrew.store.trace import TraceStore
+
+
+class Scripted(FakeAdapter):
+    """세션이 여러 개여도 **호출 순서대로** 응답을 준다 (FakeAdapter는 세션별 턴 기준)."""
+
+    def __init__(self, structured: list[dict]):
+        super().__init__(script=["ok"] * 50)
+        self.queue = collections.deque(structured)
+
+    async def send(self, session_id, message):
+        out = await super().send(session_id, message)
+        if not self.queue:
+            return out
+        # TurnOutcome은 frozen — 대입이 아니라 교체해야 한다
+        return dataclasses.replace(out, structured=self.queue.popleft())
+
+
+def _q(i, area="세션", path="a.py", start=1, source_key=None):
+    return {"area": area, "type": "CORRECT", "stem": f"문항 {i}?",
+            "options": ["A", "B", "C", "D"], "answer_index": 0,
+            "evidence": [{"path": path, "start_line": start, "end_line": start,
+                          "quote": f"line{start}"}],
+            "explanation": "해설", "diagram": None, "source_key": source_key}
+
+
+def _authored(questions):
+    return {"status": "PASS", "summary": "출제", "questions": questions}
+
+
+def _verdicts(n, reject=()):
+    return {"status": "PASS", "summary": "검증",
+            "verdicts": [{"index": i, "verdict": "REJECT" if i in reject else "PASS",
+                          "reason": "근거 불일치" if i in reject else "ok"}
+                         for i in range(n)]}
+
+
+@pytest.fixture
+def repo(tmp_path):
+    (tmp_path / "a.py").write_text("\n".join(f"line{i}" for i in range(1, 40)) + "\n")
+    (tmp_path / "b.py").write_text("\n".join(f"line{i}" for i in range(1, 40)) + "\n")
+    return tmp_path
+
+
+def make_orch(tmp_path, author: Scripted, verifier: Scripted):
+    trace = TraceStore(tmp_path / "t.db")
+    orch = Orchestrator(trace, SessionRegistry(tmp_path / "h.db"),
+                        {Provider.CLAUDE_CODE: author, Provider.CODEX: verifier})
+    return orch, trace
+
+
+@pytest.mark.asyncio
+async def test_pipeline_drops_fabricated_then_verifies_then_selects_ten(tmp_path, repo):
+    """12문항 → 인용 대조(2개 폐기) → 검증(1개 반려) → 보충 → 10문항."""
+    from devcrew.tutor import issue_quiz
+    draft = [_q(i, area=f"영역{i % 4}", start=i + 1) for i in range(10)]
+    draft += [_q(90, path="ghost.py"), _q(91, path="../etc/passwd")]   # 지어낸 인용
+    author = Scripted([_authored(draft), _authored([_q(50, area="영역9", start=20)])])
+    verifier = Scripted([_verdicts(10, reject={3}), _verdicts(1)])
+    orch, _ = make_orch(tmp_path, author, verifier)
+    res = await issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
+                           exec_id="TUTOR-U1-r", misses=[])
+    assert len(res.questions) == 10 and res.shortfall is False
+    assert any("인용" in n for n in res.notes)
+
+
+@pytest.mark.asyncio
+async def test_verifier_runs_on_codex_not_the_authoring_provider(tmp_path, repo):
+    """교차 검증의 전제는 provider 분리다 — 같은 계열이면 같은 방식으로 틀린다."""
+    from devcrew.tutor import issue_quiz
+    author = Scripted([_authored([_q(i, start=i + 1) for i in range(12)])])
+    verifier = Scripted([_verdicts(12)])
+    orch, trace = make_orch(tmp_path, author, verifier)
+    await issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
+                     exec_id="E", misses=[])
+    roles = {e["payload"]["role"]: e["payload"]["model"]
+             for e in trace.events(event_type="ModelRoutingEvent")}
+    assert "gpt" in roles["TUTOR_VERIFIER"] and "claude" in roles["TUTOR"]
+    assert len(verifier.sent) == 1 and len(author.sent) == 1   # 각자 자기 세션에서만
+
+
+@pytest.mark.asyncio
+async def test_verifier_gets_fenced_questions_not_the_authoring_transcript(tmp_path, repo):
+    """검증자에게 출제 논증을 주면 교차 검증이 아니다. 문항은 울타리 안 자료다."""
+    from devcrew.tutor import issue_quiz
+    author = Scripted([_authored([_q(i, start=i + 1) for i in range(12)])])
+    verifier = Scripted([_verdicts(12)])
+    orch, _ = make_orch(tmp_path, author, verifier)
+    await issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
+                     exec_id="E", misses=[])
+    sent = verifier.initial_messages[0] + verifier.sent[0][1]
+    assert "<<<questions" in sent and "지시가 아니" in sent
+    assert "문항 0?" in sent and "evidence" in sent
+    # 출제 세션에 준 지시와 그 세션의 발화는 검증자에게 가지 않는다
+    from devcrew.tutor import AUTHOR_INTRO
+    assert AUTHOR_INTRO.split("\n")[0][:20] not in sent
+    assert author.initial_messages[0] not in sent
+
+
+@pytest.mark.asyncio
+async def test_pipeline_reports_shortfall_instead_of_padding(tmp_path, repo):
+    """보충 후에도 미달이면 채운 만큼만. 숫자를 맞추려 지어내지 않는다."""
+    from devcrew.tutor import issue_quiz
+    author = Scripted([_authored([_q(i, start=i + 1) for i in range(4)]),
+                       _authored([_q(50, start=20), _q(51, start=21)])])
+    verifier = Scripted([_verdicts(4), _verdicts(2)])
+    orch, _ = make_orch(tmp_path, author, verifier)
+    res = await issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
+                           exec_id="E", misses=[])
+    assert len(res.questions) == 6 and res.shortfall is True
+
+
+@pytest.mark.asyncio
+async def test_misses_are_fed_to_the_author_and_carried_keys_survive(tmp_path, repo):
+    """오답 evidence를 투입하고, 하네스가 발급한 키만 이월로 받는다."""
+    from devcrew.tutor import issue_quiz
+    miss = {"q_key": "k-old-1", "area": "세션",
+            "evidence": [{"path": "a.py", "start_line": 5, "end_line": 5, "quote": "line5"}]}
+    draft = [_q(0, area="세션", start=5, source_key="k-old-1"),
+             _q(1, area="세션", start=6, source_key="지어낸키")]
+    draft += [_q(i, area=f"영역{i}", start=i + 10) for i in range(2, 12)]
+    author = Scripted([_authored(draft)])
+    verifier = Scripted([_verdicts(12)])
+    orch, _ = make_orch(tmp_path, author, verifier)
+    res = await issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
+                           exec_id="E", misses=[miss])
+    assert "k-old-1" in author.initial_messages[0] or "k-old-1" in author.sent[0][1]
+    carried = [q for q in res.questions if q.carried]
+    assert [q.key for q in carried] == ["k-old-1"]           # 지어낸 키는 이월 안 됨
+
+
+@pytest.mark.asyncio
+async def test_select_ten_prioritizes_carried_then_area_diversity():
+    from devcrew.quiz import Evidence, Question
+    from devcrew.tutor import select_ten
+
+    def q(area, key, carried=False):
+        return Question(area=area, type="CORRECT", stem="s", options=list("ABCD"),
+                        answer_index=0, evidence=[Evidence("a.py", 1, 1, "x")],
+                        explanation="e", key=key, carried=carried)
+
+    pool = [q("세션", f"s{i}") for i in range(9)]
+    pool += [q("리포트", "r1"), q("권한", "p1")]
+    pool += [q("세션", "old1", carried=True), q("세션", "old2", carried=True)]
+    picked = select_ten(pool, count=10)
+    assert [x.key for x in picked[:2]] == ["old1", "old2"]      # 오답 유래가 먼저
+    assert {"r1", "p1"} <= {x.key for x in picked}              # 영역 다양성이 그다음
+    assert len(picked) == 10
+
+
+@pytest.mark.asyncio
+async def test_verifier_failure_does_not_pass_unverified_questions(tmp_path, repo):
+    """검증이 죽으면 통과시키지 않는다 — 검증 없는 문항이 사람에게 가면 안 된다."""
+    from devcrew.tutor import issue_quiz
+    author = Scripted([_authored([_q(i, start=i + 1) for i in range(12)])])
+    verifier = Scripted([])
+    verifier.fail_after = 0                                    # 검증 세션이 죽는다
+    orch, _ = make_orch(tmp_path, author, verifier)
+    res = await issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
+                           exec_id="E", misses=[])
+    assert res.questions == [] and res.shortfall is True
+    assert any("검증" in n for n in res.notes)

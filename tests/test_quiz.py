@@ -37,9 +37,18 @@ def test_q_key_is_order_independent():
 def test_carried_key_survives_reissue():
     """재출제 문항은 원래 키를 유지한다 — 인용 줄이 흔들려도 오답이 해소된다."""
     from devcrew.quiz import parse_questions
-    q = parse_questions([_q(start=38)], carried_keys={0: "deadbeef1234"})[0]
+    raw = _q(start=38); raw["source_key"] = "deadbeef1234"
+    q = parse_questions([raw], allowed_keys={"deadbeef1234"})[0]
     assert q.key == "deadbeef1234"
     assert q.carried is True
+
+
+def test_unissued_source_key_is_ignored():
+    """하네스는 **자기가 발급한 키만** 수용한다 — 모델이 키를 지어내도 무해하다."""
+    from devcrew.quiz import parse_questions, q_key
+    raw = _q(start=38); raw["source_key"] = "지어낸키"
+    q = parse_questions([raw], allowed_keys={"deadbeef1234"})[0]
+    assert q.carried is False and q.key == q_key(q.area, q.evidence)
 
 
 def test_parse_questions_drops_malformed():
