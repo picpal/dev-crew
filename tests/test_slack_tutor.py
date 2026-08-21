@@ -279,7 +279,7 @@ async def test_grading_failure_leaves_the_round_retryable(tmp_path, repo):
     h, trace, pub = make_handler(tmp_path, repo)
     say = SaySpy()
     await h.on_mention(mention(), say)
-    h.orch.trace = FlakyTrace(trace, "QuizMissEvent")
+    h.orch.trace = FlakyTrace(trace, "QuizGradedEvent")
     await answer_all(h, say, correct=8)                   # 2문항 오답 → miss 기록 실패
     assert h.sessions["100.1"].done is False              # 재시도 가능해야 한다
     assert pub == []
@@ -298,7 +298,7 @@ async def test_regrade_is_owner_only(tmp_path, repo):
     h, trace, pub = make_handler(tmp_path, repo)
     say = SaySpy()
     await h.on_mention(mention(), say)
-    h.orch.trace = FlakyTrace(trace, "QuizMissEvent")
+    h.orch.trace = FlakyTrace(trace, "QuizGradedEvent")
     await answer_all(h, say, correct=8)
     await h.on_answer(thread_ts="100.1", value=REGRADE_VALUE, say=say,
                       user="U-STRANGER", channel="C1")

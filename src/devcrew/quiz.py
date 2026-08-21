@@ -84,8 +84,8 @@ def _origin_slots(origin) -> dict[str, set[tuple[str, int]]]:
 
 
 def parse_questions(raw: list[dict],
-                    allowed_keys: set[str] | dict[str, list[dict]] | None = None
-                    ) -> list[Question]:
+                    allowed_keys: dict[str, list[dict]] | None = None,
+                    *, trusted_keys: set[str] | None = None) -> list[Question]:
     """모델 출력 → 문항. 형태가 어긋난 항목은 조용히 버린다.
 
     재출제 문항은 `source_key`로 **원래 키를 이월**한다. 키를 매번 재계산하면 모델이
@@ -96,6 +96,7 @@ def parse_questions(raw: list[dict],
     근거가 **비어 있는** 문항은 여기서 버리지 않는다 — 인용 대조가 사유와 함께 버려야
     사용자에게 "왜 문항이 줄었는지" 설명할 수 있다."""
     slots = _origin_slots(allowed_keys)
+    trusted = trusted_keys or set()
     out: list[Question] = []
     for r in (raw or []):
         if not isinstance(r, dict):
@@ -118,7 +119,11 @@ def parse_questions(raw: list[dict],
         # 문항이 남의 오답을 해소해 노트가 의미를 잃는다 (Codex 리뷰 2026-08-21).
         src = r.get("source_key")
         carried = None
-        if isinstance(src, str) and src in slots:
+        if isinstance(src, str) and src in trusted:
+            # 하네스가 저장한 회차의 복원 — 모델의 주장이 아니라 우리가 쓴 값이다.
+            # 여기서 대조를 요구하면 재개할 때마다 이월이 끊긴다 (Codex 3차 리뷰).
+            carried = src
+        elif isinstance(src, str) and src in slots:
             want = slots[src]
             here = {(e.path, e.start_line) for e in ev}
             # 원래 근거를 **전부** 다시 인용했을 때만 승계한다. 일부만 겹쳐도 받으면
@@ -223,8 +228,7 @@ def grade(questions: list[Question], answers: dict[int, int]) -> Scorecard:
 
 
 # ── 오답 노트 (trace 이벤트) ────────────────────────────────────────────────
-MISS_EVENT = "QuizMissEvent"
-CLEARED_EVENT = "QuizClearedEvent"
+GRADED_EVENT = "QuizGradedEvent"   # 회차 채점 결과 — 오답·해소를 한 이벤트에 담는다
 ISSUED_EVENT = "QuizIssuedEvent"
 ANSWER_EVENT = "QuizAnswerEvent"
 
@@ -235,7 +239,7 @@ def note_id(user: str, repo: str) -> str:
 
 
 def open_misses(trace, exec_id: str) -> list[dict]:
-    """지금 열려 있는 오답 — miss 뒤에 같은 key의 clear가 **없는** 것.
+    """지금 열려 있는 오답 — 회차 이벤트를 id 순서로 접어 남는 것.
 
     trace는 append-only라 상태가 아니라 이력이다. 벽시계가 아니라 **id 순서**로 접는다
     (같은 초에 여러 이벤트가 들어오면 ts로는 순서가 갈리지 않는다)."""
@@ -245,13 +249,14 @@ def open_misses(trace, exec_id: str) -> list[dict]:
         raise NoteUnavailable(str(e)) from e
     state: dict[str, dict] = {}
     for e in sorted(evs, key=lambda e: e["id"]):
-        key = (e.get("payload") or {}).get("q_key")
-        if not key:
+        if e["event_type"] != GRADED_EVENT:
             continue
-        if e["event_type"] == MISS_EVENT:
-            state[key] = e["payload"]
-        elif e["event_type"] == CLEARED_EVENT:
+        payload = e.get("payload") or {}
+        for key in payload.get("cleared") or []:
             state.pop(key, None)
+        for miss in payload.get("missed") or []:
+            if miss.get("q_key"):
+                state[miss["q_key"]] = miss
     return list(state.values())
 
 
@@ -259,22 +264,22 @@ def record_scorecard(trace, exec_id: str, card: Scorecard,
                      prior_keys: set[str]) -> tuple[int, int]:
     """채점 결과를 오답 노트에 반영한다. 반환: (새 오답 수, 해소 수).
 
-    해소는 **이전에 열려 있던 문항을 맞혔을 때만** 기록한다. 처음 맞힌 문항까지
-    clear로 남기면 이력이 의미를 잃는다."""
-    added = cleared = 0
-    for r in card.results:
-        k = r.question.key
-        if not r.correct:
-            trace.append(MISS_EVENT, task_id=exec_id, execution_id=exec_id,
-                         payload={"q_key": k, "area": r.question.area,
-                                  "stem": r.question.stem,
-                                  "evidence": [vars(e) for e in r.question.evidence]})
-            added += 1
-        elif k in prior_keys:
-            trace.append(CLEARED_EVENT, task_id=exec_id, execution_id=exec_id,
-                         payload={"q_key": k, "area": r.question.area})
-            cleared += 1
-    return added, cleared
+    **회차 하나 = 이벤트 하나.** 문항별로 쪼개 쓰면 중간에 실패했을 때 부분 반영이
+    남고, 재시도가 그 위에 겹쳐 상태가 갈린다. 한 번의 append는 한 번의 커밋이라
+    전부 쓰이거나 전혀 안 쓰이며, 같은 내용을 다시 써도 접은 결과가 같다
+    (Codex 3차 리뷰 2026-08-21).
+
+    해소는 **이전에 열려 있던 문항을 맞혔을 때만** 센다. 처음 맞힌 문항까지 clear로
+    남기면 이력이 의미를 잃는다."""
+    missed = [{"q_key": r.question.key, "area": r.question.area,
+               "stem": r.question.stem,
+               "evidence": [vars(e) for e in r.question.evidence]}
+              for r in card.results if not r.correct]
+    cleared = [r.question.key for r in card.results
+               if r.correct and r.question.key in prior_keys]
+    trace.append(GRADED_EVENT, task_id=exec_id, execution_id=exec_id,
+                 payload={"missed": missed, "cleared": cleared})
+    return len(missed), len(cleared)
 
 
 def to_raw(q: Question) -> dict:
@@ -291,4 +296,4 @@ def to_raw(q: Question) -> dict:
 def from_raw(raws: list[dict]) -> list[Question]:
     """`to_raw`의 역 — 저장된 회차를 복원한다. 키는 저장된 것을 그대로 쓴다."""
     keys = {r.get("source_key") for r in (raws or []) if isinstance(r, dict)}
-    return parse_questions(raws, allowed_keys={k for k in keys if isinstance(k, str)})
+    return parse_questions(raws, trusted_keys={k for k in keys if isinstance(k, str)})

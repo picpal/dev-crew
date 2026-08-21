@@ -119,11 +119,14 @@ execution_id = TUTOR-{slack_user}-{repo_name}
 |---|---|---|
 | `QuizIssuedEvent` | 출제 확정 | 문항 세트 전체 (세션 유실 후 재개의 근거) |
 | `QuizAnswerEvent` | 답변마다 | `{q_key, choice, correct}` |
-| `QuizMissEvent` | 채점 시 오답 | `{q_key, area, evidence}` |
-| `QuizClearedEvent` | 채점 시 오답 문항 정답 | `{q_key}` |
+| `QuizGradedEvent` | 채점 완료 | `{missed: [{q_key, area, stem, evidence}], cleared: [q_key]}` |
 
-**현재 오답 = `QuizMissEvent` 중 그 뒤에 같은 `q_key`의 `QuizClearedEvent`가 없는 것.**
-id 순서로 판정한다 (벽시계가 아니라 rowid — brain의 `_prior_handoff`가 같은 이유로 그렇게 한다).
+**회차 하나 = 이벤트 하나.** 문항별로 쪼개 쓰면 중간 실패가 부분 반영을 남기고, 재시도가 그 위에
+겹쳐 상태가 갈린다. 한 번의 append는 한 번의 커밋이라 전부 쓰이거나 전혀 안 쓰이고, 같은 내용을
+다시 써도 접은 결과가 같다 — 재채점이 멱등해진다.
+
+**현재 오답 = 회차 이벤트를 id 순서로 접어(`cleared` 제거 → `missed` 추가) 남는 것.**
+벽시계가 아니라 rowid로 접는다 — brain의 `_prior_handoff`가 같은 이유로 그렇게 한다.
 
 ### 문항 동일성 키
 

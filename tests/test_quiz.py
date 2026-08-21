@@ -144,13 +144,21 @@ def test_grade_area_percentages():
 
 
 # ── Task 5: 오답 노트 ───────────────────────────────────────────────────────
+def _graded(t, missed=(), cleared=(), exec_id="E"):
+    from devcrew.quiz import GRADED_EVENT
+    t.append(GRADED_EVENT, task_id="T", execution_id=exec_id,
+             payload={"missed": [{"q_key": k, "area": "세션"} for k in missed],
+                      "cleared": list(cleared)})
+
+
 def test_miss_clear_miss_leaves_the_miss_open(tmp_path):
-    """해소 후 다시 틀리면 다시 열린다 — 벽시계가 아니라 rowid 순서로 판정한다."""
+    """해소 후 다음 회차에서 다시 틀리면 다시 열린다 — id 순서로 접는다."""
     from devcrew.quiz import open_misses
     from devcrew.store.trace import TraceStore
     t = TraceStore(tmp_path / "t.db")
-    for et in ("QuizMissEvent", "QuizClearedEvent", "QuizMissEvent"):
-        t.append(et, task_id="T", execution_id="E", payload={"q_key": "k1", "area": "세션"})
+    _graded(t, missed=["k1"])
+    _graded(t, cleared=["k1"])
+    _graded(t, missed=["k1"])
     assert [m["q_key"] for m in open_misses(t, "E")] == ["k1"]
 
 
@@ -158,9 +166,8 @@ def test_cleared_after_miss_removes_it(tmp_path):
     from devcrew.quiz import open_misses
     from devcrew.store.trace import TraceStore
     t = TraceStore(tmp_path / "t.db")
-    t.append("QuizMissEvent", task_id="T", execution_id="E", payload={"q_key": "k1"})
-    t.append("QuizMissEvent", task_id="T", execution_id="E", payload={"q_key": "k2"})
-    t.append("QuizClearedEvent", task_id="T", execution_id="E", payload={"q_key": "k1"})
+    _graded(t, missed=["k1", "k2"])
+    _graded(t, cleared=["k1"])
     assert [m["q_key"] for m in open_misses(t, "E")] == ["k2"]
 
 
@@ -256,3 +263,31 @@ def test_carry_is_refused_when_the_original_evidence_is_unknown():
     from devcrew.quiz import parse_questions
     raw = _q(); raw["source_key"] = "k"
     assert parse_questions([raw], allowed_keys={"k": []})[0].carried is False
+
+
+def test_restored_round_keeps_its_carried_keys(tmp_path):
+    """재개는 하네스가 저장한 회차를 되살리는 것이다 — 모델의 이월 주장과 달리
+    다시 대조할 대상이 없다. 여기서 키를 재계산하면 오답 해소가 끊긴다."""
+    from devcrew.quiz import Question, from_raw, to_raw
+    from devcrew.quiz import Evidence
+    q = Question(area="세션", type="CORRECT", stem="s", options=list("ABCD"),
+                 answer_index=0, evidence=[Evidence("a.py", 38, 40, "x")],
+                 explanation="e", key="k-old", carried=True)
+    back = from_raw([to_raw(q)])[0]
+    assert back.key == "k-old" and back.carried is True
+
+
+def test_grading_is_one_atomic_event_so_retry_is_idempotent(tmp_path):
+    """문항별로 쪼개 기록하면 중간 실패 후 재시도가 부분 반영 위에 겹친다.
+    회차 하나 = 이벤트 하나여야 재시도가 같은 상태로 수렴한다."""
+    from devcrew.quiz import grade, open_misses, parse_questions, record_scorecard
+    from devcrew.store.trace import TraceStore
+    t = TraceStore(tmp_path / "t.db")
+    qs = parse_questions([_q(area="세션", answer_index=0, path="a.py", start=1),
+                          _q(area="세션", answer_index=0, path="a.py", start=9)])
+    card = grade(qs, {0: 1, 1: 1})                       # 둘 다 오답
+    first = record_scorecard(t, "E", card, prior_keys=set())
+    assert len(t.events(execution_id="E")) == 1          # 회차 하나 = 이벤트 하나
+    again = record_scorecard(t, "E", card, prior_keys=set())
+    assert first == again
+    assert sorted(m["q_key"] for m in open_misses(t, "E")) == sorted(q.key for q in qs)
