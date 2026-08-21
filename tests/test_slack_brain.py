@@ -272,6 +272,82 @@ def test_md_lite_escapes_and_structures():
     assert "<script>" not in out and "&lt;script&gt;" in out
 
 
+def test_md_lite_merges_consecutive_quote_lines():
+    """줄마다 blockquote를 열면 한 문단짜리 인용이 테두리 여러 개로 쪼개져
+    서로 다른 인용처럼 보였다. 연속한 `> ` 줄은 blockquote 하나여야 한다."""
+    from devcrew.report.brain_report import md_lite
+    out = md_lite("> 첫 줄\n> 둘째 줄\n\n본문\n\n> 별개 인용")
+    assert out.count("<blockquote>") == 2          # 붙은 두 줄 + 떨어진 하나
+    quote = out.split("</blockquote>")[0]
+    assert "첫 줄" in quote and "둘째 줄" in quote  # 같은 덩어리 안에
+
+
+def test_report_lets_every_variable_length_text_wrap():
+    """줄바꿈 지점이 없는 100자 브랜치명·URL이 들어오면 문서가 가로로 늘어나
+    320px에서 본문이 화면 밖으로 나갔다 (h1/meta/li/p 전부). 실측: 7개 샘플 ×
+    5개 폭 중 20개 조합에서 가로 넘침 → 0."""
+    from devcrew.report.brain_report import render_brief, render_reply
+    long_token = "wt/tutor-" + "a1b2c3d4e5" * 10
+    for html in (
+        render_reply(topic=long_token, mode_hint="심층", repo=long_token,
+                     text=f"- {long_token}"),
+        render_brief(brief={"status": "PASS", "goal": long_token,
+                            "summary": long_token, "decisions": [long_token]},
+                     repo=long_token),
+    ):
+        css = html.split("<style>")[1].split("</style>")[0]
+        for sel in ("h1{", ".where{", ".lede{", ".items li{",
+                    ".prose p{", ".prose li{", "code{"):
+            rule = css.split(sel)[1].split("}")[0]
+            assert "overflow-wrap:anywhere" in rule, sel
+        assert "overflow-x:auto" in css.split("pre{")[1].split("}")[0]
+
+
+def test_unknown_brief_status_is_not_painted_as_a_warning():
+    """PASS가 아니면 무조건 blocked(주황) 배지를 달아, 알 수 없는 status까지
+    막힌 것처럼 보였다. 색은 아는 값에만 쓴다."""
+    from devcrew.report.brain_report import render_brief
+    def badge(status):
+        html = render_brief(brief={"status": status, "goal": "g"}, repo=None)
+        return html.split('<span class="badge')[1].split(">")[0]
+    assert "is-pass" in badge("PASS")
+    assert "is-blocked" in badge("BLOCKED")
+    assert badge("NEEDS_INPUT").strip() == '"'      # 추가 클래스 없음
+    assert badge("?").strip() == '"'
+
+
+def test_report_title_is_not_repeated_in_the_meta_line():
+    """h1과 바로 밑 메타 줄이 같은 문장을 두 번 찍었다 — 두 번째는 정보가
+    아니라 소음이고, 긴 주제에서는 화면 두 줄을 통째로 잡아먹었다."""
+    from devcrew.report.brain_report import render_brief, render_reply
+    topic = "결제 승인·취소 알림을 슬랙으로 옮긴다"
+    assert render_reply(topic=topic, mode_hint="심층", repo="o/r",
+                        text="본문").count(topic) == 2   # <title> + <h1>
+    assert render_brief(brief={"status": "PASS", "goal": topic},
+                        repo="o/r").count(topic) == 2
+
+
+def test_empty_brief_summary_leaves_no_empty_paragraph():
+    """summary가 비면 <p></p>가 그대로 나가 헤더와 첫 섹션 사이에 정체 모를
+    빈 줄이 생겼다. 섹션이 하나도 없으면 안내 문구를 낸다."""
+    from devcrew.report.brain_report import render_brief
+    html = render_brief(brief={"status": "BLOCKED", "goal": "g",
+                               "summary": "", "constraints": ["c"]}, repo=None)
+    assert "<p></p>" not in html and 'class="lede"' not in html
+    assert 'class="empty"' in render_brief(brief={}, repo=None)
+
+
+def test_report_defines_dark_tokens_of_its_own():
+    """라이트 전용 고정색이라 다크 환경에서 흰 판이 그대로 떴다. quiz 리포트와
+    같은 토큰 팔레트를 쓰고 color-scheme을 선언한다."""
+    from devcrew.report.brain_report import TEMPLATE_VERSION, render_brief
+    html = render_brief(brief={"status": "PASS", "goal": "g"}, repo=None)
+    assert '<meta name="color-scheme" content="light dark">' in html
+    assert "@media (prefers-color-scheme:dark)" in html
+    assert "text-transform:uppercase" not in html   # 한글에 효과 없음
+    assert TEMPLATE_VERSION == "brain-2"            # 구조가 바뀌면 올린다
+
+
 def test_parse_options_and_blocks():
     from devcrew.slack_brain import parse_options, question_blocks
     text = "범위를 정하죠.\nA) 최소 범위 (권장)\nB) 전체 재설계\n이유: ..."
@@ -875,3 +951,11 @@ async def test_badge_falls_back_when_adapter_cannot_measure(tmp_path):
     say = SaySpy()
     await h.on_mention(mention("<@U1> 결제 알림"), say)
     assert not say.messages[0]["text"].startswith("[context")
+
+
+def test_code_block_does_not_open_with_a_blank_line():
+    """`<pre>`는 여는 태그 직후 개행 하나를 무시하지만 `<pre><code>`에서는 그 규칙이
+    `code`에 걸려 코드 블록 첫 줄이 빈 줄로 보인다 (실물 확인 2026-08-21)."""
+    from devcrew.report.brain_report import md_lite
+    out = md_lite("앞\n```\ncode line\n```\n뒤")
+    assert "<pre><code>code line</code></pre>" in out
