@@ -631,3 +631,59 @@ def test_format_result_puts_context_badge_on_top():
 
     quiet = dataclasses.replace(r, context_used=100_000)
     assert not format_result("SLACK-9", quiet, "/tmp/wt").startswith("[context")
+
+
+# ── @tutor 배선 (lessons.md C1: 클로저 안 배선은 테스트가 닿지 않는다) ──────
+def test_tutor_action_routes_button_value_to_handler():
+    """버튼 클릭 → 핸들러로 (thread, value, user)가 흐르는지. 배선이 유실되면 잡힌다."""
+    import asyncio
+
+    from devcrew.slack_engine import make_tutor_action
+
+    seen = {}
+
+    class H:
+        async def on_answer(self, *, thread_ts, value, say, strip=None,
+                            channel="", user=""):
+            seen.update(thread_ts=thread_ts, value=value, channel=channel, user=user)
+            await strip()
+
+    updated = []
+
+    class Client:
+        async def chat_update(self, **kw):
+            updated.append(kw)
+
+        async def chat_postMessage(self, **kw):
+            return kw
+
+    handler = make_tutor_action(H(), Client())
+    body = {"channel": {"id": "C9"}, "user": {"id": "U7"},
+            "message": {"ts": "50.1", "thread_ts": "40.1", "text": "문항 3?"},
+            "actions": [{"value": "2:1"}]}
+    asyncio.run(handler(body))
+    assert seen == {"thread_ts": "40.1", "value": "2:1", "channel": "C9", "user": "U7"}
+    assert updated and "✅ 선택: B" in updated[0]["text"]     # 고른 보기가 남는다
+
+
+def test_tutor_action_marks_the_chosen_option_letter():
+    import asyncio
+
+    from devcrew.slack_engine import make_tutor_action
+
+    class H:
+        async def on_answer(self, *, thread_ts, value, say, strip=None,
+                            channel="", user=""):
+            await strip()
+
+    updated = []
+
+    class Client:
+        async def chat_update(self, **kw):
+            updated.append(kw)
+
+    asyncio.run(make_tutor_action(H(), Client())(
+        {"channel": {"id": "C1"}, "user": {"id": "U1"},
+         "message": {"ts": "1.1", "thread_ts": "1.0", "text": "q"},
+         "actions": [{"value": "0:3"}]}))
+    assert "✅ 선택: D" in updated[0]["text"]

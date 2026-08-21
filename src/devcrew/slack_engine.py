@@ -362,6 +362,33 @@ def slack_posters(brain_client, crew_client):
     return post_handoff, post_crew
 
 
+def make_tutor_action(tutor, client):
+    """@tutor 버튼 클릭 핸들러. **클로저 밖**에 둔다 — `_amain` 안에 두면 배선이
+    통째로 사라져도 테스트가 전부 초록이다 (lessons.md C1).
+
+    고른 보기를 원 메시지에 남기고 버튼은 걷는다. 정오는 표시하지 않는다 —
+    채점은 회차 끝에 한 번에 한다."""
+    async def on_action(body: dict) -> None:
+        ch = body["channel"]["id"]
+        msg = body.get("message") or {}
+        thread = msg.get("thread_ts") or msg.get("ts")
+        value = body["actions"][0]["value"]
+
+        async def say(*, text, thread_ts=None, blocks=None):
+            return await client.chat_postMessage(
+                channel=ch, text=text, thread_ts=thread_ts or thread, blocks=blocks)
+
+        async def strip():
+            letter = chr(65 + int(value.split(":")[1])) if ":" in value else "?"
+            await client.chat_update(
+                channel=ch, ts=msg["ts"], blocks=[],
+                text=(msg.get("text") or "문항")[:2800] + f"\n\n✅ 선택: {letter}")
+
+        await tutor.on_answer(thread_ts=thread, value=value, say=say, strip=strip,
+                              channel=ch, user=(body.get("user") or {}).get("id", ""))
+    return on_action
+
+
 def make_crew_dispatch(post_handoff, post_crew, handler, roots: dict | None = None,
                        trace=None):
     """brain → crew 핸드오프 디스패처 (bolt 클라이언트와 분리된 순수 로직).
@@ -612,6 +639,45 @@ async def _amain() -> None:
 
         tasks.append(AsyncSocketModeHandler(brain_app, brain_app_token).start_async())
         print("devcrew: @brain 인터뷰 앱 활성화")
+
+    tutor_bot = _real_token(os.environ.get("TUTOR_BOT_TOKEN"), "xoxb-")
+    tutor_app_token = _real_token(os.environ.get("TUTOR_APP_TOKEN"), "xapp-")
+    if tutor_bot and tutor_app_token:
+        from .slack_tutor import TutorHandler
+
+        tutor_app = AsyncApp(token=tutor_bot)
+
+        async def tutor_react(channel: str, ts: str) -> None:
+            await tutor_app.client.reactions_add(channel=channel, timestamp=ts,
+                                                 name="mortar_board")
+
+        async def tutor_status(channel: str, thread_ts: str, text: str) -> None:
+            await tutor_app.client.assistant_threads_setStatus(
+                channel_id=channel, thread_ts=thread_ts, status=text)
+
+        tutor = TutorHandler(runner.orch, runner.cfg, runner.repos,
+                             react=tutor_react, status=tutor_status)
+        tutor_action = make_tutor_action(tutor, tutor_app.client)
+
+        @tutor_app.event("app_mention")
+        async def on_tutor_mention(body, say):
+            async def tsay(*, text, thread_ts=None, blocks=None):
+                return await tutor_app.client.chat_postMessage(
+                    channel=body["event"]["channel"], text=text,
+                    thread_ts=thread_ts, blocks=blocks)
+            await tutor.on_mention(body, tsay)
+
+        @tutor_app.event("message")
+        async def on_tutor_message(body, say):
+            return                       # 회차 진행은 버튼으로만 — 자유 답글은 받지 않는다
+
+        @tutor_app.action(re.compile("tutor_answer_.*"))
+        async def on_tutor_answer(ack, body):
+            await ack()
+            await tutor_action(body)
+
+        tasks.append(AsyncSocketModeHandler(tutor_app, tutor_app_token).start_async())
+        print("devcrew: @tutor 학습 앱 활성화")
 
     print("devcrew slack engine: Socket Mode 연결 중… (@mention으로 작업을 요청하세요)")
     await asyncio.gather(*tasks)

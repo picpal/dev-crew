@@ -54,6 +54,8 @@ LLM(leader)은 정책이 답을 못 정하는 **5개 트리거에서만** 호출
 | `enforcement.py` | role별 도구 허용목록·샌드박스·경로 게이트 |
 | `slack_engine.py` | crew 봇 — 멘션 처리, 스레드 이월, 중지 버튼, `/clear` |
 | `slack_brain.py` | brain 봇 — 인터뷰 세션, brief 산출, 핸드오프 |
+| `slack_tutor.py` | tutor 봇 — 학습 회차, 문항 진행, 채점 발행 |
+| `quiz.py` `tutor.py` | 문항 모델·인용 대조·채점·오답 노트 / 출제 파이프라인 |
 | `store/trace.py` | append-only 이벤트(진실) + projection. `store/registry.py` = 세션 레지스트리 |
 | `usage.py` | 컨텍스트 점유 실측/표기 |
 | `repos.py` `worktree.py` | repo 레지스트리(+base 브랜치), git worktree 격리 |
@@ -65,7 +67,7 @@ LLM(leader)은 정책이 답을 못 정하는 **5개 트리거에서만** 호출
 
 ## 3. 반드시 지켜야 할 불변 조건
 
-1. **비밀은 env로만.** `SLACK_*`, `BRAIN_*`, `REPORT_BASE_URL`. 코드·설정·커밋에 절대
+1. **비밀은 env로만.** `SLACK_*`, `BRAIN_*`, `TUTOR_*`, `REPORT_BASE_URL`. 코드·설정·커밋에 절대
    쓰지 않는다. `.env`는 gitignore 유지.
 2. **harness MCP는 read-only.** leader는 `get_execution_state` / `get_worker_result` /
    `get_trace_events`만 갖는다. 쓰기 도구를 주지 않는다.
@@ -150,6 +152,7 @@ uv run python -u -m devcrew.slack_engine   # 브리지 (env 필요)
 | 스레드 답글 / 버튼 | 인터뷰 진행 |
 | `전달` | brief 산출 → crew 인계 (재인계는 delta만) |
 | `@brain /clear` | 인터뷰 세션 정리 |
+| `@tutor <repo>:` | 그 repo에 대한 10문항 학습 회차 시작 (버튼으로 응답) |
 
 응답 형태로 의도가 구분된다: **버튼 = 골라야 할 결정**, **본문 산문 = 이어갈 논의**,
 **📄 링크 = 읽고 넘어갈 결론**(최종 brief 또는 3,000자 초과분).

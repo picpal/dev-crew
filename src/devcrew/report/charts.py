@@ -20,6 +20,11 @@ def _e(v) -> str:
     return _html.escape(str(v), quote=True)
 
 
+def _fmt(v: float) -> str:
+    """정수는 소수 꼬리 없이 — `0.0개`는 읽기 나쁘다."""
+    return str(int(v)) if float(v).is_integer() else str(v)
+
+
 def _num(v) -> float | None:
     """모델이 문자열 수치("많음")를 흘려도 그래프가 깨지지 않게 한다."""
     if isinstance(v, bool) or not isinstance(v, (int, float)):
@@ -41,7 +46,7 @@ def bar_chart(items: list[tuple[str, float]], *, unit: str = "") -> str:
         rows.append(
             f'<text x="{LABEL_W - 6}" y="{y + 15}" text-anchor="end" font-size="12">{_e(label)}</text>'
             f'<rect x="{LABEL_W}" y="{y}" width="{w}" height="{BAR_H}" fill="#333"/>'
-            f'<text x="{LABEL_W + w + 6}" y="{y + 15}" font-size="12">{_e(value)}{_e(unit)}</text>')
+            f'<text x="{LABEL_W + w + 6}" y="{y + 15}" font-size="12">{_e(_fmt(value))}{_e(unit)}</text>')
     return (f'<svg viewBox="0 0 {width} {h}" width="100%" role="img" '
             f'style="max-width:{width}px">' + "".join(rows) + "</svg>")
 
