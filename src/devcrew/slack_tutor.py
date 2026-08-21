@@ -196,7 +196,9 @@ class TutorHandler:
                       thread_ts=thread_ts)
             return
         if not res.questions:
-            detail = ("\n" + "\n".join(f"• {n}" for n in res.notes)) if res.notes else ""
+            # 사유 없이 "못 만들었습니다"만 보내면 사용자도 나도 원인을 못 찾는다
+            detail = ("\n" + "\n".join(f"• {n}" for n in res.notes)) if res.notes \
+                else "\n• 사유가 기록되지 않았습니다 — 브리지 로그를 확인해 주세요"
             await say(text=f"🙋 근거 있는 문항을 만들지 못했습니다.{detail}",
                       thread_ts=thread_ts)
             return

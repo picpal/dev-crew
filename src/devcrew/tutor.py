@@ -100,36 +100,45 @@ def select_ten(pool: list[Question], *, count: int = QUIZ_COUNT) -> list[Questio
 
 
 async def _ask(orch, cfg, role: Role, *, exec_id: str, node_id: str, scope: str,
-               worktree: str | None, intro: str, nudge: str) -> dict | None:
-    """role 인스턴스 하나를 띄워 구조화 출력 하나를 받는다. 실패는 None."""
+               worktree: str | None, intro: str, nudge: str,
+               notes: list[str] | None = None) -> dict | None:
+    """role 인스턴스 하나를 띄워 구조화 출력 하나를 받는다. 실패는 None.
+
+    **실패 이유는 삼키지 않고 `notes`에 남긴다.** 삼키면 사용자에게는 "문항을 만들지
+    못했습니다"만 남고 원인이 로그에도 trace에도 없다 — 2026-08-21 첫 실행에서
+    enforcement 정책 누락(KeyError)이 이렇게 보이지 않는 실패가 됐다."""
     tier = cfg.role_defaults[role].tier
-    inst = await orch.spawn(role, tier, execution_id=exec_id, node_id=node_id,
-                            task_scope=scope, worktree=worktree)
+    inst = None
     try:
+        inst = await orch.spawn(role, tier, execution_id=exec_id, node_id=node_id,
+                                task_scope=scope, worktree=worktree)
         sid = await orch.start_worker(inst, intro)
         out = await asyncio.wait_for(
             orch.adapters[inst.provider].send(sid, nudge), timeout=TURN_TIMEOUT)
-    except Exception:
+    except Exception as e:
+        if notes is not None:
+            notes.append(f"{role.value} 세션 실패: {type(e).__name__}: {e}")
         return None
     finally:
-        try:
-            orch.registry.finish(inst.instance_id)      # 1회용 인스턴스 반납
-        except Exception:
-            pass
+        if inst is not None:
+            try:
+                orch.registry.finish(inst.instance_id)  # 1회용 인스턴스 반납
+            except Exception:
+                pass
     return out.structured if isinstance(out.structured, dict) else None
 
 
-async def _author(orch, cfg, *, exec_id, repo_path, intro, allowed_keys):
+async def _author(orch, cfg, *, exec_id, repo_path, intro, allowed_keys, notes=None):
     raw = await _ask(orch, cfg, Role.TUTOR, exec_id=exec_id, node_id="author",
                      scope="학습 문항 출제", worktree=repo_path, intro=intro,
-                     nudge="이제 문항을 스키마대로 제출해라.")
+                     nudge="이제 문항을 스키마대로 제출해라.", notes=notes)
     if not raw:
         return []
     return parse_questions(raw.get("questions"), allowed_keys=allowed_keys)
 
 
-async def _verify(orch, cfg, *, exec_id, repo_path,
-                  questions: list[Question]) -> tuple[list[Question], list[str]]:
+async def _verify(orch, cfg, *, exec_id, repo_path, questions: list[Question],
+                  notes: list[str] | None = None) -> tuple[list[Question], list[str]]:
     """검증자 판정 적용. **검증이 실패하면 아무것도 통과시키지 않는다** —
     검증 없는 문항이 사람에게 가는 것이 이 파이프라인의 실패 모드다."""
     if not questions:
@@ -137,7 +146,7 @@ async def _verify(orch, cfg, *, exec_id, repo_path,
     intro = VERIFY_INTRO.format(questions=fence("questions", _verifier_view(questions)))
     raw = await _ask(orch, cfg, Role.TUTOR_VERIFIER, exec_id=exec_id, node_id="verify",
                      scope="문항 교차 검증", worktree=repo_path, intro=intro,
-                     nudge="이제 판정을 스키마대로 제출해라.")
+                     nudge="이제 판정을 스키마대로 제출해라.", notes=notes)
     verdicts = (raw or {}).get("verdicts")
     if not raw or raw.get("status") != "PASS" or not isinstance(verdicts, list):
         return [], ["교차 검증에 실패해 이번 출제를 통과시키지 않았습니다"]
@@ -178,13 +187,13 @@ async def issue_quiz(orch, cfg, *, repo_name: str | None, repo_path: str | None,
             k=MAX_CARRIED)
 
     drafted = await _author(orch, cfg, exec_id=exec_id, repo_path=repo_path,
-                            intro=intro, allowed_keys=allowed)
+                            intro=intro, allowed_keys=allowed, notes=notes)
     cited, dropped = verify_citations(drafted, repo_path or ".")
     if dropped:
         notes.append(f"인용 대조에서 {len(dropped)}문항 폐기 "
                      f"({', '.join(sorted({r for _, r in dropped}))})")
     verified, rejects = await _verify(orch, cfg, exec_id=exec_id,
-                                      repo_path=repo_path, questions=cited)
+                                      repo_path=repo_path, questions=cited, notes=notes)
     if rejects:
         notes.append(f"교차 검증에서 {len(rejects)}문항 반려")
 
@@ -196,7 +205,7 @@ async def issue_quiz(orch, cfg, *, repo_name: str | None, repo_path: str | None,
             reasons=fence("reject-reasons", "\n".join(
                 rejects + [f"{q.stem} — {r}" for q, r in dropped]) or "사유 없음"))
         extra = await _author(orch, cfg, exec_id=exec_id, repo_path=repo_path,
-                              intro=top_intro, allowed_keys=allowed)
+                              intro=top_intro, allowed_keys=allowed, notes=notes)
         extra_cited, _ = verify_citations(extra, repo_path or ".")
         extra_ok, _ = await _verify(orch, cfg, exec_id=exec_id,
                                     repo_path=repo_path, questions=extra_cited)

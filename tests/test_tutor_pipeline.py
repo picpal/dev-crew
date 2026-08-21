@@ -247,3 +247,21 @@ async def test_non_integer_verdict_index_rejects_the_batch(tmp_path, repo):
     res = await issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
                            exec_id="E", misses=[])
     assert res.questions == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_failure_reason_reaches_the_user(tmp_path, repo):
+    """출제가 왜 실패했는지 화면에 남아야 한다. 예외를 삼키면 '문항을 못 만들었다'는
+    말만 남고 원인은 trace에도 로그에도 없다 (2026-08-21 첫 회차가 그랬다)."""
+    from devcrew.tutor import issue_quiz
+
+    class Exploding(Scripted):
+        async def start_session(self, inst, initial_message, **kw):
+            raise KeyError(inst.role)          # 정책 누락이 이렇게 터졌다
+
+    orch, _ = make_orch(tmp_path, Exploding([]), Scripted([]))
+    res = await issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
+                           exec_id="E", misses=[])
+    assert res.questions == [] and res.shortfall is True
+    joined = " ".join(res.notes)
+    assert "KeyError" in joined and "TUTOR" in joined

@@ -149,7 +149,26 @@
 
 ---
 
-## C10. 리뷰 프로세스 자체의 실패
+## C10. 새 Role을 추가하고 **정책 테이블**을 빠뜨림
+
+- **2026-08-21 · TUTOR·TUTOR_VERIFIER가 `ROLE_POLICY`에 없었다** (`#19`)
+  Role enum, `roleDefaults`, `BUNDLED_ROLES`, role 번들까지 다 채웠는데
+  `enforcement.ROLE_POLICY`만 빠졌다. `spawn` → `claude_options_kwargs`에서
+  `KeyError`가 났고, `_ask`가 예외를 삼켜 **첫 실행이 통째로 조용히 실패**했다.
+  화면에는 "근거 있는 문항을 만들지 못했습니다"만 남았다.
+  → 왜: 테스트가 role을 **이름으로 하나씩** 검사했다(`ROLE_POLICY[Role.EXPLORER]…`).
+    있는 것만 확인하는 테스트는 **빠진 것**을 절대 못 잡는다. FakeAdapter 경로는
+    enforcement를 타지 않아 379개 테스트가 전부 초록이었다(C1의 변종).
+  → 막은 방법: `for r in Role: assert r in ROLE_POLICY` 전수 검사 + 모든 role에 대해
+    `claude_options_kwargs`/`codex_session_kwargs`를 실제로 부르는 파라미터 테스트.
+
+**규칙**: role·provider·tier처럼 **enum과 테이블이 짝을 이루는 곳**은 개별 항목이
+아니라 **enum 전수**로 검사한다. 그리고 예외를 삼키는 자리에는 반드시 사유를 남긴다 —
+삼킨 예외는 로그에도 trace에도 없어서 원인 추적이 처음부터 불가능해진다.
+
+---
+
+## C11. 리뷰 프로세스 자체의 실패
 
 - **2026-08-20 · 서브에이전트가 보고 없이 유휴로 빠짐**
   리뷰 에이전트 3개가 분석을 마치고도 결과를 보내지 않고 idle 알림만 냈다. 최초 1회는

@@ -38,7 +38,10 @@ ROLE_POLICY: dict[Role, RolePolicy] = {
     Role.REVIEWER: RolePolicy(allowed_tools=list(_READ_TOOLS), sandbox="read-only"),
     Role.QA: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash"]),
     Role.BRAIN: RolePolicy(allowed_tools=list(_READ_TOOLS)),  # 인터뷰 근거용 읽기 전용
-
+    # 학습 Agent (#19) — 출제·검증 모두 repo를 **읽기만** 한다. 학습 도구가 코드를
+    # 만질 이유가 없고, Bash도 주지 않는다 (근거는 파일 읽기로 충분하다).
+    Role.TUTOR: RolePolicy(allowed_tools=list(_READ_TOOLS)),
+    Role.TUTOR_VERIFIER: RolePolicy(allowed_tools=list(_READ_TOOLS), sandbox="read-only"),
 }
 
 
