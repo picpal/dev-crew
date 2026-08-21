@@ -216,3 +216,34 @@ async def test_select_ten_caps_carried_and_drops_duplicate_keys():
     picked = select_ten(pool, count=10)
     assert sum(1 for x in picked if x.carried) == MAX_CARRIED
     assert len({x.key for x in picked}) == len(picked)                  # key 중복 없음
+
+
+def test_dedupe_keeps_the_carried_variant_when_keys_collide():
+    """같은 key의 일반 문항이 먼저 있어도 오답 유래 쪽이 살아남아야 한다 —
+    아니면 '지난 오답을 먼저 낸다'가 조용히 사라진다."""
+    from devcrew.quiz import Evidence, Question
+    from devcrew.tutor import select_ten
+
+    def q(key, carried):
+        return Question(area="세션", type="CORRECT", stem="s", options=list("ABCD"),
+                        answer_index=0, evidence=[Evidence("a.py", 1, 1, "x")],
+                        explanation="e", key=key, carried=carried)
+
+    picked = select_ten([q("k1", False), q("k1", True)], count=10)
+    assert len(picked) == 1 and picked[0].carried is True
+
+
+@pytest.mark.asyncio
+async def test_non_integer_verdict_index_rejects_the_batch(tmp_path, repo):
+    """bool·실수 인덱스를 int()로 구부려 받으면 판정이 엉뚱한 문항에 붙는다."""
+    from devcrew.tutor import issue_quiz
+    author = Scripted([_authored([_q(i, start=i + 1) for i in range(12)])])
+    bad = {"status": "PASS", "summary": "s",
+           "verdicts": [{"index": True, "verdict": "PASS", "reason": "ok"}]
+                       + [{"index": i, "verdict": "PASS", "reason": "ok"}
+                          for i in range(1, 12)]}
+    verifier = Scripted([bad, bad])
+    orch, _ = make_orch(tmp_path, author, verifier)
+    res = await issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
+                           exec_id="E", misses=[])
+    assert res.questions == []

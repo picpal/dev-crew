@@ -687,3 +687,28 @@ def test_tutor_action_marks_the_chosen_option_letter():
          "message": {"ts": "1.1", "thread_ts": "1.0", "text": "q"},
          "actions": [{"value": "0:3"}]}))
     assert "✅ 선택: D" in updated[0]["text"]
+
+
+def test_tutor_action_labels_regrade_without_a_fake_option_letter():
+    """`✅ 선택: ?`는 사용자를 헷갈리게 한다 — 재채점은 선택이 아니다."""
+    import asyncio
+
+    from devcrew.slack_engine import make_tutor_action
+    from devcrew.slack_tutor import REGRADE_VALUE
+
+    class H:
+        async def on_answer(self, *, thread_ts, value, say, strip=None,
+                            channel="", user=""):
+            await strip()
+
+    updated = []
+
+    class Client:
+        async def chat_update(self, **kw):
+            updated.append(kw)
+
+    asyncio.run(make_tutor_action(H(), Client())(
+        {"channel": {"id": "C1"}, "user": {"id": "U1"},
+         "message": {"ts": "1.1", "thread_ts": "1.0", "text": "채점 실패"},
+         "actions": [{"value": REGRADE_VALUE}]}))
+    assert "🔁 다시 채점 중" in updated[0]["text"] and "선택: ?" not in updated[0]["text"]

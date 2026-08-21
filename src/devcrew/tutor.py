@@ -72,11 +72,15 @@ def select_ten(pool: list[Question], *, count: int = QUIZ_COUNT) -> list[Questio
     묻게 되기 때문이다 — 리포트의 영역별 카드도 의미를 잃는다."""
     # key 중복을 먼저 없앤다. 같은 key가 한 회차에 둘 들어오면 하나는 miss, 하나는
     # clear로 기록돼 최종 오답 상태가 문항 순서에 좌우된다 (Codex 리뷰 2026-08-21).
+    # 같은 key가 겹치면 **오답 유래 쪽을 남긴다** — 일반 문항이 먼저 있다는 이유로
+    # carried가 밀리면 "지난 오답을 먼저 낸다"가 조용히 사라진다 (Codex 재리뷰).
     uniq, seen_keys = [], set()
-    for q in pool:
+    for q in sorted(pool, key=lambda x: not x.carried):
         if q.key not in seen_keys:
             seen_keys.add(q.key)
             uniq.append(q)
+    order = {id(q): i for i, q in enumerate(pool)}
+    uniq.sort(key=lambda q: order[id(q)])       # 대표를 고른 뒤 출제 순서로 되돌린다
     picked = [q for q in uniq if q.carried][:MAX_CARRIED]
     seen_areas = {q.area for q in picked}
     # 상한을 넘은 오답 유래 문항은 나머지 후보에서도 뺀다 — 안 그러면 상한이 무의미하다
@@ -143,10 +147,10 @@ async def _verify(orch, cfg, *, exec_id, repo_path,
     for v in verdicts:
         if not isinstance(v, dict) or v.get("verdict") not in ("PASS", "REJECT"):
             continue
-        try:
-            i = int(v["index"])
-        except (KeyError, TypeError, ValueError):
-            continue
+        i = v.get("index")
+        if not isinstance(i, int) or isinstance(i, bool):
+            # bool·실수·문자열을 int()로 구부려 받으면 판정이 엉뚱한 문항에 붙는다
+            return [], ["교차 검증 판정의 인덱스 형식이 잘못됐습니다 — 통과시키지 않았습니다"]
         if i in seen or not 0 <= i < len(questions):
             return [], ["교차 검증 판정이 중복·범위 밖입니다 — 통과시키지 않았습니다"]
         seen[i] = v

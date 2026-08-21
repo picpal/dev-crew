@@ -26,6 +26,7 @@ from .tutor import issue_quiz
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 ROUND_TTL = 24 * 3600.0     # 미완 회차의 수명 — 하루가 지나면 코드도 기억도 달라진다
 ANSWER_RE = re.compile(r"^(\d+):([0-3])$")
+REGRADE_VALUE = "__REGRADE__"   # 채점 실패 후 다시 채점하는 버튼의 sentinel
 NEED_REPO = ("⚠️ 대상 repo를 지정해 주세요 — `@tutor <repo명>: ` 형식입니다.\n"
              "등록된 repo: {repos}")
 STALE_MSG = ("⚠️ 이 회차는 하루가 지나 이어서 풀 수 없습니다. "
@@ -64,6 +65,19 @@ def question_blocks(q: Question, idx: int, total: int) -> list[dict]:
              "value": f"{idx}:{i}"} for i in range(len(q.options))]},
         {"type": "context", "elements": [{"type": "mrkdwn",
                                           "text": f"_{kind}을 고르세요 · 채점은 마지막에 한 번에 합니다_"}]},
+    ]
+
+
+def regrade_blocks() -> list[dict]:
+    """채점이 실패했을 때 주는 손잡이. 마지막 문항 버튼은 이미 걷힌 뒤라
+    이걸 안 주면 사용자에게는 회차를 되살릴 방법이 없다."""
+    return [
+        {"type": "section", "text": {"type": "mrkdwn",
+                                     "text": "채점을 마치지 못했습니다. 다시 시도할 수 있습니다."}},
+        {"type": "actions", "block_id": "tutor_regrade", "elements": [
+            {"type": "button", "action_id": "tutor_answer_regrade", "style": "primary",
+             "text": {"type": "plain_text", "text": "🔁 다시 채점"},
+             "value": REGRADE_VALUE}]},
     ]
 
 
@@ -116,10 +130,10 @@ class TutorHandler:
 
     async def on_answer(self, *, thread_ts: str, value: str, say, strip=None,
                         channel: str = "", user: str = "") -> None:
+        regrade = value == REGRADE_VALUE
         m = ANSWER_RE.match(value or "")
-        if not m:
+        if not m and not regrade:
             return
-        idx, choice = int(m.group(1)), int(m.group(2))
         sess = self.sessions.get(thread_ts) or await self._resume(thread_ts, say)
         if sess is None:
             return
@@ -127,7 +141,18 @@ class TutorHandler:
             # 대화는 누구나 볼 수 있지만 답은 회차 주인의 것이다 — 남이 채점을 흔들면 안 된다
             await say(text=NOT_OWNER, thread_ts=thread_ts)
             return
-        if sess.done or not 0 <= idx < len(sess.questions):
+        if sess.done:
+            return
+        if regrade:
+            if strip:
+                try:
+                    await strip()
+                except Exception:
+                    pass
+            await self._finish(sess, say)
+            return
+        idx, choice = int(m.group(1)), int(m.group(2))
+        if not 0 <= idx < len(sess.questions):
             return
         # 버튼을 먼저 걷으면 기록 실패 시 그 답을 다시 낼 방법이 없다 (lessons.md C7).
         try:
@@ -201,6 +226,13 @@ class TutorHandler:
         self.last_questions = res.questions
         await self._post_question(sess, 0, say)
 
+    @staticmethod
+    async def _say_blocks(say, thread_ts, text: str, blocks: list[dict]) -> None:
+        try:
+            await say(text=text, thread_ts=thread_ts, blocks=blocks)
+        except TypeError:
+            await say(text=text, thread_ts=thread_ts)
+
     async def _post_question(self, sess: QuizSession, idx: int, say) -> None:
         q = sess.questions[idx]
         total = len(sess.questions)
@@ -216,13 +248,25 @@ class TutorHandler:
         try:
             prior = {m["q_key"] for m in open_misses(self.orch.trace, note)}
         except NoteUnavailable:
-            # done을 세우기 전에 빠진다 — 세우면 재시도가 거부돼 회차가 채점 없이 끝난다
-            await say(text="⚠️ 오답 노트를 읽지 못해 채점을 마치지 못했습니다. "
-                           "마지막 버튼을 다시 눌러 주세요.", thread_ts=sess.thread_ts)
+            # done을 세우기 전에 빠진다 — 세우면 재시도가 거부돼 회차가 채점 없이 끝난다.
+            # 마지막 문항 버튼은 이미 걷혔으므로 새 손잡이를 준다.
+            await self._say_blocks(say, sess.thread_ts,
+                                   "⚠️ 오답 노트를 읽지 못해 채점을 마치지 못했습니다.",
+                                   regrade_blocks())
+            return
+        card = grade(sess.questions, sess.answers)
+        # **기록이 먼저, done은 나중.** done을 먼저 세우면 기록이 실패했을 때 회차가
+        # 영구히 채점 불가가 된다. 노트는 key 단위로 접히므로 재시도는 멱등이다.
+        try:
+            added, cleared = record_scorecard(self.orch.trace, note, card,
+                                              prior_keys=prior)
+        except Exception as e:
+            await self._say_blocks(
+                say, sess.thread_ts,
+                f"⚠️ 채점 결과를 기록하지 못했습니다: {type(e).__name__}",
+                regrade_blocks())
             return
         sess.done = True
-        card = grade(sess.questions, sess.answers)
-        added, cleared = record_scorecard(self.orch.trace, note, card, prior_keys=prior)
         url = None
         try:
             html = render_quiz_report(card, repo=sess.repo_name, added=added,

@@ -37,8 +37,9 @@ def test_q_key_is_order_independent():
 def test_carried_key_survives_reissue():
     """재출제 문항은 원래 키를 유지한다 — 인용 줄이 흔들려도 오답이 해소된다."""
     from devcrew.quiz import parse_questions
+    origin = {"deadbeef1234": [{"path": "src/a.py", "start_line": 38}]}
     raw = _q(start=38); raw["source_key"] = "deadbeef1234"
-    q = parse_questions([raw], allowed_keys={"deadbeef1234"})[0]
+    q = parse_questions([raw], allowed_keys=origin)[0]
     assert q.key == "deadbeef1234"
     assert q.carried is True
 
@@ -46,8 +47,9 @@ def test_carried_key_survives_reissue():
 def test_unissued_source_key_is_ignored():
     """하네스는 **자기가 발급한 키만** 수용한다 — 모델이 키를 지어내도 무해하다."""
     from devcrew.quiz import parse_questions, q_key
+    origin = {"deadbeef1234": [{"path": "src/a.py", "start_line": 38}]}
     raw = _q(start=38); raw["source_key"] = "지어낸키"
-    q = parse_questions([raw], allowed_keys={"deadbeef1234"})[0]
+    q = parse_questions([raw], allowed_keys=origin)[0]
     assert q.carried is False and q.key == q_key(q.area, q.evidence)
 
 
@@ -233,3 +235,24 @@ def test_carried_key_requires_matching_evidence_location():
     qs = parse_questions([same, other], allowed_keys=origin)
     assert qs[0].carried is True and qs[0].key == "k-old"
     assert qs[1].carried is False and qs[1].key != "k-old"
+
+
+def test_carried_key_requires_every_original_location(tmp_path):
+    """일부만 겹쳐도 승계하면, 근거 하나를 갈아끼워 남의 오답을 해소할 수 있다."""
+    from devcrew.quiz import parse_questions
+    origin = {"k": [{"path": "a.py", "start_line": 10}, {"path": "b.py", "start_line": 20}]}
+    partial = _q(evidence=[_ev(path="a.py", start=10), _ev(path="c.py", start=99)])
+    partial["source_key"] = "k"
+    full = _q(evidence=[_ev(path="a.py", start=10), _ev(path="b.py", start=20),
+                        _ev(path="c.py", start=99)])
+    full["source_key"] = "k"
+    qs = parse_questions([partial, full], allowed_keys=origin)
+    assert qs[0].carried is False                      # 일부만 겹침 — 승계 불가
+    assert qs[1].carried is True and qs[1].key == "k"  # 원래 근거를 전부 다시 인용
+
+
+def test_carry_is_refused_when_the_original_evidence_is_unknown():
+    """대조할 근거가 없으면 승계하지 않는다 — 키만으로는 검증할 수 없다."""
+    from devcrew.quiz import parse_questions
+    raw = _q(); raw["source_key"] = "k"
+    assert parse_questions([raw], allowed_keys={"k": []})[0].carried is False

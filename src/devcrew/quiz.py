@@ -121,7 +121,10 @@ def parse_questions(raw: list[dict],
         if isinstance(src, str) and src in slots:
             want = slots[src]
             here = {(e.path, e.start_line) for e in ev}
-            carried = src if (not want or want & here) else None
+            # 원래 근거를 **전부** 다시 인용했을 때만 승계한다. 일부만 겹쳐도 받으면
+            # 근거 하나를 갈아끼워 남의 오답을 해소할 수 있고, 대조할 근거가 아예 없으면
+            # 키만 남아 검증이 불가능하다 (Codex 재리뷰 2026-08-21).
+            carried = src if (want and want <= here) else None
         out.append(Question(
             area=area, type=r["type"], stem=stem, options=[str(o) for o in options],
             answer_index=idx, evidence=ev, explanation=explanation,

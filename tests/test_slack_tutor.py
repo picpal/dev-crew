@@ -269,3 +269,37 @@ async def test_round_aborts_when_the_miss_note_cannot_be_read(tmp_path, repo):
     await h.on_mention(mention(), say)
     assert h.sessions == {}
     assert "오답 노트" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_grading_failure_leaves_the_round_retryable(tmp_path, repo):
+    """채점 기록이 실패했는데 done을 세우면 회차가 영구히 채점 불가가 된다.
+    버튼도 이미 걷힌 뒤라 사용자에게는 되살릴 손잡이가 없다."""
+    from devcrew.slack_tutor import REGRADE_VALUE
+    h, trace, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    h.orch.trace = FlakyTrace(trace, "QuizMissEvent")
+    await answer_all(h, say, correct=8)                   # 2문항 오답 → miss 기록 실패
+    assert h.sessions["100.1"].done is False              # 재시도 가능해야 한다
+    assert pub == []
+    btns = buttons_of(say.messages[-1])                   # 다시 채점할 손잡이를 준다
+    assert [b["value"] for b in btns] == [REGRADE_VALUE]
+
+    h.orch.trace = trace                                  # 복구된 뒤 다시 채점
+    await h.on_answer(thread_ts="100.1", value=REGRADE_VALUE, say=say,
+                      user="U-OWNER", channel="C1")
+    assert len(pub) == 1 and "8 / 10" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_regrade_is_owner_only(tmp_path, repo):
+    from devcrew.slack_tutor import REGRADE_VALUE
+    h, trace, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    h.orch.trace = FlakyTrace(trace, "QuizMissEvent")
+    await answer_all(h, say, correct=8)
+    await h.on_answer(thread_ts="100.1", value=REGRADE_VALUE, say=say,
+                      user="U-STRANGER", channel="C1")
+    assert pub == [] and "시작한 사람만" in say.messages[-1]["text"]

@@ -379,10 +379,13 @@ def make_tutor_action(tutor, client):
                 channel=ch, text=text, thread_ts=thread_ts or thread, blocks=blocks)
 
         async def strip():
-            letter = chr(65 + int(value.split(":")[1])) if ":" in value else "?"
+            if ":" in value:
+                mark = f"✅ 선택: {chr(65 + int(value.split(':')[1]))}"
+            else:
+                mark = "🔁 다시 채점 중"        # 재채점은 보기 선택이 아니다
             await client.chat_update(
                 channel=ch, ts=msg["ts"], blocks=[],
-                text=(msg.get("text") or "문항")[:2800] + f"\n\n✅ 선택: {letter}")
+                text=(msg.get("text") or "문항")[:2800] + f"\n\n{mark}")
 
         await tutor.on_answer(thread_ts=thread, value=value, say=say, strip=strip,
                               channel=ch, user=(body.get("user") or {}).get("id", ""))
