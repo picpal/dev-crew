@@ -958,4 +958,44 @@ def test_code_block_does_not_open_with_a_blank_line():
     `code`에 걸려 코드 블록 첫 줄이 빈 줄로 보인다 (실물 확인 2026-08-21)."""
     from devcrew.report.brain_report import md_lite
     out = md_lite("앞\n```\ncode line\n```\n뒤")
-    assert "<pre><code>code line</code></pre>" in out
+    assert "<code>code line</code></pre>" in out
+
+
+# ── Codex 화면 검토 (2026-08-21) ────────────────────────────────────────────
+def test_longer_fence_is_not_closed_by_a_shorter_one():
+    """백틱 3개면 무엇이든 닫는 것으로 보면, ````로 연 블록 안의 ```가 블록을 조기에
+    닫고 뒤 문단까지 코드로 삼켜 화면 내용이 바뀐다."""
+    from devcrew.report.brain_report import md_lite
+    out = md_lite("````\n```not-a-closer\nstill code\n````\n뒤 문단")
+    assert "```not-a-closer" in out and "<p>뒤 문단</p>" in out
+    assert out.count("<pre") == 1
+
+
+def test_brief_counts_only_what_it_draws():
+    """빈 문자열을 그대로 받으면 화면에는 빈 줄만 뜨는데 제목은 '결정 사항 2'라고
+    말한다. 모델이 리스트 대신 문자열을 흘리면 글자 하나가 항목 하나가 된다."""
+    from devcrew.report.brain_report import render_brief
+    base = dict(status="PASS", goal="g", summary="s", constraints=[],
+                acceptance_criteria=[], open_questions=[])
+    assert "결정 사항" not in render_brief(brief={**base, "decisions": ["", "  "]}, repo=None)
+    assert render_brief(brief={**base, "decisions": "완료"}, repo=None).count("<li") == 1
+    html = render_brief(brief={**base, "decisions": ["a", "", "b"]}, repo=None)
+    assert html.count("<li") == 2 and 'sec-count">2<' in html
+
+
+def test_status_badge_can_wrap_instead_of_pushing_the_page():
+    """`flex:none` + `nowrap`이면 배지가 줄바꿈도 축소도 못 해, 모델이 쓴 긴 status
+    하나가 320px에서 문서 전체를 밀어낸다."""
+    from devcrew.report.brain_report import render_brief
+    html = render_brief(brief={"status": "검토 보류 " * 20, "goal": "g", "summary": "s",
+                               "decisions": [], "constraints": [],
+                               "acceptance_criteria": [], "open_questions": []}, repo=None)
+    badge_rule = html.split(".badge{")[1].split("}")[0]
+    assert "nowrap" not in badge_rule and "flex:0 1 auto" in badge_rule
+    assert "word-break:keep-all" in badge_rule
+
+
+def test_scrollable_code_blocks_are_reachable_by_keyboard():
+    """가로로 구르는 코드 블록에 진입점이 없으면 마우스 없이는 가려진 코드를 못 본다."""
+    from devcrew.report.brain_report import md_lite
+    assert '<pre tabindex="0">' in md_lite("```\nx\n```")

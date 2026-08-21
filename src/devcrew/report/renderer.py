@@ -15,6 +15,7 @@ hash로 멱등이라 렌더마다 값이 바뀌면 같은 실행이 매번 새 �
 from __future__ import annotations
 
 import html as _html
+import re
 
 TEMPLATE_VERSION = "poc-2"
 
@@ -22,13 +23,13 @@ _TOKENS = """
 :root{color-scheme:light dark;
   --plane:#f9f9f7;--surface:#fcfcfb;--surface-2:#f2f1ed;
   --line:rgba(11,11,11,.10);--line-strong:#c3c2b7;
-  --ink-1:#0b0b0b;--ink-2:#52514e;--ink-3:#898781;
-  --good:#006300;--bad:#d03b3b;--shadow:rgba(11,11,11,.05);
+  --ink-1:#0b0b0b;--ink-2:#52514e;--ink-3:#6e6c67;
+  --good:#006300;--bad:#c22f2f;--shadow:rgba(11,11,11,.05);
   --code:rgba(11,11,11,.055)}
 @media (prefers-color-scheme:dark){
   :root{--plane:#0d0d0d;--surface:#1a1a19;--surface-2:#212120;
     --line:rgba(255,255,255,.10);--line-strong:#383835;
-    --ink-1:#fff;--ink-2:#c3c2b7;--ink-3:#898781;
+    --ink-1:#fff;--ink-2:#c3c2b7;--ink-3:#93918a;
     --good:#0ca30c;--bad:#e66767;--shadow:rgba(0,0,0,.3);
     --code:rgba(255,255,255,.07)}}
 """
@@ -48,7 +49,8 @@ h1{margin:0;font-size:clamp(1.2rem,3.2vw,1.65rem);font-weight:650;letter-spacing
 /* 알약이 아니라 둥근 사각이다 — status는 두 줄을 넘기도 하는데(모델이 쓰는 문자열),
    양끝이 반원인 상자에 두 줄이 들어가면 모양이 무너진다. */
 .status{display:inline-block;margin:.7rem 0 0;max-width:100%;border-radius:10px;
-  padding:.2rem .7rem;font-size:.8rem;font-weight:600;overflow-wrap:anywhere;
+  padding:.2rem .7rem;font-size:.8rem;font-weight:600;
+  word-break:keep-all;overflow-wrap:anywhere;
   border:1px solid var(--line-strong);background:var(--surface-2);color:var(--ink-2)}
 .status-ok{color:var(--good)}
 .status-no{color:var(--bad)}
@@ -70,6 +72,8 @@ h1{margin:0;font-size:clamp(1.2rem,3.2vw,1.65rem);font-weight:650;letter-spacing
 .panel-count{color:var(--ink-3);font-size:.78rem;font-weight:500;white-space:nowrap;
   font-variant-numeric:tabular-nums}
 .table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px}
+.table-wrap:focus-visible{outline:2px solid var(--series-1,#2a78d6);outline-offset:2px}
+.scroll-hint{margin:.4rem 0 0;color:var(--ink-3);font-size:.72rem}
 table{border-collapse:collapse;width:100%;font-size:.84rem}
 /* 좁은 화면에서 열을 짓이기지 않는다 — 대신 컨테이너가 옆으로 구른다.
    min-width가 없으면 375px에서 instance_id가 8글자씩 12줄로 접혀 표가 못 읽힌다. */
@@ -83,10 +87,12 @@ tbody tr:last-child td{border-bottom:0}
   white-space:nowrap}
 .c-id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em}
 .c-model{color:var(--ink-2)}
-/* 짧은 열거값이 `mediu/m`처럼 두 줄로 찢기지 않게 한다. 한글 role은 단어 안에서
-   끊지 않는다(keep-all) — 표가 넓어지면 컨테이너가 구르면 된다. */
+/* 짧은 열거값이 `mediu/m`처럼 두 줄로 찢기지 않게 한다. 한글은 어절 안에서
+   끊지 않는다(keep-all) — 표가 넓어지면 컨테이너가 구르면 된다.
+   `nowrap`이 아니라 `overflow-wrap:normal`이다: nowrap은 셀 공통의 줄바꿈 방어를
+   이겨서, 긴 `allowed_tools=...` 한 덩어리가 들어오면 표를 그 길이만큼 늘린다. */
 .c-role{word-break:keep-all}
-.c-effort{white-space:nowrap}
+.c-effort{overflow-wrap:normal;word-break:keep-all}
 .verdict{font-weight:600}
 .verdict-ok{color:var(--good)}
 .verdict-no{color:var(--bad)}
@@ -94,7 +100,7 @@ tbody tr:last-child td{border-bottom:0}
 .decisions li{counter-increment:d;display:grid;
   grid-template-columns:1.7rem minmax(0,1fr);gap:.3rem;align-items:start;
   border:1px solid var(--line);border-radius:10px;background:var(--surface-2);
-  padding:.6rem .8rem;font-size:.88rem;overflow-wrap:anywhere}
+  padding:.6rem .8rem;font-size:.88rem;word-break:keep-all;overflow-wrap:anywhere}
 .decisions li::before{content:counter(d);color:var(--ink-3);font-size:.76rem;
   font-weight:600;font-variant-numeric:tabular-nums;padding-top:.18rem}
 .empty{margin:0;color:var(--ink-3);font-size:.84rem}
@@ -112,11 +118,17 @@ def _e(v) -> str:
 
 def _tone(v, ok_suffix: str, no_suffix: str) -> str:
     """상태 문자열의 색조. **색만으로 말하지 않는다** — 값 자체가 항상 글자로 보이고,
-    색은 거들 뿐이다. 판정 못 하면 중립으로 둔다(agent가 쓴 임의 문자열일 수 있다)."""
-    up = str(v).upper()
-    if any(w in up for w in _NO_WORDS):    # NOT_PASS가 PASS보다 먼저 걸려야 한다
+    색은 거들 뿐이다. 판정 못 하면 중립으로 둔다(agent가 쓴 임의 문자열일 수 있다).
+
+    **부분 문자열이 아니라 상태 토큰 전체로 맞춘다.** 부분 문자열로 보면 `NOT_OK`가
+    `OK`를, `UNAPPROVED`가 `APPROVED`를, `INCOMPLETE`가 `COMPLETE`를 품어 실패가
+    초록으로 칠해진다 — 글자는 실패라고 쓰는데 칩은 성공색인, 화면이 거짓말하는
+    자리다 (Codex 화면 검토 2026-08-21). 밑줄로 쪼개도 안 된다(`NOT_OK` → `OK`).
+    상태값은 첫 낱말이므로 그것만 보고, 모르는 값은 색을 주지 않는다."""
+    head = re.split(r"\s", str(v).strip(), 1)[0].upper().strip(".,;:·")
+    if head in _NO_WORDS:              # NOT_PASS가 PASS보다 먼저 걸려야 한다
         return no_suffix
-    return ok_suffix if any(w in up for w in _OK_WORDS) else ""
+    return ok_suffix if head in _OK_WORDS else ""
 
 
 def _lead_time(view: dict) -> str:
@@ -128,13 +140,20 @@ def _lead_time(view: dict) -> str:
     return f'<dd>{_e(v)}<span class="unit">분</span></dd>'
 
 
-def _table(cls: str, head: str, rows: str, empty: str) -> str:
+def _table(cls: str, head: str, rows: str, empty: str, label: str) -> str:
     """표는 반드시 `overflow-x:auto` 컨테이너 안에 둔다. 안 그러면 안 끊기는
-    instance_id 하나가 본문 전체를 옆으로 민다(375px에서 문서 폭 657px)."""
+    instance_id 하나가 본문 전체를 옆으로 민다(375px에서 문서 폭 657px).
+
+    다만 좁은 화면에서는 열이 **통째로 화면 밖에 있고** 스크롤바는 20행짜리 표의
+    맨 아래에 있어 사용자가 그 사실을 모른다. 그래서 `tabindex`로 키보드 진입점을
+    주고(마우스 없이도 굴릴 수 있게), 이름을 붙이고, 눈에 보이는 안내를 단다
+    (Codex 화면 검토 2026-08-21)."""
     if not rows:
         return f'<p class="empty">{empty}</p>'
-    return (f'<div class="table-wrap"><table class="{cls}"><thead><tr>{head}</tr></thead>'
-            f"<tbody>{rows}</tbody></table></div>")
+    return (f'<div class="table-wrap" tabindex="0" role="region" aria-label="{label}">'
+            f'<table class="{cls}"><thead><tr>{head}</tr></thead>'
+            f"<tbody>{rows}</tbody></table></div>"
+            '<p class="scroll-hint">좁은 화면에서는 표를 옆으로 밀어 나머지 열을 봅니다.</p>')
 
 
 def render(view: dict) -> str:
@@ -182,12 +201,12 @@ def render(view: dict) -> str:
 <section class="panel"><h2 class="panel-title">Agent Instances
   <span class="panel-count">{len(instances)}</span></h2>
 {_table("t-inst", "<th>ID</th><th>Role</th><th>Model</th><th>Effort</th>", inst_rows,
-        "실행된 에이전트 인스턴스가 없습니다.")}
+        "실행된 에이전트 인스턴스가 없습니다.", "Agent Instances 표")}
 </section>
 <section class="panel"><h2 class="panel-title">Review Loops
   <span class="panel-count">{len(loops)}</span></h2>
 {_table("t-loop", "<th>#</th><th>Verdict</th>", loop_rows,
-        "리뷰 루프가 돌지 않았습니다.")}
+        "리뷰 루프가 돌지 않았습니다.", "Review Loops 표")}
 </section>
 <section class="panel"><h2 class="panel-title">Decisions
   <span class="panel-count">{len(decisions)}</span></h2>

@@ -7,6 +7,18 @@ const MARKER = "\ud83d\udce9 \uc120\ud0dd \ub2f5\ubcc0:"; // 📩 선택 답변:
 const esc = (v) => String(v).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
+// Slack이 준 오류 코드를 화면에 그대로 옮기기 전에 다듬는다.
+// - ok:false인데 error가 없거나 문자열이 아니면 `undefined`/`[object Object]`가
+//   진짜 오류 코드인 척 표시된다 → 모른다고 말한다
+// - 양방향 제어문자(U+202A~U+202E 등)는 escape를 통과하지만 화면에서 글자 순서를
+//   뒤집어 오류 값을 왜곡한다 → 걷어낸다
+// - 길이를 제한한다: 오류 전문이 길면 복구 안내가 화면 밖으로 밀린다
+const errCode = (e) => {
+  if (typeof e !== "string" || !e.trim()) return "";
+  const clean = e.replace(/[\u0000-\u001F\u007F\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g, "");
+  return clean.length > 120 ? clean.slice(0, 120) + "…" : clean;
+};
+
 // 상태 아이콘. CSP가 외부 이미지를 막으므로 인라인 SVG로 그린다. 색만으로 말하지
 // 않도록 모양(✓ / ✕ / !)이 상태마다 다르다 — 다크 모드·색각 이상에서도 구분된다.
 const ICON = {
@@ -21,12 +33,12 @@ const ICON = {
 const CSS = `
 :root{color-scheme:light dark;
   --plane:#f9f9f7;--surface:#fcfcfb;--line:rgba(11,11,11,.10);
-  --ink-1:#0b0b0b;--ink-2:#52514e;
-  --good:#006300;--bad:#d03b3b;--warn:#8a5a00;
+  --ink-1:#0b0b0b;--ink-2:#52514e;--ink-3:#6e6c67;
+  --good:#006300;--bad:#c22f2f;--warn:#8a5a00;
   --code:rgba(11,11,11,.055);--shadow:rgba(11,11,11,.05)}
 @media (prefers-color-scheme:dark){:root{
   --plane:#0d0d0d;--surface:#1a1a19;--line:rgba(255,255,255,.10);
-  --ink-1:#fff;--ink-2:#c3c2b7;
+  --ink-1:#fff;--ink-2:#c3c2b7;--ink-3:#93918a;
   --good:#0ca30c;--bad:#e66767;--warn:#e0a33a;
   --code:rgba(255,255,255,.07);--shadow:rgba(0,0,0,.3)}}
 *{box-sizing:border-box}
@@ -42,8 +54,11 @@ body{margin:0;background:var(--plane);color:var(--ink-1);line-height:1.65;
 .is-error .icon{color:var(--bad)}
 .is-warn .icon{color:var(--warn)}
 h1{margin:.65rem 0 0;font-size:clamp(1.1rem,4.6vw,1.35rem);font-weight:650;
-  line-height:1.42;letter-spacing:-.01em;overflow-wrap:anywhere}
-p{margin:.55rem 0 0;color:var(--ink-2);font-size:.93rem;overflow-wrap:anywhere}
+  line-height:1.42;letter-spacing:-.01em;word-break:keep-all;overflow-wrap:anywhere}
+p{margin:.55rem 0 0;color:var(--ink-2);font-size:.93rem;
+  word-break:keep-all;overflow-wrap:anywhere}
+.diag{margin-top:.9rem;padding-top:.7rem;border-top:1px solid var(--line);
+  color:var(--ink-3);font-size:.84rem}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.86em;
   background:var(--code);border-radius:4px;padding:.05em .3em;overflow-wrap:anywhere}
 `;
@@ -85,9 +100,15 @@ export default {
         body: JSON.stringify({ channel, thread_ts: thread, text: `${MARKER} ${text}` }),
       });
       const out = await res.json();
-      if (!out.ok)
-        return page("error", "전달 실패", `<p>Slack 오류: <code>${esc(out.error)}</code></p>`
-          + "<p>잠시 후 다시 시도하거나, Slack 스레드에 직접 답글을 남겨 주세요.</p>");
+      if (!out.ok) {
+        // 복구 안내가 먼저다. 오류 코드는 진단용이라 뒤에 둔다 — 앞에 두면 긴
+        // 오류 문자열이 "무엇을 해야 하는지"를 화면 밖으로 밀어낸다.
+        const code = errCode(out.error);
+        return page("error", "전달 실패",
+          "<p>잠시 후 다시 시도하거나, Slack 스레드에 직접 답글을 남겨 주세요.</p>"
+          + (code ? `<p class="diag">Slack 오류: <code>${esc(code)}</code></p>`
+                  : "<p class=\"diag\">Slack이 오류 코드를 주지 않았습니다.</p>"));
+      }
       return page("ok", "전달 완료", "<p>선택한 답변이 Slack 스레드에 게시됐습니다. 이 탭은 닫아도 됩니다.</p>");
     }
 

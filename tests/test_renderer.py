@@ -66,9 +66,17 @@ def test_every_table_sits_in_a_horizontal_scroll_container():
     assert rest, "표가 렌더되지 않았다"
     prefix = head
     for part in rest:
-        assert prefix.rstrip().endswith('<div class="table-wrap">'), \
-            "표가 table-wrap 밖에 있다"
+        assert prefix.rstrip().endswith("</div>") or 'class="table-wrap"' in \
+            prefix[prefix.rfind("<div"):], "표가 table-wrap 밖에 있다"
         prefix = part
+
+
+def test_scroll_containers_are_reachable_by_keyboard_and_named():
+    """좁은 화면에서는 열이 통째로 화면 밖에 있고 스크롤바는 20행짜리 표 맨 아래에
+    있다 — 사용자가 열이 잘렸다는 사실 자체를 모른다 (Codex 화면 검토 2026-08-21)."""
+    html = render(make_hard_view())
+    assert html.count('class="table-wrap" tabindex="0" role="region" aria-label=') == 2
+    assert "옆으로 밀어" in html
 
 
 def test_cells_with_long_values_are_allowed_to_wrap():
@@ -113,3 +121,21 @@ def test_empty_sections_say_so_instead_of_showing_a_headerless_table():
 def test_template_version_tracks_the_redesign():
     """CSP·구조가 바뀌면 버전으로 추적한다 (DESIGN.md §15.5)."""
     assert 'data-template-version="poc-2"' in render(make_empty_view())
+
+
+def test_status_tone_matches_tokens_not_substrings():
+    """부분 문자열로 보면 `NOT_OK`가 `OK`를, `UNAPPROVED`가 `APPROVED`를 품어
+    실패가 초록으로 칠해진다 — 글자는 실패라는데 칩은 성공색인 자리 (Codex 검토)."""
+    from devcrew.report.renderer import _tone
+    for bad in ("NOT_OK", "UNAPPROVED", "INCOMPLETE", "NOT_PASS", "BLOCKED"):
+        assert _tone(bad, "OK", "NO") != "OK", bad
+    for good in ("PASS", "DONE", "COMPLETE"):
+        assert _tone(good, "OK", "NO") == "OK", good
+    assert _tone("BYPASS", "OK", "NO") == ""          # 모르는 값은 중립
+
+
+def test_muted_ink_meets_body_text_contrast():
+    """보조 잉크는 빈 상태 문구·표 헤더 같은 **뜻을 지닌** 작은 글자에 쓰인다.
+    라이트 3.18:1 / 다크 4.49:1이라 AA 4.5:1에 미달했다 (Codex 검토)."""
+    html = render(make_empty_view())
+    assert "--ink-3:#6e6c67" in html and "--ink-3:#93918a" in html

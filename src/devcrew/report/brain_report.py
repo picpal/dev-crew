@@ -24,20 +24,21 @@ _TOKENS = """
 :root{color-scheme:light dark;
   --plane:#f9f9f7;--surface:#fcfcfb;--surface-2:#f2f1ed;
   --line:rgba(11,11,11,.10);--line-strong:#c3c2b7;
-  --ink-1:#0b0b0b;--ink-2:#52514e;--ink-3:#898781;
-  --series-1:#2a78d6;--warn:#a8620a;--shadow:rgba(11,11,11,.05);
+  --ink-1:#0b0b0b;--ink-2:#52514e;--ink-3:#6e6c67;
+  --series-1:#2a78d6;--good:#006300;--warn:#8a5a00;--shadow:rgba(11,11,11,.05);
   --code:rgba(11,11,11,.055)}
 @media (prefers-color-scheme:dark){
   :root{--plane:#0d0d0d;--surface:#1a1a19;--surface-2:#212120;
     --line:rgba(255,255,255,.10);--line-strong:#383835;
-    --ink-1:#fff;--ink-2:#c3c2b7;--ink-3:#898781;
-    --series-1:#3987e5;--warn:#e0a33a;--shadow:rgba(0,0,0,.3);
+    --ink-1:#fff;--ink-2:#c3c2b7;--ink-3:#93918a;
+    --series-1:#3987e5;--good:#0ca30c;--warn:#e0a33a;--shadow:rgba(0,0,0,.3);
     --code:rgba(255,255,255,.07)}}
 """
 
 _CSS = _TOKENS + """
 *{box-sizing:border-box}
 body{margin:0;background:var(--plane);color:var(--ink-1);line-height:1.65;
+  word-break:keep-all;
   font-family:system-ui,-apple-system,"Apple SD Gothic Neo","Segoe UI",sans-serif;
   font-size:15px;-webkit-text-size-adjust:100%}
 .page{max-width:52rem;margin:0 auto;
@@ -45,14 +46,19 @@ body{margin:0;background:var(--plane);color:var(--ink-1);line-height:1.65;
 .masthead{padding-bottom:1.1rem;border-bottom:1px solid var(--line)}
 .eyebrow{margin:0 0 .35rem;color:var(--ink-3);font-size:.75rem;letter-spacing:.04em}
 h1{margin:0;font-size:clamp(1.3rem,3.2vw,1.75rem);font-weight:650;letter-spacing:-.01em;
-  line-height:1.35;overflow-wrap:anywhere}
+  line-height:1.35;word-break:keep-all;overflow-wrap:anywhere}
 .where{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem .7rem;
   margin:.7rem 0 0;color:var(--ink-2);font-size:.85rem;overflow-wrap:anywhere}
 .where span{min-width:0}
-.badge{flex:none;border:1px solid var(--line);border-radius:999px;
+/* `flex:none` + `nowrap`이면 배지가 줄바꿈도 축소도 못 한다. 모델이 쓴 100자짜리
+   status 하나가 320px에서 문서 전체를 밀어낸다 (Codex 화면 검토 2026-08-21).
+   상태 단어는 잘리면 안 되므로 감추지 않고 접는다. 색은 상태 팔레트를 쓴다 —
+   series 파랑은 12px 글자로 3.91:1이라 읽기 어렵다. */
+.badge{flex:0 1 auto;min-width:0;border:1px solid var(--line);border-radius:10px;
   background:var(--surface-2);color:var(--ink-2);
-  padding:.1rem .6rem;font-size:.75rem;font-weight:600;white-space:nowrap}
-.badge.is-pass{color:var(--series-1);border-color:var(--series-1)}
+  padding:.1rem .6rem;font-size:.75rem;font-weight:600;
+  word-break:keep-all;overflow-wrap:anywhere}
+.badge.is-pass{color:var(--good);border-color:var(--good)}
 .badge.is-blocked{color:var(--warn);border-color:var(--warn)}
 .lede{margin:1.6rem 0 0;color:var(--ink-2);font-size:.98rem;overflow-wrap:anywhere}
 .sec{margin:2.2rem 0 0}
@@ -78,9 +84,12 @@ h1{margin:0;font-size:clamp(1.3rem,3.2vw,1.75rem);font-weight:650;letter-spacing
 .prose blockquote p{margin:.3rem 0}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.86em;
   background:var(--code);border-radius:4px;padding:0 .22em;overflow-wrap:anywhere}
+/* 가로로 구르는 코드 블록에는 키보드 진입점을 준다 — 없으면 마우스 없이는
+   오른쪽에 가려진 코드를 볼 방법이 없다. `word-break`는 코드에 적용하지 않는다. */
 pre{margin:1rem 0;background:var(--surface-2);border:1px solid var(--line);
   border-radius:10px;padding:.85rem 1rem;overflow-x:auto;font-size:.84em;
-  line-height:1.55}
+  line-height:1.55;word-break:normal}
+pre:focus-visible{outline:2px solid var(--series-1);outline-offset:2px}
 pre code{background:none;padding:0;font-size:1em;overflow-wrap:normal}
 strong{font-weight:700}
 .empty{margin:1.6rem 0 0;color:var(--ink-3);font-size:.9rem}
@@ -103,7 +112,8 @@ def md_lite(text: str) -> str:
     인용이 테두리 여러 개로 쪼개져 서로 다른 인용처럼 보인다.
     """
     out: list[str] = []
-    in_ul = in_pre = in_bq = False
+    in_ul = in_bq = False
+    fence = 0                      # 열린 코드 펜스의 백틱 개수 (0 = 열려 있지 않음)
 
     def close_blocks(*, keep_ul: bool = False, keep_bq: bool = False) -> None:
         nonlocal in_ul, in_bq
@@ -115,15 +125,21 @@ def md_lite(text: str) -> str:
             in_bq = False
 
     for raw in text.splitlines():
-        if raw.strip().startswith("```"):
-            if in_pre:
-                out.append("</code></pre>")
-            else:
-                close_blocks()
-                out.append("<pre><code>")
-            in_pre = not in_pre
+        stripped_raw = raw.strip()
+        ticks = len(stripped_raw) - len(stripped_raw.lstrip("`"))
+        # **여는 펜스의 길이를 기억한다.** 백틱 3개면 무엇이든 닫는 것으로 보면,
+        # ````로 연 블록 안의 ```가 블록을 조기에 닫고 뒤 문단까지 코드로 삼킨다
+        # (Codex 화면 검토 2026-08-21).
+        if fence and ticks >= fence and not stripped_raw.lstrip("`").strip():
+            out.append("</code></pre>")
+            fence = 0
             continue
-        if in_pre:
+        if not fence and ticks >= 3:
+            close_blocks()
+            out.append('<pre tabindex="0"><code>')
+            fence = ticks
+            continue
+        if fence:
             out.append(_e(raw))
             continue
         line = _e(raw)
@@ -152,11 +168,11 @@ def md_lite(text: str) -> str:
         elif stripped:
             out.append(f"<p>{line}</p>")
     close_blocks()
-    if in_pre:
+    if fence:
         out.append("</code></pre>")
     # `<pre>`는 여는 태그 직후 개행 하나를 무시하지만 `<pre><code>`에서는 그 규칙이
     # `code`에 걸려 첫 줄이 빈 줄로 보인다. 이어 붙일 때 그 개행을 지운다.
-    return ("\n".join(out).replace("<pre><code>\n", "<pre><code>")
+    return ("\n".join(out).replace('<code>\n', "<code>")
             .replace("\n</code></pre>", "</code></pre>"))
 
 
@@ -220,7 +236,12 @@ def render_brief(*, brief: dict, repo: str | None) -> str:
     secs: list[str] = []
 
     def sec(title: str, items, marked: bool = False) -> None:
-        items = [i for i in (items or [])]
+        # **세는 것과 그리는 것이 같아야 한다.** 빈 문자열을 그대로 받으면 화면에는
+        # 빈 줄만 뜨는데 제목은 "결정 사항 2"라고 말하고, 모델이 리스트 대신 문자열을
+        # 흘리면 글자 하나가 항목 하나가 된다 (Codex 화면 검토 2026-08-21).
+        if isinstance(items, str):
+            items = [items]
+        items = [t for i in (items or []) if (t := str(i).strip())]
         if not items:
             return
         cls = "items marked" if marked else "items"

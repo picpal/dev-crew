@@ -26,13 +26,13 @@ TOKENS = """
 :root{color-scheme:light dark;
   --plane:#f9f9f7;--surface:#fcfcfb;--surface-2:#f2f1ed;
   --line:rgba(11,11,11,.10);--line-strong:#c3c2b7;--grid:#e1e0d9;
-  --ink-1:#0b0b0b;--ink-2:#52514e;--ink-3:#898781;
-  --series-1:#2a78d6;--good:#006300;--bad:#d03b3b;--shadow:rgba(11,11,11,.05);
+  --ink-1:#0b0b0b;--ink-2:#52514e;--ink-3:#6e6c67;
+  --series-1:#2a78d6;--good:#006300;--bad:#c22f2f;--shadow:rgba(11,11,11,.05);
   --code:rgba(11,11,11,.055)}
 @media (prefers-color-scheme:dark){
   :root{--plane:#0d0d0d;--surface:#1a1a19;--surface-2:#212120;
     --line:rgba(255,255,255,.10);--line-strong:#383835;--grid:#2c2c2a;
-    --ink-1:#fff;--ink-2:#c3c2b7;--ink-3:#898781;
+    --ink-1:#fff;--ink-2:#c3c2b7;--ink-3:#93918a;
     --series-1:#3987e5;--good:#0ca30c;--bad:#e66767;--shadow:rgba(0,0,0,.3);
     --code:rgba(255,255,255,.07)}}
 """
