@@ -134,3 +134,36 @@ def test_no_arrow_where_the_model_declared_no_edge():
                              "nodes": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
                              "edges": [{"from": "a", "to": "b"}]})
     assert "flow-arrow" in linked
+
+
+def test_zero_bar_draws_nothing_not_a_stub():
+    """`min-width` 스텁이 남으면 "값 없음"이 "조금 있음"으로 보인다."""
+    from devcrew.report.charts import bar_chart
+    out = bar_chart([("a", 0.0), ("b", 50.0)], unit="%", full=100.0)
+    assert 'chart-fill is-zero" style="width:0.0%"' in out
+    assert out.count("is-zero") == 1
+
+
+def test_changed_scale_and_dropped_items_are_stated_on_screen():
+    """말없이 기준을 바꾸면 "40%"라고 쓰인 막대가 트랙의 15%만 채우고, 말없이 버리면
+    그 데이터가 애초에 없었던 것처럼 보인다 (Codex 화면 검토 2026-08-21)."""
+    from devcrew.report.charts import render_diagram
+    out = render_diagram({"type": "bar", "unit": "%",
+                          "items": [{"label": "정상", "value": 40},
+                                    {"label": "음수", "value": -30},
+                                    {"label": "초과", "value": 260}]})
+    assert "최댓값(260%) 기준" in out and "1건" in out
+
+
+def test_fallback_table_is_named_and_reachable_by_keyboard():
+    from devcrew.report.charts import render_diagram
+    out = render_diagram({"type": "sankey", "items": [{"a": 1, "b": 2}]})
+    assert 'tabindex="0"' in out and 'role="region"' in out
+    assert "<caption>" in out and 'scope="col"' in out
+
+
+def test_arrow_is_not_painted_in_the_line_colour():
+    """화살표는 방향을 전달하는 유일한 표식이다. 선 색은 1.37~1.59:1이라 안 보인다."""
+    from devcrew.report.charts import CHART_CSS
+    rule = CHART_CSS.split(".flow-arrow{")[1].split("}")[0]
+    assert "--ink-3" in rule and "line-strong" not in rule

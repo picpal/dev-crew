@@ -30,8 +30,13 @@ CHART_CSS = """
              min-width:0}
 .chart-fill{height:100%;border-radius:0 4px 4px 0;background:var(--series-1);
             min-width:2px}
+/* 0은 0으로 보여야 한다. min-width 스텁이 남으면 "값 없음"이 "조금 있음"이 된다. */
+.chart-fill.is-zero{min-width:0}
+/* 숫자는 끊지 않되 단위는 접힌다 — 단위 문자열은 모델이 쓰므로 길이에 상한이 없고,
+   값 열 전체가 nowrap이면 그 한 덩어리가 차트를 컨테이너 밖으로 민다. */
 .chart-value{font-size:.82rem;color:var(--ink-1);font-variant-numeric:tabular-nums;
-             white-space:nowrap}
+             min-width:0;overflow-wrap:anywhere}
+.chart-num{white-space:nowrap}
 @media (max-width:520px){
   .chart{gap:1rem}
   .chart-row{grid-template-columns:1fr auto;gap:.3rem .7rem;
@@ -45,12 +50,18 @@ CHART_CSS = """
 .flow-gap{height:.5rem}
 .flow-link{display:flex;align-items:center;gap:.45rem;padding:.15rem 0 .15rem .9rem;
            color:var(--ink-3);font-size:.75rem;line-height:1.3}
-.flow-arrow{color:var(--line-strong)}
+.flow-link span{min-width:0;word-break:keep-all;overflow-wrap:anywhere}
+/* 화살표는 방향을 전달하는 유일한 표식이다. 선 색(1.37~1.59:1)으로 칠하면 안 보인다. */
+.flow-arrow{flex:none;color:var(--ink-3)}
 .flow-extra-title{margin:.75rem 0 .1rem;color:var(--ink-3);font-size:.7rem;
                   letter-spacing:.04em}
 .flow-extra{margin:.1rem 0 0;padding:0;list-style:none;color:var(--ink-3);
             font-size:.75rem;line-height:1.6}
 .table-wrap{overflow-x:auto;margin:.9rem 0}
+.table-wrap:focus-visible{outline:2px solid var(--series-1);outline-offset:2px}
+.table-wrap caption{caption-side:top;text-align:left;padding:0 0 .35rem;
+                    color:var(--ink-3);font-size:.72rem}
+.chart-note{margin:.5rem 0 0;color:var(--ink-3);font-size:.72rem}
 .table-wrap table{border-collapse:collapse;min-width:100%;font-size:.8rem}
 .table-wrap th,.table-wrap td{border-bottom:1px solid var(--line);padding:.4rem .6rem;
                               text-align:left;white-space:nowrap}
@@ -78,7 +89,7 @@ def _num(v) -> float | None:
 
 
 def bar_chart(items: list[tuple[str, float]], *, unit: str = "",
-              full: float | None = None) -> str:
+              full: float | None = None, note: str = "") -> str:
     """가로 막대. 요약의 영역별 정답률과 `bar` 도식이 함께 쓴다.
 
     막대 하나에 색 하나다. 값이 클수록 진하게 칠하면 길이가 이미 말한 것을 색으로
@@ -86,32 +97,47 @@ def bar_chart(items: list[tuple[str, float]], *, unit: str = "",
 
     `full`은 100%가 무엇인지 아는 경우(정답률 등)에 준다. 없으면 최댓값 기준이라
     "모두 40%"인 회차가 "하나는 꽉 참"으로 보인다 — 비교의 기준이 데이터마다
-    달라지는 것이 막대 그래프의 흔한 거짓말이다."""
+    달라지는 것이 막대 그래프의 흔한 거짓말이다.
+
+    `note`는 막대 아래에 붙는 한 줄이다. **기준이 바뀌었거나 항목을 버렸으면 반드시
+    적는다.** 말없이 기준을 바꾸면 "40%"라고 쓰인 막대가 트랙의 15%만 채우고, 말없이
+    버리면 그 데이터가 애초에 없었던 것처럼 보인다 (Codex 화면 검토 2026-08-21)."""
     if not items:
         return ""
     top = full if full and full > 0 else (max((v for _, v in items), default=0) or 1)
     rows = []
     for label, value in items:
         pct = max(0.0, min(100.0, value * 100.0 / top))
+        zero = " is-zero" if pct <= 0 else ""
         rows.append(
             f'<div class="chart-row">'
             f'<div class="chart-label">{_e(label)}</div>'
-            f'<div class="chart-track"><div class="chart-fill" style="width:{pct:.1f}%">'
-            f'</div></div>'
-            f'<div class="chart-value">{_e(_fmt(value))}{_e(unit)}</div></div>')
-    return '<div class="chart">' + "".join(rows) + "</div>"
+            f'<div class="chart-track"><div class="chart-fill{zero}" '
+            f'style="width:{pct:.1f}%"></div></div>'
+            f'<div class="chart-value"><span class="chart-num">{_e(_fmt(value))}</span>'
+            f'{_e(unit)}</div></div>')
+    out = '<div class="chart">' + "".join(rows) + "</div>"
+    return out + (f'<p class="chart-note">{_e(note)}</p>' if note else "")
 
 
 def _bar_spec(spec: dict) -> str:
-    items = [(it.get("label", ""), v)
-             for it in (spec.get("items") or []) if isinstance(it, dict)
-             and (v := _num(it.get("value"))) is not None]
+    raw = [it for it in (spec.get("items") or []) if isinstance(it, dict)]
+    items = [(it.get("label", ""), v) for it in raw
+             if (v := _num(it.get("value"))) is not None]
+    dropped = len(raw) - len(items)
     unit = str(spec.get("unit") or "")
     # `%`인데 100을 넘는 값이 오면 단위가 틀린 것이다. 100에 붙여 자르면 260%와 40%가
     # 둘 다 "꽉 참"과 "조금"이 아니라 거짓 비율이 된다 — 기준을 최댓값으로 되돌려
-    # 적어도 **막대끼리의 비례**는 지킨다.
-    full = 100.0 if unit == "%" and all(v <= 100 for _, v in items) else None
-    return bar_chart(items, unit=unit, full=full)
+    # 적어도 **막대끼리의 비례**는 지킨다. 다만 `%` 트랙은 0~100을 뜻하므로,
+    # 기준이 바뀌었으면 화면에 적는다. 조용히 바꾸면 그것도 거짓말이다.
+    over = unit == "%" and any(v > 100 for _, v in items)
+    full = 100.0 if unit == "%" and not over else None
+    notes = []
+    if over:
+        notes.append(f"막대는 100%가 아니라 최댓값({_fmt(max(v for _, v in items))}%) 기준입니다")
+    if dropped:
+        notes.append(f"그릴 수 없는 값({dropped}건)은 막대에서 뺐습니다")
+    return bar_chart(items, unit=unit, full=full, note=" · ".join(notes))
 
 
 def _flow_spec(spec: dict) -> str:
@@ -164,10 +190,13 @@ def _table_fallback(spec: dict) -> str:
     if not items:
         return ""
     keys = list(dict.fromkeys(k for it in items for k in it))
-    head = "".join(f"<th>{_e(k)}</th>" for k in keys)
+    head = "".join(f'<th scope="col">{_e(k)}</th>' for k in keys)
     rows = "".join("<tr>" + "".join(f"<td>{_e(it.get(k, ''))}</td>" for k in keys) + "</tr>"
                    for it in items)
-    return ('<div class="table-wrap"><table><thead><tr>' + head
+    return ('<div class="table-wrap" tabindex="0" role="region" '
+            'aria-label="그리지 못한 도식의 값 표">'
+            '<table><caption>그림으로 그리지 못해 값만 표로 옮겼습니다</caption>'
+            '<thead><tr>' + head
             + "</tr></thead><tbody>" + rows + "</tbody></table></div>")
 
 

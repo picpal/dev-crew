@@ -140,3 +140,21 @@ def test_document_quotes_are_not_set_in_monospace():
     qs = parse_questions([_q("세션", 0, path="DESIGN.md"), _q("권한", 0, path="a.py")])
     html = _html(grade(qs, {0: 0, 1: 0}), repo=None)
     assert html.count('evi-quote is-prose') == 1 and html.count('"evi-quote"') == 1
+
+
+def test_zero_score_meter_draws_nothing():
+    """0점인데 미터에 2px 스텁이 남으면 "조금 맞음"처럼 보인다 (Codex 화면 검토)."""
+    qs = parse_questions([_q("세션", 0), _q("권한", 0)])
+    html = _html(grade(qs, {0: 1, 1: 1}), repo=None)
+    assert 'meter-fill is-zero" style="width:0%"' in html
+    scored = _html(grade(qs, {0: 0, 1: 1}), repo=None)
+    assert 'meter-fill" style=' in scored          # 점수가 있으면 스텁 규칙을 안 붙인다
+
+
+def test_korean_prose_keeps_words_whole():
+    """기본 CJK 줄바꿈은 음절 사이를 끊는다 — 긴 토큰 방어가 한글 조판을 훼손했다."""
+    qs = parse_questions([_q("세션", 0)])
+    html = _html(grade(qs, {0: 0}), repo=None)
+    assert "word-break:keep-all" in html
+    evi = html.split(".evi-quote{")[1].split("}")[0]
+    assert "word-break:normal" in evi          # 인용은 원문 그대로

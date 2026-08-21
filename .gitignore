@@ -7,3 +7,4 @@ poc/_artifacts/
 
 # 로컬 비밀
 .env
+.codex-screens/

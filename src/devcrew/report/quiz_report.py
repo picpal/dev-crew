@@ -40,6 +40,7 @@ TOKENS = """
 _CSS = TOKENS + """
 *{box-sizing:border-box}
 body{margin:0;background:var(--plane);color:var(--ink-1);line-height:1.65;
+  word-break:keep-all;
   font-family:system-ui,-apple-system,"Apple SD Gothic Neo","Segoe UI",sans-serif;
   -webkit-text-size-adjust:100%}
 .page{max-width:56rem;margin:0 auto;padding:clamp(1.2rem,4vw,3rem) clamp(1rem,4vw,2rem) 5rem}
@@ -59,7 +60,9 @@ h1{margin:0;font-size:clamp(1.35rem,3.4vw,1.8rem);font-weight:650;letter-spacing
 .hero-sub{margin:.5rem 0 0;color:var(--ink-2);font-size:.85rem}
 .meter{height:8px;border-radius:999px;background:var(--grid);margin-top:.85rem;
   overflow:hidden}
+/* 0은 0으로 보여야 한다 — min-width 스텁이 남으면 0점 회차가 "조금 맞음"이 된다. */
 .meter-fill{height:100%;border-radius:0 4px 4px 0;background:var(--series-1);min-width:2px}
+.meter-fill.is-zero{min-width:0}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(5.5rem,1fr));
   gap:.6rem;margin:0}
 .stat{border:1px solid var(--line);border-radius:10px;background:var(--surface-2);
@@ -93,7 +96,8 @@ h1{margin:0;font-size:clamp(1.35rem,3.4vw,1.8rem);font-weight:650;letter-spacing
 .qa>summary:hover{background:var(--surface-2)}
 .q-no{color:var(--ink-3);font-size:.78rem;font-variant-numeric:tabular-nums;
   padding-top:.15rem;white-space:nowrap}
-.q-stem{flex:1;min-width:0;overflow-wrap:anywhere;font-weight:550;font-size:.92rem}
+.q-stem{flex:1;min-width:0;word-break:keep-all;overflow-wrap:anywhere;
+  font-weight:550;font-size:.92rem}
 .chip{display:inline-flex;align-items:center;gap:.25rem;border-radius:999px;
   padding:.1rem .5rem;font-size:.72rem;font-weight:600;white-space:nowrap;
   border:1px solid var(--line);background:var(--surface-2);color:var(--ink-2)}
@@ -120,8 +124,10 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.86em;
   background:var(--surface-2);border-radius:0 8px 8px 0}
 .evi-at{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.74rem;
   color:var(--ink-3);overflow-wrap:anywhere}
+/* 인용은 원문 그대로다 — 코드에는 한글 어절 규칙을 적용하지 않는다. */
 .evi-quote{margin:.25rem 0 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-  font-size:.76rem;color:var(--ink-2);white-space:pre-wrap;overflow-wrap:anywhere}
+  font-size:.76rem;color:var(--ink-2);white-space:pre-wrap;
+  word-break:normal;overflow-wrap:anywhere}
 .evi-quote.is-prose{font-family:inherit;font-size:.83rem;line-height:1.6}
 @media (max-width:640px){.hero{grid-template-columns:minmax(0,1fr);gap:1.2rem}}
 """ + CHART_CSS
@@ -251,6 +257,7 @@ def render_quiz_report(card: Scorecard, *, repo: str | None,
     headline = ("이번 회차, 전부 맞혔습니다" if card.total and card.correct == card.total
                 else "이번 회차에서 무엇을 놓쳤나")
     delta = f"+{int(added)}" if added else "0"
+    zero = " is-zero" if not card.correct else ""
     panel = (f'<section class="card panel"><h2 class="panel-title">영역별 정답률</h2>'
              f'{chart}{table}{_weakest(card)}</section>') if pct else ""
     return f"""<!doctype html>
@@ -269,7 +276,7 @@ def render_quiz_report(card: Scorecard, *, repo: str | None,
     <p class="hero-label">정답</p>
     <p class="hero-figure">{card.correct}<span class="hero-of">/ {card.total}</span></p>
     <p class="hero-sub">{card.total}문항 중 {card.correct}문항 정답 · {rate}%</p>
-    <div class="meter"><div class="meter-fill" style="width:{rate}%"></div></div>
+    <div class="meter"><div class="meter-fill{zero}" style="width:{rate}%"></div></div>
   </div>
   <dl class="stats">
     <div class="stat"><dt>오답 노트 추가</dt><dd>{delta}</dd></div>
