@@ -45,6 +45,20 @@ def test_wrong_answers_open_by_default(card):
     assert html.count('<details class="qa" open>') == card.total - card.correct
 
 
+def test_mostly_wrong_rounds_collapse_every_card():
+    """열 중 아홉이 펼쳐져 있으면 펼침은 '여기를 보라'는 뜻을 잃는다."""
+    qs = parse_questions([_q("세션", 0), _q("세션", 0, path="b.py"), _q("권한", 0)])
+    html = _html(grade(qs, {0: 1, 1: 1, 2: 1}), repo=None)     # 전부 오답
+    assert " open>" not in html
+
+
+def test_single_area_round_has_no_area_chart():
+    """막대 하나짜리 차트는 차트가 아니다 — hero가 이미 같은 값을 말한다."""
+    qs = parse_questions([_q("세션", 0), _q("세션", 1, path="b.py")])
+    html = _html(grade(qs, {0: 0, 1: 1}), repo=None)
+    assert "영역별 정답률" not in html and "가장 약한 영역" not in html
+
+
 def test_cards_are_grouped_by_area_in_issue_order(card):
     html = _html(card)
     assert '<span class="area-name">세션</span>' in html
@@ -111,3 +125,18 @@ def test_report_defines_both_light_and_dark_palettes():
 def test_report_is_deterministic_so_publishing_stays_idempotent(card):
     """발행은 content hash로 멱등이다 — 렌더마다 값이 바뀌면 같은 회차가 매번 새 객체."""
     assert _html(card) == _html(card)
+
+
+def test_headline_does_not_claim_a_miss_on_a_perfect_round():
+    """제목이 늘 '무엇을 놓쳤나'면 만점 회차에서 거짓말이 된다."""
+    qs = parse_questions([_q("세션", 0), _q("권한", 0)])
+    html = _html(grade(qs, {0: 0, 1: 0}), repo=None, added=0, cleared=2)
+    assert "무엇을 놓쳤나" not in html and "전부 맞혔습니다" in html
+    assert "영역별 정답률" not in html          # 100% 막대만 늘어놓을 이유가 없다
+
+
+def test_document_quotes_are_not_set_in_monospace():
+    """문서 인용은 산문이다 — 한글을 고정폭으로 깔면 읽기가 나빠진다."""
+    qs = parse_questions([_q("세션", 0, path="DESIGN.md"), _q("권한", 0, path="a.py")])
+    html = _html(grade(qs, {0: 0, 1: 0}), repo=None)
+    assert html.count('evi-quote is-prose') == 1 and html.count('"evi-quote"') == 1

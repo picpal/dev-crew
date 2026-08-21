@@ -22,8 +22,8 @@ import html as _html
 # 라이트/다크 전환이 두 군데로 갈린다.
 CHART_CSS = """
 .chart{display:grid;gap:.55rem;margin:.9rem 0}
-.chart-row{display:grid;grid-template-columns:minmax(0,10.5rem) 1fr auto;
-           align-items:center;gap:.7rem}
+.chart-row{display:grid;grid-template-columns:minmax(0,13rem) minmax(0,26rem) auto;
+           justify-content:start;align-items:center;gap:.7rem}
 .chart-label{min-width:0;overflow-wrap:anywhere;color:var(--ink-2);font-size:.82rem;
              line-height:1.35}
 .chart-track{position:relative;height:10px;border-radius:999px;background:var(--grid);
@@ -39,13 +39,14 @@ CHART_CSS = """
   .chart-label{grid-area:label}.chart-value{grid-area:value}.chart-track{grid-area:track}
 }
 .flow{display:grid;gap:0;margin:.9rem 0;justify-items:stretch}
+.flow{max-width:38rem}
 .flow-node{border:1px solid var(--line);border-radius:10px;background:var(--surface-2);
            padding:.55rem .8rem;font-size:.85rem;line-height:1.45;overflow-wrap:anywhere}
 .flow-link{display:flex;align-items:center;gap:.45rem;padding:.15rem 0 .15rem .9rem;
            color:var(--ink-3);font-size:.75rem;line-height:1.3}
 .flow-arrow{color:var(--line-strong)}
-.flow-extra-title{margin:.75rem 0 .1rem;color:var(--ink-3);font-size:.68rem;
-                  letter-spacing:.08em;text-transform:uppercase}
+.flow-extra-title{margin:.75rem 0 .1rem;color:var(--ink-3);font-size:.7rem;
+                  letter-spacing:.04em}
 .flow-extra{margin:.1rem 0 0;padding:0;list-style:none;color:var(--ink-3);
             font-size:.75rem;line-height:1.6}
 .table-wrap{overflow-x:auto;margin:.9rem 0}

@@ -27,12 +27,14 @@ _TOKENS = """
   --plane:#f9f9f7;--surface:#fcfcfb;--surface-2:#f2f1ed;
   --line:rgba(11,11,11,.10);--line-strong:#c3c2b7;--grid:#e1e0d9;
   --ink-1:#0b0b0b;--ink-2:#52514e;--ink-3:#898781;
-  --series-1:#2a78d6;--good:#006300;--bad:#d03b3b;--shadow:rgba(11,11,11,.05)}
+  --series-1:#2a78d6;--good:#006300;--bad:#d03b3b;--shadow:rgba(11,11,11,.05);
+  --code:rgba(11,11,11,.055)}
 @media (prefers-color-scheme:dark){
   :root{--plane:#0d0d0d;--surface:#1a1a19;--surface-2:#212120;
     --line:rgba(255,255,255,.10);--line-strong:#383835;--grid:#2c2c2a;
     --ink-1:#fff;--ink-2:#c3c2b7;--ink-3:#898781;
-    --series-1:#3987e5;--good:#0ca30c;--bad:#e66767;--shadow:rgba(0,0,0,.3)}}
+    --series-1:#3987e5;--good:#0ca30c;--bad:#e66767;--shadow:rgba(0,0,0,.3);
+    --code:rgba(255,255,255,.07)}}
 """
 
 _CSS = _TOKENS + """
@@ -42,8 +44,7 @@ body{margin:0;background:var(--plane);color:var(--ink-1);line-height:1.65;
   -webkit-text-size-adjust:100%}
 .page{max-width:56rem;margin:0 auto;padding:clamp(1.2rem,4vw,3rem) clamp(1rem,4vw,2rem) 5rem}
 .masthead{padding-bottom:1.1rem;border-bottom:1px solid var(--line)}
-.eyebrow{margin:0 0 .35rem;color:var(--ink-3);font-size:.75rem;letter-spacing:.09em;
-  text-transform:uppercase}
+.eyebrow{margin:0 0 .35rem;color:var(--ink-3);font-size:.75rem;letter-spacing:.04em}
 h1{margin:0;font-size:clamp(1.35rem,3.4vw,1.8rem);font-weight:650;letter-spacing:-.01em}
 .masthead .where{margin:.4rem 0 0;color:var(--ink-2);font-size:.85rem;
   overflow-wrap:anywhere}
@@ -51,8 +52,7 @@ h1{margin:0;font-size:clamp(1.35rem,3.4vw,1.8rem);font-weight:650;letter-spacing
   box-shadow:0 1px 2px var(--shadow)}
 .hero{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:1.6rem;
   align-items:center;padding:1.5rem clamp(1rem,3vw,1.8rem);margin:1.6rem 0 1rem}
-.hero-label{margin:0;color:var(--ink-3);font-size:.75rem;letter-spacing:.08em;
-  text-transform:uppercase}
+.hero-label{margin:0;color:var(--ink-3);font-size:.75rem;letter-spacing:.04em}
 .hero-figure{margin:.15rem 0 .1rem;font-size:clamp(2.6rem,9vw,3.6rem);font-weight:600;
   line-height:1.05;letter-spacing:-.03em}
 .hero-of{color:var(--ink-3);font-size:.42em;font-weight:500;margin-left:.15em}
@@ -60,7 +60,8 @@ h1{margin:0;font-size:clamp(1.35rem,3.4vw,1.8rem);font-weight:650;letter-spacing
 .meter{height:8px;border-radius:999px;background:var(--grid);margin-top:.85rem;
   overflow:hidden}
 .meter-fill{height:100%;border-radius:0 4px 4px 0;background:var(--series-1);min-width:2px}
-.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.6rem;margin:0}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(5.5rem,1fr));
+  gap:.6rem;margin:0}
 .stat{border:1px solid var(--line);border-radius:10px;background:var(--surface-2);
   padding:.7rem .8rem;min-width:0}
 .stat dt{margin:0;color:var(--ink-3);font-size:.72rem;line-height:1.35;
@@ -86,13 +87,13 @@ h1{margin:0;font-size:clamp(1.35rem,3.4vw,1.8rem);font-weight:650;letter-spacing
 .qa>summary{display:flex;gap:.6rem;align-items:flex-start;padding:.85rem 1rem;
   cursor:pointer;list-style:none}
 .qa>summary::-webkit-details-marker{display:none}
-.qa>summary::after{content:"▾";color:var(--ink-3);margin-left:auto;font-size:.7rem;
+.qa>summary::after{content:"▾";color:var(--ink-3);margin-left:.2rem;font-size:.7rem;
   line-height:1.9;flex:none}
 .qa[open]>summary::after{content:"▴"}
 .qa>summary:hover{background:var(--surface-2)}
 .q-no{color:var(--ink-3);font-size:.78rem;font-variant-numeric:tabular-nums;
   padding-top:.15rem;white-space:nowrap}
-.q-stem{min-width:0;overflow-wrap:anywhere;font-weight:550;font-size:.92rem}
+.q-stem{flex:1;min-width:0;overflow-wrap:anywhere;font-weight:550;font-size:.92rem}
 .chip{display:inline-flex;align-items:center;gap:.25rem;border-radius:999px;
   padding:.1rem .5rem;font-size:.72rem;font-weight:600;white-space:nowrap;
   border:1px solid var(--line);background:var(--surface-2);color:var(--ink-2)}
@@ -103,18 +104,17 @@ h1{margin:0;font-size:clamp(1.35rem,3.4vw,1.8rem);font-weight:650;letter-spacing
 .opt{display:grid;grid-template-columns:1.4rem minmax(0,1fr);gap:.5rem;
   align-items:start;border:1px solid transparent;border-radius:9px;
   padding:.45rem .6rem;font-size:.86rem;background:var(--surface-2)}
-.opt.is-answer{border-color:var(--good);background:transparent}
-.opt.is-picked{border-color:var(--bad);background:transparent}
+.opt.is-answer{border-color:var(--good)}
+.opt.is-picked{border-color:var(--bad)}
 .opt-key{color:var(--ink-3);font-weight:600;font-size:.78rem;padding-top:.1rem}
 .opt-text{min-width:0;overflow-wrap:anywhere;display:block}
 .opt-tags{display:flex;flex-wrap:wrap;gap:.3rem;margin-top:.3rem}
 .sect{margin-top:1.2rem}
-.sect-title{margin:0 0 .35rem;color:var(--ink-3);font-size:.72rem;letter-spacing:.08em;
-  text-transform:uppercase}
+.sect-title{margin:0 0 .35rem;color:var(--ink-3);font-size:.74rem;letter-spacing:.04em;
+  font-weight:600}
 .sect p{margin:0;font-size:.88rem;color:var(--ink-2)}
-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.88em;
-  background:var(--surface-2);border:1px solid var(--line);border-radius:5px;
-  padding:.05em .3em;overflow-wrap:anywhere}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.86em;
+  background:var(--code);border-radius:4px;padding:0 .22em;overflow-wrap:anywhere}
 .q-stem strong,.opt-text strong{font-weight:700}
 .evi{margin:.35rem 0 0;padding:.55rem .7rem;border-left:2px solid var(--line-strong);
   background:var(--surface-2);border-radius:0 8px 8px 0}
@@ -122,11 +122,8 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.88em;
   color:var(--ink-3);overflow-wrap:anywhere}
 .evi-quote{margin:.25rem 0 0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
   font-size:.76rem;color:var(--ink-2);white-space:pre-wrap;overflow-wrap:anywhere}
-@media (max-width:640px){
-  .hero{grid-template-columns:minmax(0,1fr);gap:1.2rem}
-  .stats{grid-template-columns:repeat(3,minmax(0,1fr))}
-}
-@media (max-width:420px){.stats{grid-template-columns:minmax(0,1fr)}}
+.evi-quote.is-prose{font-family:inherit;font-size:.83rem;line-height:1.6}
+@media (max-width:640px){.hero{grid-template-columns:minmax(0,1fr);gap:1.2rem}}
 """ + CHART_CSS
 
 
@@ -148,10 +145,19 @@ def _rich(v) -> str:
     return _BOLD_RE.sub(r"<strong>\1</strong>", out)
 
 
+PROSE_SUFFIX = (".md", ".txt", ".rst", ".adoc")
+
+
+def _prose(path: str) -> str:
+    """문서에서 뽑은 인용인가. 코드가 아니면 monospace를 씌우지 않는다 —
+    한글 산문을 고정폭으로 깔면 글자가 성기고 줄이 길어져 읽기가 나빠진다."""
+    return " is-prose" if str(path).lower().endswith(PROSE_SUFFIX) else ""
+
+
 def _mark(r) -> tuple[str, str]:
     """정오 표시 — 색만으로 말하지 않는다. 기호 + 말이 함께 간다."""
     if r.choice is None:
-        return "chip-no", "○ 미응답"
+        return "", "○ 미응답"
     return ("chip-ok", "✓ 정답") if r.correct else ("chip-no", "✗ 오답")
 
 
@@ -169,19 +175,23 @@ def _option(i: int, o: str, *, is_answer: bool, is_picked: bool) -> str:
             f'<span class="opt-text">{_rich(o)}{tag_html}</span></li>')
 
 
-def _card(idx: int, r) -> str:
+def _card(idx: int, r, *, open_wrong: bool) -> str:
     """문항 하나. **틀린 문항은 펼친 채로 낸다** — 리포트를 여는 이유가 거기 있는데
-    전부 접어 두면 사용자가 열 문항을 일일이 눌러야 오답을 찾는다."""
+    전부 접어 두면 사용자가 열 문항을 일일이 눌러야 오답을 찾는다.
+
+    다만 절반 넘게 틀린 회차에서는 전부 접는다(`open_wrong=False`). 열 개 중 아홉이
+    펼쳐져 있으면 펼침은 "여기를 보라"는 뜻을 잃고 페이지만 길어진다."""
     q = r.question
     cls, label = _mark(r)
     opts = "".join(_option(i, o, is_answer=(i == q.answer_index), is_picked=(i == r.choice))
                    for i, o in enumerate(q.options))
     evi = "".join(
         f'<div class="evi"><div class="evi-at">{_e(e.path)}:{e.start_line}–{e.end_line}</div>'
-        f'<div class="evi-quote">{_e(e.quote)}</div></div>' for e in q.evidence)
+        f'<div class="evi-quote{_prose(e.path)}">{_e(e.quote)}</div></div>'
+        for e in q.evidence)
     diagram = render_diagram(q.diagram)
     return (
-        f'<details class="qa"{"" if r.correct else " open"}>'
+        f'<details class="qa"{" open" if (open_wrong and not r.correct) else ""}>'
         f'<summary><span class="q-no">Q{idx}</span>'
         f'<span class="q-stem">{_rich(q.stem)}</span>'
         f'<span class="chip {cls}">{label}</span></summary>'
@@ -211,19 +221,24 @@ def _weakest(card: Scorecard) -> str:
     if not ranked or ranked[0][0] >= 1:
         return '<p class="panel-note">모든 영역을 다 맞혔습니다.</p>'
     _, area, ok, n = ranked[0]
-    return (f'<p class="panel-note">가장 약한 영역 — <b>{_e(area)}</b> '
-            f'{ok} / {n}. 이 영역의 문항부터 펼쳐 보세요.</p>')
+    return (f'<p class="panel-note">가장 약한 영역 — <b>{_e(area)}</b> {ok} / {n}</p>')
 
 
 def render_quiz_report(card: Scorecard, *, repo: str | None,
                        added: int, cleared: int) -> str:
     """채점 결과 → 단일 파일 HTML."""
-    pct = card.area_pct()
+    # 막대 하나짜리 차트는 차트가 아니다. "가장 약한 영역"도 비교가 있어야 뜻이 선다.
+    # 만점 회차도 마찬가지 — 100% 막대만 늘어놓느니 hero 한 줄이 낫다.
+    show_areas = len(card.by_area) > 1 and card.correct < card.total
+    pct = card.area_pct() if show_areas else []
     chart = bar_chart(pct, unit="%", full=100.0) if pct else ""
     table = _area_table(card) if pct else ""
+    wrong = card.total - card.correct
+    open_wrong = 0 < wrong <= card.total / 2
     groups = []
     for area in dict.fromkeys(r.question.area for r in card.results):
-        cards = "".join(_card(i + 1, r) for i, r in enumerate(card.results)
+        cards = "".join(_card(i + 1, r, open_wrong=open_wrong)
+                        for i, r in enumerate(card.results)
                         if r.question.area == area)
         ok, n = card.by_area.get(area, (0, 0))
         groups.append(
@@ -232,6 +247,10 @@ def render_quiz_report(card: Scorecard, *, repo: str | None,
             f'<span class="area-score">{ok} / {n}</span></h2>{cards}</section>')
     where = (f'<p class="where">대상 저장소 <code>{_e(repo)}</code></p>' if repo else "")
     rate = round(card.correct * 100 / card.total) if card.total else 0
+    # 제목이 늘 "무엇을 놓쳤나"면 만점 회차에서 거짓말이 된다
+    headline = ("이번 회차, 전부 맞혔습니다" if card.total and card.correct == card.total
+                else "이번 회차에서 무엇을 놓쳤나")
+    delta = f"+{int(added)}" if added else "0"
     panel = (f'<section class="card panel"><h2 class="panel-title">영역별 정답률</h2>'
              f'{chart}{table}{_weakest(card)}</section>') if pct else ""
     return f"""<!doctype html>
@@ -242,7 +261,7 @@ def render_quiz_report(card: Scorecard, *, repo: str | None,
 <main class="page">
 <header class="masthead">
   <p class="eyebrow">dev-crew · 학습 회차 리포트</p>
-  <h1>이번 회차에서 무엇을 놓쳤나</h1>
+  <h1>{headline}</h1>
   {where}
 </header>
 <section class="card hero">
@@ -253,7 +272,7 @@ def render_quiz_report(card: Scorecard, *, repo: str | None,
     <div class="meter"><div class="meter-fill" style="width:{rate}%"></div></div>
   </div>
   <dl class="stats">
-    <div class="stat"><dt>오답 노트 추가</dt><dd>+{int(added)}</dd></div>
+    <div class="stat"><dt>오답 노트 추가</dt><dd>{delta}</dd></div>
     <div class="stat"><dt>해소</dt><dd>{int(cleared)}</dd></div>
     <div class="stat"><dt>영역</dt><dd>{len(card.by_area)}</dd></div>
   </dl>
