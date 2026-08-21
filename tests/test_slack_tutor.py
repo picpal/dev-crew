@@ -360,3 +360,60 @@ def test_score_blocks_break_areas_into_lines_with_a_report_button():
     assert areas.count("\n") >= 2
     btn = next(b for b in blocks if b["type"] == "actions")["elements"][0]
     assert btn["url"] == "https://r/x"
+
+
+# ── Block Kit 한도 (2026-08-21) ─────────────────────────────────────────────
+# Slack이 거절하면 문항이 아예 안 뜬다. 길이는 모델이 정하므로 상한을 테스트로 고정한다.
+LIMITS = {"blocks": 50, "section": 3000, "header": 150, "context_el": 10,
+          "actions_el": 25, "button": 75, "value": 2000}
+
+
+def assert_block_kit_valid(blocks):
+    assert len(blocks) <= LIMITS["blocks"], f"블록 {len(blocks)}개"
+    for b in blocks:
+        if b["type"] == "section":
+            assert len(b["text"]["text"]) <= LIMITS["section"]
+            assert b["text"]["type"] == "mrkdwn"
+        elif b["type"] == "header":
+            assert b["text"]["type"] == "plain_text"
+            assert len(b["text"]["text"]) <= LIMITS["header"]
+        elif b["type"] == "context":
+            assert len(b["elements"]) <= LIMITS["context_el"]
+        elif b["type"] == "actions":
+            assert len(b["elements"]) <= LIMITS["actions_el"]
+            for e in b["elements"]:
+                assert e["text"]["type"] == "plain_text"
+                assert 0 < len(e["text"]["text"]) <= LIMITS["button"]
+                assert len(e.get("value", "")) <= LIMITS["value"]
+
+
+def test_question_blocks_stay_inside_slack_limits_on_absurd_input():
+    from devcrew.slack_tutor import question_blocks
+    q = _question(area="영" * 400, stem="지" * 5000,
+                  options=["보" * 3000, "`" + "코" * 200 + "`", "**" + "굵" * 100 + "**", "d"])
+    assert_block_kit_valid(question_blocks(q, 0, 10))
+
+
+def test_opening_and_score_blocks_stay_inside_slack_limits():
+    from devcrew.quiz import Scorecard
+    from devcrew.slack_tutor import opening_blocks, regrade_blocks, score_blocks
+    assert_block_kit_valid(opening_blocks("리" * 300, 10, shortfall=True, misses=99))
+    card = Scorecard(total=60, correct=31,
+                     by_area={f"영역{i} " + "긴" * 50: (i % 3, 3) for i in range(30)})
+    assert_block_kit_valid(score_blocks(card, repo_name="r" * 300,
+                                        url="https://example.test/" + "x" * 200,
+                                        added=9, cleared=9))
+    assert_block_kit_valid(regrade_blocks())
+
+
+def test_area_lines_are_cut_by_line_not_by_character():
+    """글자 수로 자르면 마지막 줄이 문장 도중에 끊겨 고장난 것처럼 보인다."""
+    from devcrew.quiz import Scorecard
+    from devcrew.slack_tutor import AREA_LINES, score_blocks
+    card = Scorecard(total=60, correct=30,
+                     by_area={f"영역{i}": (1, 2) for i in range(AREA_LINES + 5)})
+    text = next(b["text"]["text"] for b in score_blocks(
+        card, repo_name="r", url=None, added=0, cleared=0)
+        if b["type"] == "section" and "영역별" in b["text"]["text"])
+    assert "외 5개 영역" in text                        # 자른 사실을 숨기지 않는다
+    assert all(l.strip() for l in text.splitlines())    # 잘린 반쪽 줄이 없다

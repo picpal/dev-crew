@@ -103,3 +103,34 @@ def test_fence_strips_forged_closing_marker():
     assert out.startswith("<<<questions\n") and out.endswith("\nquestions")
     assert out.count("\nquestions\n") == 0          # 본문 안의 닫는 표식이 무력화됨
     assert "<<<questions\n정상" in out
+
+
+# ── 도식 갤러리에서 나온 것 (2026-08-21) ────────────────────────────────────
+def test_negative_values_are_dropped_not_clamped():
+    """클램프하면 막대는 0인데 라벨은 -30%로 남아 둘이 서로 다른 말을 한다."""
+    from devcrew.report.charts import render_diagram
+    out = render_diagram({"type": "bar", "unit": "%",
+                          "items": [{"label": "정상", "value": 40},
+                                    {"label": "음수", "value": -30}]})
+    assert "정상" in out and "음수" not in out and "-30" not in out
+
+
+def test_percent_over_a_hundred_falls_back_to_max_scaling():
+    """`%`인데 260이 오면 단위가 틀린 것이다. 100에 붙여 자르면 비율이 거짓이 된다."""
+    from devcrew.report.charts import render_diagram
+    out = render_diagram({"type": "bar", "unit": "%",
+                          "items": [{"label": "정상", "value": 130},
+                                    {"label": "초과", "value": 260}]})
+    assert "width:100.0%" in out and "width:50.0%" in out   # 최댓값 기준으로 비례
+
+
+def test_no_arrow_where_the_model_declared_no_edge():
+    """간선 없는 자리에 화살표를 두면 하네스가 없는 흐름을 주장하는 셈이다."""
+    from devcrew.report.charts import render_diagram
+    out = render_diagram({"type": "flow",
+                          "nodes": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}]})
+    assert "flow-arrow" not in out and "flow-gap" in out
+    linked = render_diagram({"type": "flow",
+                             "nodes": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+                             "edges": [{"from": "a", "to": "b"}]})
+    assert "flow-arrow" in linked

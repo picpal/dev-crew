@@ -33,6 +33,7 @@ REGRADE_VALUE = "__REGRADE__"   # 채점 실패 후 다시 채점하는 버튼�
 LETTERS = "ABCDEFGH"
 BAR_FULL, BAR_EMPTY = "▰", "▱"
 TYPE_HINT = {"CORRECT": ("✅", "옳은 것"), "INCORRECT": ("⛔", "틀린 것")}
+AREA_LINES = 12          # 채점 결과에 펼치는 영역 줄 수 상한
 NEED_REPO = ("⚠️ 대상 repo를 지정해 주세요 — `@tutor <repo명>: ` 형식입니다.\n"
              "등록된 repo: {repos}")
 STALE_MSG = ("⚠️ 이 회차는 하루가 지나 이어서 풀 수 없습니다. "
@@ -161,11 +162,16 @@ def score_blocks(card: Scorecard, *, repo_name: str, url: str | None,
                   f"{bar(card.correct, card.total)}")}},
     ]
     if card.by_area:
-        lines = "\n".join(f"{bar(ok, n, 5)}  {plain(area, 40)}  ·  *{ok}/{n}*"
-                           for area, (ok, n) in card.by_area.items())
+        # 글자 수로 자르면 마지막 줄이 문장 도중에 끊겨 고장난 것처럼 보인다.
+        # 줄 단위로 자르고, 자른 사실을 숨기지 않는다.
+        shown = list(card.by_area.items())[:AREA_LINES]
+        lines = [f"{bar(ok, n, 5)}  {plain(area, 40)}  ·  *{ok}/{n}*"
+                 for area, (ok, n) in shown]
+        if len(card.by_area) > AREA_LINES:
+            lines.append(f"_… 외 {len(card.by_area) - AREA_LINES}개 영역은 리포트에서_")
         blocks += [{"type": "divider"},
                    {"type": "section", "text": {"type": "mrkdwn",
-                    "text": f"*영역별*\n{lines}"[:2900]}}]
+                    "text": "*영역별*\n" + "\n".join(lines)}}]
     if added or cleared:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
                        "text": f"📕 오답 노트 · 새로 담음 *{added}* · 해소 *{cleared}*"}]})

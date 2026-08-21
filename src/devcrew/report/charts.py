@@ -42,6 +42,7 @@ CHART_CSS = """
 .flow{max-width:38rem}
 .flow-node{border:1px solid var(--line);border-radius:10px;background:var(--surface-2);
            padding:.55rem .8rem;font-size:.85rem;line-height:1.45;overflow-wrap:anywhere}
+.flow-gap{height:.5rem}
 .flow-link{display:flex;align-items:center;gap:.45rem;padding:.15rem 0 .15rem .9rem;
            color:var(--ink-3);font-size:.75rem;line-height:1.3}
 .flow-arrow{color:var(--line-strong)}
@@ -67,10 +68,13 @@ def _fmt(v: float) -> str:
 
 
 def _num(v) -> float | None:
-    """모델이 문자열 수치("많음")를 흘려도 그래프가 깨지지 않게 한다."""
+    """모델이 문자열 수치("많음")를 흘려도 그래프가 깨지지 않게 한다.
+
+    음수도 버린다. 가로 막대에는 음의 길이가 없어서 0으로 접히는데, 라벨은 `-30%`로
+    남아 **막대와 숫자가 서로 다른 말을 한다** (도식 갤러리 2026-08-21)."""
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
-    return float(v)
+    return float(v) if float(v) >= 0 else None
 
 
 def bar_chart(items: list[tuple[str, float]], *, unit: str = "",
@@ -103,7 +107,11 @@ def _bar_spec(spec: dict) -> str:
              for it in (spec.get("items") or []) if isinstance(it, dict)
              and (v := _num(it.get("value"))) is not None]
     unit = str(spec.get("unit") or "")
-    return bar_chart(items, unit=unit, full=100.0 if unit == "%" else None)
+    # `%`인데 100을 넘는 값이 오면 단위가 틀린 것이다. 100에 붙여 자르면 260%와 40%가
+    # 둘 다 "꽉 참"과 "조금"이 아니라 거짓 비율이 된다 — 기준을 최댓값으로 되돌려
+    # 적어도 **막대끼리의 비례**는 지킨다.
+    full = 100.0 if unit == "%" and all(v <= 100 for _, v in items) else None
+    return bar_chart(items, unit=unit, full=full)
 
 
 def _flow_spec(spec: dict) -> str:
@@ -134,7 +142,9 @@ def _flow_spec(spec: dict) -> str:
             parts.append(f'<div class="flow-link"><span class="flow-arrow">↓</span>'
                          f'{text}</div>')
         elif i + 1 < len(nodes):
-            parts.append('<div class="flow-link"><span class="flow-arrow">↓</span></div>')
+            # 간선이 없는 자리에는 화살표를 두지 않는다 — 모델이 말하지 않은 흐름을
+            # 하네스가 주장하는 셈이다. 자리만 띄워 노드가 붙어 보이지 않게 한다.
+            parts.append('<div class="flow-gap"></div>')
     out = '<div class="flow">' + "".join(parts) + "</div>"
     if extra:
         items = "".join(
