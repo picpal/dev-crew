@@ -712,3 +712,23 @@ def test_tutor_action_labels_regrade_without_a_fake_option_letter():
          "message": {"ts": "1.1", "thread_ts": "1.0", "text": "채점 실패"},
          "actions": [{"value": REGRADE_VALUE}]}))
     assert "🔁 다시 채점 중" in updated[0]["text"] and "선택: ?" not in updated[0]["text"]
+
+
+# ── .env 로딩 ───────────────────────────────────────────────────────────────
+def test_dotenv_fills_missing_vars_without_overriding_the_shell(tmp_path, monkeypatch):
+    """이미 export한 값이 파일에 밀리면 안 된다 — 셸이 항상 이긴다."""
+    from devcrew.slack_engine import load_env
+    (tmp_path / ".env").write_text(
+        "# 주석\nTUTOR_BOT_TOKEN=xoxb-from-file\nSLACK_BOT_TOKEN=xoxb-from-file\n")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-from-shell")
+    monkeypatch.delenv("TUTOR_BOT_TOKEN", raising=False)
+    load_env(tmp_path / ".env")
+    import os
+    assert os.environ["TUTOR_BOT_TOKEN"] == "xoxb-from-file"
+    assert os.environ["SLACK_BOT_TOKEN"] == "xoxb-from-shell"
+
+
+def test_missing_dotenv_is_not_an_error(tmp_path):
+    """.env 없이 export만 쓰던 기존 방식이 그대로 돌아야 한다."""
+    from devcrew.slack_engine import load_env
+    assert load_env(tmp_path / "nope.env") is False

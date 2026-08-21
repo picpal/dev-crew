@@ -40,6 +40,31 @@ _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 _BROADCAST_RE = re.compile(r"<!(channel|here|everyone)(\|[^>]*)?>", re.I)
 
 
+# 저장소 루트 — `src/devcrew/slack_engine.py` 기준 두 단계 위
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ENV_FILE = REPO_ROOT / ".env"
+
+
+def load_env(path: Path | str | None = None) -> bool:
+    """`.env`의 값으로 **비어 있는** 환경변수만 채운다. 반환: 파일을 읽었는가.
+
+    셸에서 이미 export한 값은 덮지 않는다 — 임시로 토큰을 바꿔 띄우는 흐름을
+    파일이 조용히 되돌리면 디버깅이 불가능해진다. 파일이 없어도 오류가 아니다
+    (export만 쓰던 기존 방식이 그대로 돈다)."""
+    p = Path(path) if path else ENV_FILE
+    if not p.is_file():
+        return False
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key and value and key not in os.environ:
+            os.environ[key] = value
+    return True
+
+
 def sanitize_slack(text: str) -> str:
     return _BROADCAST_RE.sub(lambda m: f"@{m.group(1).lower()}", text or "")
 
@@ -543,6 +568,8 @@ class MentionHandler:
 
 
 async def _amain() -> None:
+    if load_env():
+        print(f"devcrew: {ENV_FILE} 로드 (셸 export 우선)")
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
     from slack_bolt.async_app import AsyncApp
 
