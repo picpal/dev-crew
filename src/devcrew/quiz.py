@@ -246,3 +246,20 @@ def record_scorecard(trace, exec_id: str, card: Scorecard,
                          payload={"q_key": k, "area": r.question.area})
             cleared += 1
     return added, cleared
+
+
+def to_raw(q: Question) -> dict:
+    """문항 → 저장 가능한 dict. `source_key`에 키를 실어 복원 시 그대로 이월된다.
+
+    회차는 trace에 기록돼야 세션이 죽어도 이어 풀 수 있다 (append-only가 진실)."""
+    return {"area": q.area, "type": q.type, "stem": q.stem, "options": list(q.options),
+            "answer_index": q.answer_index, "explanation": q.explanation,
+            "diagram": q.diagram, "source_key": q.key,
+            "evidence": [{"path": e.path, "start_line": e.start_line,
+                          "end_line": e.end_line, "quote": e.quote} for e in q.evidence]}
+
+
+def from_raw(raws: list[dict]) -> list[Question]:
+    """`to_raw`의 역 — 저장된 회차를 복원한다. 키는 저장된 것을 그대로 쓴다."""
+    keys = {r.get("source_key") for r in (raws or []) if isinstance(r, dict)}
+    return parse_questions(raws, allowed_keys={k for k in keys if isinstance(k, str)})
