@@ -1,0 +1,65 @@
+<!doctype html><meta charset="utf-8"><title>viewport rig</title>
+<!-- 리포트를 임의 폭 뷰포트에서 보고 넘침을 기계로 판정하는 검토용 하네스.
+     브라우저 창 폭을 바꿀 수 없는 환경(원격 제어·헤드리스)에서 쓴다. iframe 안은
+     진짜 뷰포트라 미디어쿼리가 정상 동작한다.
+
+     띄우기:  python3 -m http.server 8791   (리포트 HTML과 같은 디렉터리에서)
+     쓰기:    viewport-rig.html?src=report.html&w=320,375,700,1200,1400&s=0.3
+     판정:    콘솔에서 `await audit()` — 폭마다 pageScrollW/viewport와
+              가로로 삐져나온 요소 목록을 돌려준다. 눈이 아니라 숫자가 판정한다.
+
+     주의: 이 파일은 검토 도구이지 발행물이 아니다. 리포트 본문의 CSP 규약
+     (JS 없음)은 이 파일에 적용되지 않는다. -->
+<style>
+ body{margin:0;font:12px system-ui;background:#222;color:#eee}
+ .row{margin:0 0 10px}
+ .cap{padding:4px 8px;font-weight:600}
+ .vp{transform-origin:0 0;border:0;background:#fff;display:block}
+</style>
+<div id="out"></div>
+<script>
+const params = new URLSearchParams(location.search);
+const src = params.get("src") || "sample-hard-light.html";
+const widths = (params.get("w") || "1200").split(",").map(Number);
+const scale = Number(params.get("s") || 0.42);
+const out = document.getElementById("out");
+for (const w of widths) {
+  const d = document.createElement("div"); d.className = "row";
+  d.innerHTML = `<div class="cap">${src} @ ${w}px</div>`;
+  const f = document.createElement("iframe");
+  f.className = "vp"; f.src = src; f.width = w; f.height = Math.round(2400);
+  f.style.transform = `scale(${scale})`;
+  const holder = document.createElement("div");
+  holder.style.height = (2400*scale)+"px"; holder.style.width = (w*scale)+"px";
+  holder.style.overflow = "hidden";
+  holder.appendChild(f); d.appendChild(holder); out.appendChild(d);
+}
+// overflow-x 스크롤 컨테이너 안쪽은 넘쳐도 정상이다 (표가 대표적) — 조상을 보고 건너뛴다.
+const inScroller = el => {
+  for (let n = el.parentElement; n; n = n.parentElement) {
+    const o = getComputedStyle(n).overflowX;
+    if (o === "auto" || o === "scroll") return true;
+  }
+  return false;
+};
+window.audit = async function({open = true} = {}) {
+  const res = [];
+  for (const f of document.querySelectorAll("iframe")) {
+    const doc = f.contentDocument, win = f.contentWindow, de = doc.documentElement;
+    if (open) doc.querySelectorAll("details").forEach(d => d.open = true);
+    const bad = [];
+    for (const el of doc.querySelectorAll("body *")) {
+      if (inScroller(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width && (r.right > win.innerWidth + 1 || r.left < -1))
+        bad.push(el.className || el.tagName);
+      if (el.scrollWidth - el.clientWidth > 1 && getComputedStyle(el).overflowX === "visible")
+        bad.push("SW:" + (el.className || el.tagName));
+    }
+    res.push({w: +f.width, viewport: win.innerWidth, pageScrollW: de.scrollWidth,
+              horizScroll: de.scrollWidth > win.innerWidth,
+              issues: [...new Set(bad)].slice(0, 12)});
+  }
+  return res;
+};
+</script>

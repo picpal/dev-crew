@@ -22,7 +22,7 @@ from .charts import CHART_CSS, bar_chart, render_diagram
 
 TEMPLATE_VERSION = "quiz-2"
 
-_TOKENS = """
+TOKENS = """
 :root{color-scheme:light dark;
   --plane:#f9f9f7;--surface:#fcfcfb;--surface-2:#f2f1ed;
   --line:rgba(11,11,11,.10);--line-strong:#c3c2b7;--grid:#e1e0d9;
@@ -37,7 +37,7 @@ _TOKENS = """
     --code:rgba(255,255,255,.07)}}
 """
 
-_CSS = _TOKENS + """
+_CSS = TOKENS + """
 *{box-sizing:border-box}
 body{margin:0;background:var(--plane);color:var(--ink-1);line-height:1.65;
   font-family:system-ui,-apple-system,"Apple SD Gothic Neo","Segoe UI",sans-serif;
