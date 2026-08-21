@@ -16,8 +16,8 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from .quiz import (ANSWER_EVENT, ISSUED_EVENT, Question, from_raw, grade, note_id,
-                   open_misses, record_scorecard, to_raw)
+from .quiz import (ANSWER_EVENT, ISSUED_EVENT, NoteUnavailable, Question, from_raw,
+                   grade, note_id, open_misses, record_scorecard, to_raw)
 from .report.quiz_report import render_quiz_report
 from .report.uploader import publish_report
 from .repos import RepoRegistryError, split_repo_prefix
@@ -129,15 +129,21 @@ class TutorHandler:
             return
         if sess.done or not 0 <= idx < len(sess.questions):
             return
+        # 버튼을 먼저 걷으면 기록 실패 시 그 답을 다시 낼 방법이 없다 (lessons.md C7).
+        try:
+            self.orch.trace.append(ANSWER_EVENT, task_id=round_id(thread_ts),
+                                   execution_id=round_id(thread_ts),
+                                   payload={"index": idx, "choice": choice})
+        except Exception as e:
+            await say(text=f"💥 답변 기록에 실패했습니다: {type(e).__name__}. "
+                           "같은 버튼을 다시 눌러 주세요.", thread_ts=thread_ts)
+            return
+        sess.answers[idx] = choice
         if strip:
             try:
                 await strip()
             except Exception:
                 pass
-        sess.answers[idx] = choice
-        self.orch.trace.append(ANSWER_EVENT, task_id=round_id(thread_ts),
-                               execution_id=round_id(thread_ts),
-                               payload={"index": idx, "choice": choice})
         nxt = self._next_index(sess)
         if nxt is None:
             await self._finish(sess, say)
@@ -147,7 +153,14 @@ class TutorHandler:
     # ── 회차 ────────────────────────────────────────────────────────────────
     async def _start(self, thread_ts, channel, user, repo_name, say) -> None:
         note = note_id(user, repo_name)
-        misses = open_misses(self.orch.trace, note)
+        try:
+            misses = open_misses(self.orch.trace, note)
+        except NoteUnavailable:
+            # 노트를 못 읽은 채 회차를 열면 기존 오답이 재출제되지도, 맞혀도 해소되지도
+            # 않는다. 사용자는 그 사실을 모른 채 10문항을 푼다 — 열지 않는 것이 낫다.
+            await say(text="⚠️ 오답 노트를 읽지 못해 회차를 시작하지 않았습니다. "
+                           "잠시 후 다시 시도해 주세요.", thread_ts=thread_ts)
+            return
         try:
             async with self._lock:
                 res = await issue_quiz(self.orch, self.cfg, repo_name=repo_name,
@@ -163,6 +176,18 @@ class TutorHandler:
                       thread_ts=thread_ts)
             return
         total = len(res.questions)
+        # **기록이 먼저다.** 안내를 먼저 보내고 기록에 실패하면 사용자에게는 시작했다는
+        # 메시지만 남고 이어 풀 수도, 되살릴 수도 없는 회차가 된다 (lessons.md C7).
+        try:
+            self.orch.trace.append(ISSUED_EVENT, task_id=round_id(thread_ts),
+                                   execution_id=round_id(thread_ts),
+                                   payload={"questions": [to_raw(q) for q in res.questions],
+                                            "owner": user, "repo_name": repo_name,
+                                            "channel": channel})
+        except Exception as e:
+            await say(text=f"💥 회차 기록에 실패해 시작하지 않았습니다: {type(e).__name__}",
+                      thread_ts=thread_ts)
+            return
         head = f"🎓 `{repo_name}` 학습 회차 — 총 {total}문항"
         if res.shortfall:
             # 숫자를 채우려 지어내지 않는다. 왜 적은지 사실대로 말한다 (#19 D6)
@@ -170,11 +195,6 @@ class TutorHandler:
         if misses:
             head += f"\n📌 지난 오답 {len(misses)}건을 노트에서 보고 있습니다."
         await say(text=head, thread_ts=thread_ts)
-        self.orch.trace.append(ISSUED_EVENT, task_id=round_id(thread_ts),
-                               execution_id=round_id(thread_ts),
-                               payload={"questions": [to_raw(q) for q in res.questions],
-                                        "owner": user, "repo_name": repo_name,
-                                        "channel": channel})
         sess = QuizSession(channel=channel, thread_ts=thread_ts, owner=user,
                            repo_name=repo_name, questions=res.questions)
         self.sessions[thread_ts] = sess
@@ -192,9 +212,15 @@ class TutorHandler:
             await say(text=text, thread_ts=sess.thread_ts)
 
     async def _finish(self, sess: QuizSession, say) -> None:
-        sess.done = True
         note = note_id(sess.owner, sess.repo_name)
-        prior = {m["q_key"] for m in open_misses(self.orch.trace, note)}
+        try:
+            prior = {m["q_key"] for m in open_misses(self.orch.trace, note)}
+        except NoteUnavailable:
+            # done을 세우기 전에 빠진다 — 세우면 재시도가 거부돼 회차가 채점 없이 끝난다
+            await say(text="⚠️ 오답 노트를 읽지 못해 채점을 마치지 못했습니다. "
+                           "마지막 버튼을 다시 눌러 주세요.", thread_ts=sess.thread_ts)
+            return
+        sess.done = True
         card = grade(sess.questions, sess.answers)
         added, cleared = record_scorecard(self.orch.trace, note, card, prior_keys=prior)
         url = None

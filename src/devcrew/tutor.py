@@ -70,9 +70,17 @@ def select_ten(pool: list[Question], *, count: int = QUIZ_COUNT) -> list[Questio
 
     영역 다양성을 두는 이유는, 통과 문항이 한 파일에 몰리면 회차 전체가 그 한 구석만
     묻게 되기 때문이다 — 리포트의 영역별 카드도 의미를 잃는다."""
-    picked = [q for q in pool if q.carried][:MAX_CARRIED]
+    # key 중복을 먼저 없앤다. 같은 key가 한 회차에 둘 들어오면 하나는 miss, 하나는
+    # clear로 기록돼 최종 오답 상태가 문항 순서에 좌우된다 (Codex 리뷰 2026-08-21).
+    uniq, seen_keys = [], set()
+    for q in pool:
+        if q.key not in seen_keys:
+            seen_keys.add(q.key)
+            uniq.append(q)
+    picked = [q for q in uniq if q.carried][:MAX_CARRIED]
     seen_areas = {q.area for q in picked}
-    rest = [q for q in pool if q not in picked]
+    # 상한을 넘은 오답 유래 문항은 나머지 후보에서도 뺀다 — 안 그러면 상한이 무의미하다
+    rest = [q for q in uniq if q not in picked and not q.carried]
     for q in rest:                              # 1순위: 아직 안 나온 영역
         if len(picked) >= count:
             break
@@ -126,18 +134,29 @@ async def _verify(orch, cfg, *, exec_id, repo_path,
     raw = await _ask(orch, cfg, Role.TUTOR_VERIFIER, exec_id=exec_id, node_id="verify",
                      scope="문항 교차 검증", worktree=repo_path, intro=intro,
                      nudge="이제 판정을 스키마대로 제출해라.")
-    if not raw or not isinstance(raw.get("verdicts"), list):
+    verdicts = (raw or {}).get("verdicts")
+    if not raw or raw.get("status") != "PASS" or not isinstance(verdicts, list):
         return [], ["교차 검증에 실패해 이번 출제를 통과시키지 않았습니다"]
-    rejected: dict[int, str] = {}
-    for v in raw["verdicts"]:
-        if isinstance(v, dict) and v.get("verdict") == "REJECT":
-            try:
-                rejected[int(v["index"])] = str(v.get("reason") or "사유 없음")
-            except (KeyError, TypeError, ValueError):
-                continue
+    # 판정이 온전하지 않으면 전부 폐기한다. 누락된 인덱스를 묵시적 PASS로 읽으면
+    # 검증자가 조용히 답을 줄이는 것만으로 관문을 우회할 수 있다 (Codex 리뷰 2026-08-21).
+    seen: dict[int, dict] = {}
+    for v in verdicts:
+        if not isinstance(v, dict) or v.get("verdict") not in ("PASS", "REJECT"):
+            continue
+        try:
+            i = int(v["index"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if i in seen or not 0 <= i < len(questions):
+            return [], ["교차 검증 판정이 중복·범위 밖입니다 — 통과시키지 않았습니다"]
+        seen[i] = v
+    if len(seen) != len(questions):
+        return [], [f"교차 검증이 {len(questions)}문항 중 {len(seen)}건만 판정했습니다 "
+                    f"— 통과시키지 않았습니다"]
+    rejected = {i: str(v.get("reason") or "사유 없음")
+                for i, v in seen.items() if v["verdict"] == "REJECT"}
     passed = [q for i, q in enumerate(questions) if i not in rejected]
-    return passed, [f"{questions[i].stem} — {r}" for i, r in rejected.items()
-                    if 0 <= i < len(questions)]
+    return passed, [f"{questions[i].stem} — {r}" for i, r in rejected.items()]
 
 
 async def issue_quiz(orch, cfg, *, repo_name: str | None, repo_path: str | None,
@@ -145,7 +164,8 @@ async def issue_quiz(orch, cfg, *, repo_name: str | None, repo_path: str | None,
                      count: int = QUIZ_COUNT) -> IssueResult:
     """한 회차를 출제한다. 반환 문항이 `count`보다 적으면 `shortfall`이 선다."""
     notes: list[str] = []
-    allowed = {m["q_key"] for m in misses if m.get("q_key")}
+    allowed = {m["q_key"]: m.get("evidence") or []
+               for m in misses if m.get("q_key")}
     intro = AUTHOR_INTRO.format(n=DRAFT_COUNT)
     if misses:
         intro += REISSUE_BLOCK.format(

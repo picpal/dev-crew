@@ -202,3 +202,70 @@ async def test_duplicate_event_is_ignored(tmp_path, repo):
     n = len(say.messages)
     await h.on_mention(mention(), say)                   # 같은 event_id
     assert len(say.messages) == n
+
+
+# ── Codex 리뷰 대응 (#19) ───────────────────────────────────────────────────
+class FlakyTrace:
+    """N번째 append부터 실패하는 trace 래퍼 — 기록 실패 시 UI가 앞서가는지 본다."""
+
+    def __init__(self, inner, fail_on: str):
+        self._inner = inner
+        self._fail_on = fail_on
+
+    def append(self, event_type, **kw):
+        if event_type == self._fail_on:
+            raise RuntimeError("trace down")
+        return self._inner.append(event_type, **kw)
+
+    def events(self, **kw):
+        return self._inner.events(**kw)
+
+    def __getattr__(self, name):        # 나머지는 그대로 위임 — 대역 구멍이 결함을 가린다
+        return getattr(self._inner, name)
+
+
+@pytest.mark.asyncio
+async def test_issue_is_recorded_before_the_round_is_announced(tmp_path, repo):
+    """기록이 먼저다 — 안내를 먼저 보내면 기록 실패 시 사용자에게 죽은 회차가 남는다."""
+    h, trace, _ = make_handler(tmp_path, repo)
+    h.orch.trace = FlakyTrace(trace, "QuizIssuedEvent")
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    assert "100.1" not in h.sessions
+    assert "실패" in say.messages[-1]["text"]
+    assert not any("1 / 10" in m["text"] for m in say.messages)   # 문항을 안 띄운다
+
+
+@pytest.mark.asyncio
+async def test_answer_is_recorded_before_the_button_is_stripped(tmp_path, repo):
+    """버튼을 먼저 걷으면 기록 실패 시 답을 다시 낼 방법이 없다."""
+    h, trace, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    h.orch.trace = FlakyTrace(trace, "QuizAnswerEvent")
+    stripped = []
+
+    async def strip():
+        stripped.append(True)
+
+    await h.on_answer(thread_ts="100.1", value="0:1", say=say, strip=strip,
+                      user="U-OWNER", channel="C1")
+    assert stripped == []                                  # 버튼은 그대로 남는다
+    assert h.sessions["100.1"].answers == {}                # 답도 안 들어간다
+    assert "실패" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_round_aborts_when_the_miss_note_cannot_be_read(tmp_path, repo):
+    """노트를 못 읽으면 회차를 열지 않는다 — 열면 기존 오답이 해소되지 않는다."""
+    h, trace, _ = make_handler(tmp_path, repo)
+
+    class BrokenTrace(FlakyTrace):
+        def events(self, **kw):
+            raise RuntimeError("db locked")
+
+    h.orch.trace = BrokenTrace(trace, "__never__")
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    assert h.sessions == {}
+    assert "오답 노트" in say.messages[-1]["text"]

@@ -182,3 +182,54 @@ def test_record_scorecard_writes_miss_and_clears_only_prior_keys(tmp_path):
     added, cleared = record_scorecard(t, "E", card, prior_keys={qs[0].key})
     assert (added, cleared) == (2, 1)
     assert sorted(m["q_key"] for m in open_misses(t, "E")) == sorted([qs[1].key, qs[2].key])
+
+
+# ── Codex 리뷰 대응 (#19) ───────────────────────────────────────────────────
+def test_out_of_range_citation_is_dropped_not_clamped(tmp_path):
+    """범위를 보정해서 통과시키면 문항에 거짓 위치가 표시되고 q_key도 어긋난다."""
+    from devcrew.quiz import parse_questions, verify_citations
+    (tmp_path / "a.py").write_text("line1\nline2\n")
+    _, dropped = verify_citations(parse_questions([
+        _q(path="a.py", start=0, end=0, quote="line1"),          # 0-based 아님
+        _q(path="a.py", start=1, end=999999, quote="line1"),     # 끝 줄이 파일 밖
+        _q(path="a.py", start=2, end=1, quote="line1"),          # 뒤집힌 범위
+        _q(path="a.py", start=9, end=9, quote="line1"),          # 시작이 파일 밖
+    ]), tmp_path)
+    assert [r for _, r in dropped] == ["line-range-invalid"] * 4
+
+
+def test_unresolvable_path_drops_only_that_question(tmp_path):
+    """경로 하나가 이상해서 회차 전체가 죽으면 안 된다."""
+    from devcrew.quiz import parse_questions, verify_citations
+    (tmp_path / "a.py").write_text("line1\n")
+    ok, dropped = verify_citations(parse_questions([
+        _q(path="a.py", start=1, end=1, quote="line1"),
+        _q(path="a\x00b.py", start=1, end=1, quote="x"),          # NUL — resolve가 던진다
+    ]), tmp_path)
+    assert len(ok) == 1 and dropped[0][1] == "path-invalid"
+
+
+def test_open_misses_raises_instead_of_reporting_an_empty_note(tmp_path):
+    """조회 실패를 '오답 없음'으로 바꾸면 기존 오답이 해소되지도, 재출제되지도 않는다."""
+    import pytest as _pytest
+
+    from devcrew.quiz import NoteUnavailable, open_misses
+
+    class BrokenTrace:
+        def events(self, **kw):
+            raise RuntimeError("db locked")
+
+    with _pytest.raises(NoteUnavailable):
+        open_misses(BrokenTrace(), "E")
+
+
+def test_carried_key_requires_matching_evidence_location():
+    """이월은 '같은 지점을 다시 물었을 때'만 성립한다 — 아무 문항이나 남의 오답을
+    해소하면 노트가 의미를 잃는다."""
+    from devcrew.quiz import parse_questions
+    origin = {"k-old": [{"path": "src/a.py", "start_line": 10}]}
+    same = _q(path="src/a.py", start=10); same["source_key"] = "k-old"
+    other = _q(path="src/b.py", start=99); other["source_key"] = "k-old"
+    qs = parse_questions([same, other], allowed_keys=origin)
+    assert qs[0].carried is True and qs[0].key == "k-old"
+    assert qs[1].carried is False and qs[1].key != "k-old"

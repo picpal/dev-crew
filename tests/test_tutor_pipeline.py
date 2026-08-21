@@ -171,3 +171,48 @@ async def test_verifier_failure_does_not_pass_unverified_questions(tmp_path, rep
                            exec_id="E", misses=[])
     assert res.questions == [] and res.shortfall is True
     assert any("검증" in n for n in res.notes)
+
+
+# ── Codex 리뷰 대응 (#19) ───────────────────────────────────────────────────
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdicts,label", [
+    ({"status": "PASS", "summary": "s", "verdicts": []}, "빈 판정"),
+    ({"status": "PASS", "summary": "s",
+      "verdicts": [{"index": 0, "verdict": "PASS", "reason": "ok"}]}, "일부만 판정"),
+    ({"status": "BLOCKED", "summary": "repo를 못 읽음",
+      "verdicts": [{"index": i, "verdict": "PASS", "reason": "ok"}
+                   for i in range(12)]}, "BLOCKED 상태"),
+    ({"status": "PASS", "summary": "s",
+      "verdicts": [{"index": 0, "verdict": "PASS", "reason": "ok"}] * 12}, "중복 인덱스"),
+])
+async def test_incomplete_verdicts_pass_nothing(tmp_path, repo, verdicts, label):
+    """마지막 관문은 fail-closed다. 판정이 온전하지 않으면 전부 폐기한다 —
+    누락된 인덱스를 묵시적 PASS로 읽으면 검증을 우회하는 길이 열린다."""
+    from devcrew.tutor import issue_quiz
+    author = Scripted([_authored([_q(i, start=i + 1) for i in range(12)])])
+    verifier = Scripted([verdicts, verdicts])
+    orch, _ = make_orch(tmp_path, author, verifier)
+    res = await issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
+                           exec_id="E", misses=[])
+    assert res.questions == [], label
+    assert res.shortfall is True
+
+
+@pytest.mark.asyncio
+async def test_select_ten_caps_carried_and_drops_duplicate_keys():
+    """같은 key가 한 회차에 둘 들어오면 하나는 miss, 하나는 clear가 되어
+    최종 오답 상태가 문항 순서에 좌우된다."""
+    from devcrew.quiz import Evidence, Question
+    from devcrew.tutor import MAX_CARRIED, select_ten
+
+    def q(area, key, carried=False):
+        return Question(area=area, type="CORRECT", stem="s", options=list("ABCD"),
+                        answer_index=0, evidence=[Evidence("a.py", 1, 1, "x")],
+                        explanation="e", key=key, carried=carried)
+
+    pool = [q("세션", f"old{i}", carried=True) for i in range(5)]      # 오답 5개
+    pool += [q("세션", "old0", carried=True)]                          # 같은 key 중복
+    pool += [q(f"영역{i}", f"n{i}") for i in range(9)]
+    picked = select_ten(pool, count=10)
+    assert sum(1 for x in picked if x.carried) == MAX_CARRIED
+    assert len({x.key for x in picked}) == len(picked)                  # key 중복 없음

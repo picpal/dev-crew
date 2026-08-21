@@ -12,6 +12,11 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+class NoteUnavailable(Exception):
+    """오답 노트를 읽지 못했다. **빈 노트와 구분해야 한다** — 조회 실패를 '오답 없음'으로
+    바꾸면 기존 오답이 재출제되지도, 맞혀도 해소되지도 않고 사용자는 그 사실을 모른다."""
+
+
 QUESTION_TYPES = ("CORRECT", "INCORRECT")
 OPTION_COUNT = 4
 _WS = re.compile(r"\s+")
@@ -69,8 +74,18 @@ def _evidence_of(raw) -> list[Evidence] | None:
     return out
 
 
+def _origin_slots(origin) -> dict[str, set[tuple[str, int]]]:
+    """이월 후보 키 → 원래 오답이 가리키던 (경로, 시작 줄) 집합."""
+    if isinstance(origin, dict):
+        return {k: {(str(e.get("path")), int(e.get("start_line", 0)))
+                    for e in (v or []) if isinstance(e, dict)}
+                for k, v in origin.items()}
+    return {k: set() for k in (origin or set())}
+
+
 def parse_questions(raw: list[dict],
-                    allowed_keys: set[str] | None = None) -> list[Question]:
+                    allowed_keys: set[str] | dict[str, list[dict]] | None = None
+                    ) -> list[Question]:
     """모델 출력 → 문항. 형태가 어긋난 항목은 조용히 버린다.
 
     재출제 문항은 `source_key`로 **원래 키를 이월**한다. 키를 매번 재계산하면 모델이
@@ -80,7 +95,7 @@ def parse_questions(raw: list[dict],
 
     근거가 **비어 있는** 문항은 여기서 버리지 않는다 — 인용 대조가 사유와 함께 버려야
     사용자에게 "왜 문항이 줄었는지" 설명할 수 있다."""
-    allowed_keys = allowed_keys or set()
+    slots = _origin_slots(allowed_keys)
     out: list[Question] = []
     for r in (raw or []):
         if not isinstance(r, dict):
@@ -99,8 +114,14 @@ def parse_questions(raw: list[dict],
         if not 0 <= idx < OPTION_COUNT:
             continue
         diagram = r.get("diagram")
+        # 이월은 "같은 지점을 다시 물었을 때"만 성립한다. 키만 보고 받으면 전혀 다른
+        # 문항이 남의 오답을 해소해 노트가 의미를 잃는다 (Codex 리뷰 2026-08-21).
         src = r.get("source_key")
-        carried = src if isinstance(src, str) and src in allowed_keys else None
+        carried = None
+        if isinstance(src, str) and src in slots:
+            want = slots[src]
+            here = {(e.path, e.start_line) for e in ev}
+            carried = src if (not want or want & here) else None
         out.append(Question(
             area=area, type=r["type"], stem=stem, options=[str(o) for o in options],
             answer_index=idx, evidence=ev, explanation=explanation,
@@ -117,19 +138,24 @@ def _check_evidence(ev: Evidence, root: Path) -> str | None:
     """인용 하나를 대조한다. 통과면 None, 아니면 폐기 사유."""
     if ev.path.startswith("/") or ev.path.startswith("~"):
         return "path-outside-repo"
-    target = (root / ev.path).resolve()
-    if not target.is_relative_to(root):        # `..` 로 저장소 밖을 가리킴
-        return "path-outside-repo"
-    if not target.is_file():
-        return "path-missing"
+    try:
+        target = (root / ev.path).resolve()
+        if not target.is_relative_to(root):    # `..` 로 저장소 밖을 가리킴
+            return "path-outside-repo"
+        if not target.is_file():
+            return "path-missing"
+    except (OSError, ValueError, RuntimeError):
+        # 경로 하나가 이상해서 회차 전체가 죽으면 안 된다 (NUL·심볼릭 루프 등)
+        return "path-invalid"
     try:
         lines = target.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return "path-unreadable"
-    start = max(1, ev.start_line)
-    end = min(len(lines), ev.end_line if ev.end_line >= start else start)
-    if start > len(lines):
-        return "quote-not-in-range"
+    start, end = ev.start_line, ev.end_line
+    # 범위를 보정해서 통과시키지 않는다. 보정하면 문항에 거짓 위치가 표시되고,
+    # q_key는 보정 전 값으로 계산돼 오답 노트가 어긋난다 (Codex 리뷰 2026-08-21).
+    if not (1 <= start <= end <= len(lines)):
+        return "line-range-invalid"
     # 모델은 줄바꿈·들여쓰기를 흘린다. 공백 차이로 진짜 근거를 버리면 안 되므로
     # 양쪽을 한 줄로 접어 비교한다 — 인용의 존재만 보고 형식은 보지 않는다.
     window = _norm(" ".join(lines[start - 1:end]))
@@ -212,8 +238,8 @@ def open_misses(trace, exec_id: str) -> list[dict]:
     (같은 초에 여러 이벤트가 들어오면 ts로는 순서가 갈리지 않는다)."""
     try:
         evs = trace.events(execution_id=exec_id)
-    except Exception:
-        return []
+    except Exception as e:
+        raise NoteUnavailable(str(e)) from e
     state: dict[str, dict] = {}
     for e in sorted(evs, key=lambda e: e["id"]):
         key = (e.get("payload") or {}).get("q_key")
