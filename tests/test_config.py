@@ -2,6 +2,11 @@ import pytest
 from devcrew.config import ConfigError, load
 from devcrew.schema import EffortLevel, Role
 
+# roleDefaults는 모든 Role을 요구한다 (config.REQUIRED_ROLE_DEFAULTS = frozenset(Role)).
+# 목록을 하드코딩하면 Role이 늘 때마다 무관한 테스트가 깨지므로 enum에서 파생시킨다.
+ALL_ROLES_CHEAP = "roleDefaults:\n" + "".join(
+    f"  {r.value}: {{tier: CHEAP}}\n" for r in Role)
+
 
 def test_load_default_config():
     cfg = load()   # config/harness.yaml
@@ -83,15 +88,7 @@ def test_loop_policy_missing_fails(tmp_path):
     p = tmp_path / "h.yaml"
     p.write_text(
         "tiers:\n  CHEAP: {provider: CLAUDE_CODE, model: claude-sonnet-5, effort: LOW}\n"
-        "roleDefaults:\n"
-        "  ORCHESTRATOR: {tier: CHEAP}\n"
-        "  EXPLORER: {tier: CHEAP}\n"
-        "  ARCHITECT: {tier: CHEAP}\n"
-        "  DEVELOPER: {tier: CHEAP}\n"
-        "  SECURITY: {tier: CHEAP}\n"
-        "  QA: {tier: CHEAP}\n"
-        "  REVIEWER: {tier: CHEAP}\n"
-            "  BRAIN: {tier: CHEAP}\n")
+        + ALL_ROLES_CHEAP)
     with pytest.raises(ConfigError, match="loopPolicy"):
         load(p)
 
@@ -100,16 +97,8 @@ def test_loop_policy_nonpositive_fails(tmp_path):
     p = tmp_path / "h.yaml"
     p.write_text(
         "tiers:\n  CHEAP: {provider: CLAUDE_CODE, model: claude-sonnet-5, effort: LOW}\n"
-        "roleDefaults:\n"
-        "  ORCHESTRATOR: {tier: CHEAP}\n"
-        "  EXPLORER: {tier: CHEAP}\n"
-        "  ARCHITECT: {tier: CHEAP}\n"
-        "  DEVELOPER: {tier: CHEAP}\n"
-        "  SECURITY: {tier: CHEAP}\n"
-        "  QA: {tier: CHEAP}\n"
-        "  REVIEWER: {tier: CHEAP}\n"
-            "  BRAIN: {tier: CHEAP}\n"
-        "loopPolicy:\n"
+        + ALL_ROLES_CHEAP
+        + "loopPolicy:\n"
         "  maxIterations: 0\n"
         "  maxDurationMinutes: 60\n"
         "  maxTokenBudget: 300000\n"
@@ -121,3 +110,14 @@ def test_loop_policy_nonpositive_fails(tmp_path):
 def test_orchestrator_role_default_required():
     cfg = load()
     assert cfg.role_defaults[Role.ORCHESTRATOR].tier == "HIGH_CAPABILITY"
+
+
+def test_tutor_roles_have_defaults():
+    """출제는 Claude 고품질, 검증은 Codex — provider가 갈려야 교차 검증이다."""
+    from devcrew.config import load
+    from devcrew.schema import Provider, Role
+    cfg = load()
+    assert cfg.role_defaults[Role.TUTOR].tier == "HIGH_CAPABILITY"
+    assert cfg.role_defaults[Role.TUTOR_VERIFIER].tier == "CODEX_DEFAULT"
+    assert cfg.tiers[cfg.role_defaults[Role.TUTOR]. tier].provider == Provider.CLAUDE_CODE
+    assert cfg.tiers[cfg.role_defaults[Role.TUTOR_VERIFIER].tier].provider == Provider.CODEX

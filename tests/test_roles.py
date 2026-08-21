@@ -75,3 +75,30 @@ def test_missing_required_keys_array_items_with_all_fields_present_is_clean():
                  "findings": [{"severity": "minor", "file": "a.py", "line": 1,
                               "description": "d"}]}
     assert missing_required_keys(schema, structured) == []
+
+
+# ── TUTOR / TUTOR_VERIFIER ──────────────────────────────────────────────────
+@pytest.mark.parametrize("role", [Role.TUTOR, Role.TUTOR_VERIFIER])
+def test_tutor_bundles_load_with_common_skeleton(role):
+    b = load_bundle(role)
+    assert len(b.prompt) > 200
+    assert b.schema["properties"]["status"]["enum"] == STATUS_ENUM
+    assert set(b.schema["required"]) >= {"status", "summary"}
+
+
+def test_tutor_question_schema_is_strict_and_carries_evidence():
+    """provider strict 모드 요구 — 전 필드 required, additionalProperties false."""
+    q = load_bundle(Role.TUTOR).schema["properties"]["questions"]["items"]
+    assert q["additionalProperties"] is False
+    assert set(q["required"]) == set(q["properties"])
+    for key in ("area", "type", "stem", "options", "answer_index",
+                "evidence", "explanation", "diagram"):
+        assert key in q["properties"]
+    ev = q["properties"]["evidence"]["items"]
+    assert set(ev["required"]) == {"path", "start_line", "end_line", "quote"}
+
+
+def test_verifier_schema_reports_per_question_verdicts():
+    v = load_bundle(Role.TUTOR_VERIFIER).schema["properties"]["verdicts"]["items"]
+    assert v["properties"]["verdict"]["enum"] == ["PASS", "REJECT"]
+    assert set(v["required"]) == {"index", "verdict", "reason"}

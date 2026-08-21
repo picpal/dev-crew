@@ -30,6 +30,8 @@ class Role(str, enum.Enum):
     REVIEWER = "REVIEWER"
     QA = "QA"
     BRAIN = "BRAIN"           # 대화형 요구사항 인터뷰 (그릴링) — 워크플로 노드 아님
+    TUTOR = "TUTOR"           # 학습 퀴즈 출제 — 대화형, 워크플로 노드 아님 (#19)
+    TUTOR_VERIFIER = "TUTOR_VERIFIER"   # 문항 교차 검증 — 출제와 다른 provider
 
 
 class InstanceStatus(str, enum.Enum):

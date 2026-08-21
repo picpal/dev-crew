@@ -23,7 +23,8 @@ _EFFORT_BY_STR = {"low": EffortLevel.LOW, "medium": EffortLevel.MEDIUM,
 
 WORKER_ROLES = {Role.EXPLORER, Role.DEVELOPER, Role.REVIEWER, Role.QA}
 # role 번들이 존재해 spawn 시 로드해야 하는 role 전체 (워크플로 worker + 결정/대화 role)
-BUNDLED_ROLES = WORKER_ROLES | {Role.ORCHESTRATOR, Role.BRAIN}
+BUNDLED_ROLES = WORKER_ROLES | {Role.ORCHESTRATOR, Role.BRAIN,
+                                Role.TUTOR, Role.TUTOR_VERIFIER}
 
 
 class ReviewQueue:
