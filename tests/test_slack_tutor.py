@@ -303,3 +303,60 @@ async def test_regrade_is_owner_only(tmp_path, repo):
     await h.on_answer(thread_ts="100.1", value=REGRADE_VALUE, say=say,
                       user="U-STRANGER", channel="C1")
     assert pub == [] and "시작한 사람만" in say.messages[-1]["text"]
+
+
+# ── Slack 렌더링 (사용자 피드백 2026-08-21: "마크다운이 그대로 보인다") ─────────
+def _question(**kw):
+    from devcrew.quiz import Evidence, Question
+    base = dict(area="세션 수명", type="INCORRECT", stem="다음 중 **틀린** 것은?",
+                options=[f"보기 {c}" for c in "ABCD"], answer_index=0,
+                evidence=[Evidence("a.py", 1, 1, "line1")], explanation="해설")
+    return Question(**{**base, **kw})
+
+
+def _sections(blocks):
+    return [b["text"]["text"] for b in blocks if b["type"] == "section"]
+
+
+def test_question_blocks_convert_markdown_to_slack_mrkdwn():
+    """Slack은 `**bold**`를 굵게 그리지 않는다 — 안 바꾸면 별표가 날문자로 보인다."""
+    from devcrew.slack_tutor import question_blocks
+    blocks = question_blocks(_question(), 0, 10)
+    stem = _sections(blocks)[0]
+    assert "**" not in stem and "*틀린*" in stem
+
+
+def test_question_blocks_give_each_option_its_own_section():
+    """보기 넷을 한 덩어리에 넣으면 긴 보기끼리 붙어 A·B·C·D 경계가 사라진다."""
+    from devcrew.slack_tutor import question_blocks
+    opts = ["매우 긴 보기 " * 12 + c for c in "ABCD"]
+    blocks = question_blocks(_question(options=opts), 2, 10)
+    labelled = [s for s in _sections(blocks) if s.startswith(("*A*", "*B*", "*C*", "*D*"))]
+    assert len(labelled) == 4
+
+
+def test_question_blocks_escape_angle_brackets():
+    """`<...>`를 안 걷으면 Slack이 링크 문법으로 먹어 보기가 통째로 사라진다."""
+    from devcrew.slack_tutor import question_blocks
+    blocks = question_blocks(_question(options=["Callable[<T>]", "b", "c", "d"]), 0, 4)
+    assert any("&lt;T&gt;" in s for s in _sections(blocks))
+
+
+def test_header_carries_no_raw_markdown_marks():
+    """header는 plain_text라 마크다운 기호가 그대로 찍힌다."""
+    from devcrew.slack_tutor import question_blocks
+    blocks = question_blocks(_question(area="`routing.py` **경계**"), 0, 4)
+    head = next(b for b in blocks if b["type"] == "header")["text"]["text"]
+    assert "*" not in head and "`" not in head
+
+
+def test_score_blocks_break_areas_into_lines_with_a_report_button():
+    """영역별을 한 줄로 이어 붙이면 어디가 약한지가 안 보인다."""
+    from devcrew.quiz import Scorecard
+    from devcrew.slack_tutor import score_blocks
+    card = Scorecard(total=4, correct=2, by_area={"세션": (1, 2), "라우팅": (1, 2)})
+    blocks = score_blocks(card, repo_name="myrepo", url="https://r/x", added=2, cleared=0)
+    areas = next(s for s in _sections(blocks) if "영역별" in s)
+    assert areas.count("\n") >= 2
+    btn = next(b for b in blocks if b["type"] == "actions")["elements"][0]
+    assert btn["url"] == "https://r/x"

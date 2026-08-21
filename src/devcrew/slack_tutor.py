@@ -16,17 +16,23 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from .quiz import (ANSWER_EVENT, ISSUED_EVENT, NoteUnavailable, Question, from_raw,
-                   grade, note_id, open_misses, record_scorecard, to_raw)
+from .quiz import (ANSWER_EVENT, ISSUED_EVENT, NoteUnavailable, Question, Scorecard,
+                   from_raw, grade, note_id, open_misses, record_scorecard, to_raw)
 from .report.quiz_report import render_quiz_report
 from .report.uploader import publish_report
 from .repos import RepoRegistryError, split_repo_prefix
+from .slack_brain import to_mrkdwn
 from .tutor import issue_quiz
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
+_WS_RE = re.compile(r"\s+")
+_MD_MARKS_RE = re.compile(r"[*_`~#]")
 ROUND_TTL = 24 * 3600.0     # 미완 회차의 수명 — 하루가 지나면 코드도 기억도 달라진다
 ANSWER_RE = re.compile(r"^(\d+):([0-3])$")
 REGRADE_VALUE = "__REGRADE__"   # 채점 실패 후 다시 채점하는 버튼의 sentinel
+LETTERS = "ABCDEFGH"
+BAR_FULL, BAR_EMPTY = "▰", "▱"
+TYPE_HINT = {"CORRECT": ("✅", "옳은 것"), "INCORRECT": ("⛔", "틀린 것")}
 NEED_REPO = ("⚠️ 대상 repo를 지정해 주세요 — `@tutor <repo명>: ` 형식입니다.\n"
              "등록된 repo: {repos}")
 STALE_MSG = ("⚠️ 이 회차는 하루가 지나 이어서 풀 수 없습니다. "
@@ -50,22 +56,138 @@ class QuizSession:
     done: bool = False
 
 
+def escape_slack(text: str) -> str:
+    """`<`·`>`·`&`는 Slack이 링크·엔티티 문법으로 먹는다. 코드 조각을 그대로 보기에
+    넣는 문항이라 이걸 안 걷으면 `Callable[<...>]` 같은 보기가 통째로 사라진다."""
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def rich(text: str, limit: int = 2900) -> str:
+    """모델이 쓴 표준 마크다운 → Slack mrkdwn.
+
+    출제 모델은 `**굵게**`로 쓰지만 Slack은 별 하나(`*굵게*`)만 굵게 그린다. 변환하지
+    않으면 지문의 강조가 전부 `**어긋나는**` 같은 날문자로 보인다."""
+    out = to_mrkdwn(escape_slack(text)).strip()
+    return out if len(out) <= limit else out[:limit - 1].rstrip() + "…"
+
+
+def plain(text: str, limit: int = 150) -> str:
+    """header·버튼용 — `plain_text`에는 마크다운이 없어 기호가 그대로 찍힌다."""
+    out = _WS_RE.sub(" ", _MD_MARKS_RE.sub("", text or "")).strip()
+    return out if len(out) <= limit else out[:limit - 1].rstrip() + "…"
+
+
+def bar(done: int, total: int, width: int = 10) -> str:
+    """진행·정답률 막대. Slack에는 진행 표시가 없어 글자로 그린다."""
+    if total <= 0:
+        return ""
+    filled = max(0, min(width, round(width * done / total)))
+    return BAR_FULL * filled + BAR_EMPTY * (width - filled)
+
+
 def question_blocks(q: Question, idx: int, total: int) -> list[dict]:
-    """문항 하나 — 진행 표시 / 지문 / 보기 4개 버튼. 정오는 표시하지 않는다."""
-    kind = "옳은 것" if q.type == "CORRECT" else "틀린 것"
-    detail = "\n".join(f"*{chr(65 + i)})* {o}" for i, o in enumerate(q.options))
-    return [
+    """문항 하나 — 진행 막대 / 영역 제목 / 지문 / 보기 4개 / 버튼. 정오는 표시하지 않는다.
+
+    보기는 **한 보기당 한 섹션**이다. 넷을 한 덩어리에 넣으면 100자짜리 보기 넷이
+    문단처럼 이어 붙어 A·B·C·D 경계가 사라진다 — 읽는 사람이 지금 몇 번을 읽고 있는지
+    모르는 것이 이 화면의 가장 큰 문제였다."""
+    emoji, kind = TYPE_HINT.get(q.type, ("•", "알맞은 것"))
+    blocks: list[dict] = [
         {"type": "context", "elements": [{"type": "mrkdwn",
-                                          "text": f"*{idx + 1} / {total}* · {q.area}"}]},
-        {"type": "header", "text": {"type": "plain_text", "text": q.stem[:150]}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": detail[:2900]}},
+         "text": f"{bar(idx, total)}  *{idx + 1} / {total}*"}]},
+        {"type": "header", "text": {"type": "plain_text",
+                                    "text": plain(f"Q{idx + 1}. {q.area}"), "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": rich(q.stem)}},
+        {"type": "context", "elements": [{"type": "mrkdwn",
+         "text": f"{emoji} 아래 보기에서 *{kind}* 하나를 고르세요"}]},
+        {"type": "divider"},
+    ]
+    blocks += [{"type": "section", "text": {"type": "mrkdwn",
+                "text": f"*{LETTERS[i]}*  ·  {rich(o, 1200)}"}}
+               for i, o in enumerate(q.options)]
+    blocks += [
         {"type": "actions", "block_id": "tutor_answers", "elements": [
             {"type": "button", "action_id": f"tutor_answer_{idx}_{i}",
-             "text": {"type": "plain_text", "text": chr(65 + i)},
+             "text": {"type": "plain_text", "text": LETTERS[i]},
              "value": f"{idx}:{i}"} for i in range(len(q.options))]},
         {"type": "context", "elements": [{"type": "mrkdwn",
-                                          "text": f"_{kind}을 고르세요 · 채점은 마지막에 한 번에 합니다_"}]},
+         "text": "_채점과 해설은 회차를 마친 뒤 리포트에서 한 번에 봅니다_"}]},
     ]
+    return blocks
+
+
+def opening_blocks(repo_name: str, total: int, *, shortfall: bool, misses: int) -> list[dict]:
+    """회차 시작 안내. 사유(부족 출제·이월 오답)는 본문이 아니라 context로 내린다 —
+    회차마다 붙는 곁줄이 제목만큼 커 보이면 정작 몇 문항인지가 안 읽힌다."""
+    notes = []
+    if shortfall:
+        notes.append(f"⚠️ 근거를 찾지 못해 {total}문항만 출제했습니다")
+    if misses:
+        notes.append(f"📌 지난 오답 {misses}건을 노트에서 함께 보고 있습니다")
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "🎓 학습 회차 시작",
+                                    "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn",
+         "text": f"`{plain(repo_name, 80)}`  ·  총 *{total}*문항"}},
+    ]
+    if notes:
+        blocks.append({"type": "context",
+                       "elements": [{"type": "mrkdwn", "text": "\n".join(notes)}]})
+    return blocks
+
+
+def opening_text(repo_name: str, total: int, *, shortfall: bool, misses: int) -> str:
+    """블록을 못 그리는 클라이언트·알림 미리보기용 대체 텍스트."""
+    head = f"🎓 `{repo_name}` 학습 회차 — 총 {total}문항"
+    if shortfall:
+        head += f"\n⚠️ 근거를 찾지 못해 {total}문항만 출제했습니다."
+    if misses:
+        head += f"\n📌 지난 오답 {misses}건을 노트에서 보고 있습니다."
+    return head
+
+
+def score_blocks(card: Scorecard, *, repo_name: str, url: str | None,
+                 added: int, cleared: int) -> list[dict]:
+    """채점 결과 — 총점 / 영역별 막대 / 노트 변화 / 리포트 버튼.
+
+    영역별을 `A 2/3 · B 1/2 · C 0/2`처럼 한 줄로 이어 붙이면 **어디가 약한지**가
+    안 보인다. 이 화면의 쓸모는 점수가 아니라 약한 영역이므로 줄을 나누고 막대를 준다."""
+    pct = round(card.correct * 100 / card.total) if card.total else 0
+    blocks: list[dict] = [
+        {"type": "header", "text": {"type": "plain_text", "text": "🎯 채점 완료",
+                                    "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn",
+         "text": (f"`{plain(repo_name, 80)}`  ·  *{card.correct} / {card.total}*  ({pct}%)\n"
+                  f"{bar(card.correct, card.total)}")}},
+    ]
+    if card.by_area:
+        lines = "\n".join(f"{bar(ok, n, 5)}  {plain(area, 40)}  ·  *{ok}/{n}*"
+                           for area, (ok, n) in card.by_area.items())
+        blocks += [{"type": "divider"},
+                   {"type": "section", "text": {"type": "mrkdwn",
+                    "text": f"*영역별*\n{lines}"[:2900]}}]
+    if added or cleared:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+                       "text": f"📕 오답 노트 · 새로 담음 *{added}* · 해소 *{cleared}*"}]})
+    if url:
+        blocks.append({"type": "actions", "elements": [
+            {"type": "button", "style": "primary", "action_id": "tutor_report",
+             "text": {"type": "plain_text", "text": "📄 해설 리포트 열기", "emoji": True},
+             "url": url}]})
+    else:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+                       "text": "_리포트 발행에 실패했습니다 — 점수만 전달합니다_"}]})
+    return blocks
+
+
+def score_text(card: Scorecard, *, url: str | None, added: int, cleared: int) -> str:
+    lines = [f"✅ 채점 완료 — *{card.correct} / {card.total}*",
+             " · ".join(f"{a} {ok}/{n}" for a, (ok, n) in card.by_area.items())]
+    if added or cleared:
+        lines.append(f"오답 노트: +{added} / 해소 {cleared}")
+    lines.append(f"📄 리포트: {url}" if url
+                 else "_(리포트 발행에 실패했습니다 — 점수만 전달합니다)_")
+    return "\n".join(lines)
 
 
 def regrade_blocks() -> list[dict]:
@@ -215,13 +337,11 @@ class TutorHandler:
             await say(text=f"💥 회차 기록에 실패해 시작하지 않았습니다: {type(e).__name__}",
                       thread_ts=thread_ts)
             return
-        head = f"🎓 `{repo_name}` 학습 회차 — 총 {total}문항"
-        if res.shortfall:
-            # 숫자를 채우려 지어내지 않는다. 왜 적은지 사실대로 말한다 (#19 D6)
-            head += f"\n⚠️ 근거를 찾지 못해 {total}문항만 출제했습니다."
-        if misses:
-            head += f"\n📌 지난 오답 {len(misses)}건을 노트에서 보고 있습니다."
-        await say(text=head, thread_ts=thread_ts)
+        # 숫자를 채우려 지어내지 않는다. 왜 적은지 사실대로 말한다 (#19 D6)
+        opening = dict(shortfall=bool(res.shortfall), misses=len(misses))
+        await self._say_blocks(say, thread_ts,
+                               opening_text(repo_name, total, **opening),
+                               opening_blocks(repo_name, total, **opening))
         sess = QuizSession(channel=channel, thread_ts=thread_ts, owner=user,
                            repo_name=repo_name, questions=res.questions)
         self.sessions[thread_ts] = sess
@@ -238,12 +358,10 @@ class TutorHandler:
     async def _post_question(self, sess: QuizSession, idx: int, say) -> None:
         q = sess.questions[idx]
         total = len(sess.questions)
-        text = f"*{idx + 1} / {total}* · {q.area}\n{q.stem}"
-        try:
-            await say(text=text, thread_ts=sess.thread_ts,
-                      blocks=question_blocks(q, idx, total))
-        except TypeError:
-            await say(text=text, thread_ts=sess.thread_ts)
+        # 대체 텍스트도 알림 미리보기로 읽히므로 마크다운을 그대로 흘리지 않는다
+        text = f"*{idx + 1} / {total}* · {plain(q.area, 40)}\n{rich(q.stem, 300)}"
+        await self._say_blocks(say, sess.thread_ts, text,
+                               question_blocks(q, idx, total))
 
     async def _finish(self, sess: QuizSession, say) -> None:
         note = note_id(sess.owner, sess.repo_name)
@@ -276,13 +394,11 @@ class TutorHandler:
             url = await asyncio.to_thread(self.publish, self._report_id(sess), html)
         except Exception:
             url = None
-        lines = [f"✅ 채점 완료 — *{card.correct} / {card.total}*",
-                 " · ".join(f"{a} {ok}/{n}" for a, (ok, n) in card.by_area.items())]
-        if added or cleared:
-            lines.append(f"오답 노트: +{added} / 해소 {cleared}")
-        lines.append(f"📄 리포트: {url}" if url
-                     else "_(리포트 발행에 실패했습니다 — 점수만 전달합니다)_")
-        await say(text="\n".join(lines), thread_ts=sess.thread_ts)
+        await self._say_blocks(
+            say, sess.thread_ts,
+            score_text(card, url=url, added=added, cleared=cleared),
+            score_blocks(card, repo_name=sess.repo_name, url=url,
+                         added=added, cleared=cleared))
 
     def _report_id(self, sess: QuizSession) -> str:
         import hashlib
