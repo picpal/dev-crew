@@ -732,3 +732,39 @@ def test_missing_dotenv_is_not_an_error(tmp_path):
     """.env 없이 export만 쓰던 기존 방식이 그대로 돌아야 한다."""
     from devcrew.slack_engine import load_env
     assert load_env(tmp_path / "nope.env") is False
+
+
+def test_env_is_found_in_the_main_repo_when_a_worktree_has_none(tmp_path):
+    """워크트리는 버려지는 공간이다 — 비밀은 본체 저장소에 두고 워크트리가 그걸 읽는다.
+
+    2026-08-22: 워크트리 정리 도구가 .worktrees/*를 치우면서 그 안의 .env가 함께
+    사라졌다. 토큰을 워크트리에 둔 것이 잘못이었다."""
+    import os
+
+    from devcrew.slack_engine import env_candidates
+    main = tmp_path / "repo"
+    (main / ".git" / "worktrees" / "wt1").mkdir(parents=True)
+    (main / ".env").write_text("X=1\n")
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text(f"gitdir: {main}/.git/worktrees/wt1\n")
+    assert main / ".env" in env_candidates(wt)
+
+
+def test_worktree_env_wins_over_the_main_repo(tmp_path):
+    """워크트리에 따로 두면 그쪽이 이긴다 — 실험용 토큰을 격리할 수 있어야 한다."""
+    from devcrew.slack_engine import env_candidates
+    main = tmp_path / "repo"
+    (main / ".git" / "worktrees" / "wt1").mkdir(parents=True)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text(f"gitdir: {main}/.git/worktrees/wt1\n")
+    cands = env_candidates(wt)
+    assert cands.index(wt / ".env") < cands.index(main / ".env")
+
+
+def test_plain_checkout_has_a_single_candidate(tmp_path):
+    """워크트리가 아닌 보통 클론에서는 그 저장소의 .env 하나뿐이다."""
+    from devcrew.slack_engine import env_candidates
+    (tmp_path / ".git").mkdir()
+    assert env_candidates(tmp_path) == [tmp_path / ".env"]

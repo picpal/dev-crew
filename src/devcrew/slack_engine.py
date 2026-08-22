@@ -43,6 +43,32 @@ _BROADCAST_RE = re.compile(r"<!(channel|here|everyone)(\|[^>]*)?>", re.I)
 # 저장소 루트 — `src/devcrew/slack_engine.py` 기준 두 단계 위
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENV_FILE = REPO_ROOT / ".env"
+LOADED_ENV_FILE: Path | None = None   # 실제로 읽은 파일 (기동 로그용)
+
+
+def env_candidates(root: Path | str | None = None) -> list[Path]:
+    """`.env`를 찾을 자리 — 워크트리 우선, 그다음 **본체 저장소**.
+
+    워크트리는 설계상 버려지는 공간이다. 거기에만 비밀을 두면 정리 도구가 한 번 돌 때
+    함께 사라진다 (2026-08-22에 실제로 그렇게 잃었다). 본체 저장소의 `.env`를 읽게 해
+    워크트리를 몇 개를 만들고 지우든 토큰은 한 자리에 남게 한다.
+
+    워크트리에 따로 두면 그쪽이 이긴다 — 실험용 토큰을 격리할 수 있어야 한다."""
+    base = Path(root) if root else REPO_ROOT
+    out = [base / ".env"]
+    git = base / ".git"
+    # 워크트리의 `.git`은 디렉토리가 아니라 `gitdir: <본체>/.git/worktrees/<이름>` 파일이다
+    if git.is_file():
+        try:
+            line = git.read_text().strip()
+        except OSError:
+            return out
+        marker = "/.git/worktrees/"
+        if line.startswith("gitdir:") and marker in line:
+            main_root = Path(line.split(":", 1)[1].strip().split(marker)[0])
+            if main_root != base:
+                out.append(main_root / ".env")
+    return out
 
 
 def load_env(path: Path | str | None = None) -> bool:
@@ -51,9 +77,11 @@ def load_env(path: Path | str | None = None) -> bool:
     셸에서 이미 export한 값은 덮지 않는다 — 임시로 토큰을 바꿔 띄우는 흐름을
     파일이 조용히 되돌리면 디버깅이 불가능해진다. 파일이 없어도 오류가 아니다
     (export만 쓰던 기존 방식이 그대로 돈다)."""
-    p = Path(path) if path else ENV_FILE
-    if not p.is_file():
+    paths = [Path(path)] if path else env_candidates()
+    p = next((c for c in paths if c.is_file()), None)
+    if p is None:
         return False
+    globals()["LOADED_ENV_FILE"] = p
     for line in p.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -569,7 +597,7 @@ class MentionHandler:
 
 async def _amain() -> None:
     if load_env():
-        print(f"devcrew: {ENV_FILE} 로드 (셸 export 우선)")
+        print(f"devcrew: {LOADED_ENV_FILE} 로드 (셸 export 우선)")
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
     from slack_bolt.async_app import AsyncApp
 
