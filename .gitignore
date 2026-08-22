@@ -8,3 +8,6 @@ poc/_artifacts/
 # 로컬 비밀
 .env
 .codex-screens/
+
+# wrangler 로컬 캐시 (계정 ID·이메일 포함)
+worker/.wrangler/
