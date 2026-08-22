@@ -1,4 +1,6 @@
-"""Orchestrator 원시 연산 — spawn/escalation(§7.6), bounded loop(§10), queue(§9.1).
+"""Orchestrator 원시 연산 — spawn/escalation(§7.6), consume_result 전이 판정(§10),
+queue(§9.1). Bounded loop/decision 오케스트레이션 자체는 `WorkflowEngine`(engine.py,
+§10) 몫이다.
 
 POC 범위: 상태 전이와 이벤트 기록의 실행 가능성 증명. Slack/Task Service는 미포함.
 """
@@ -9,7 +11,8 @@ from dataclasses import dataclass
 
 from .adapters.base import TurnOutcome
 from .routing import resolve
-from .roles import STATUS_ENUM, RoleBundle, RoleBundleError, load_bundle
+from .roles import (STATUS_ENUM, RoleBundle, RoleBundleError, load_bundle,
+                    missing_required_keys)
 from .schema import AgentInstance, EffortLevel, InstanceStatus, Provider, Role
 from .store.registry import SessionRegistry
 from .store.trace import TraceStore
@@ -19,13 +22,9 @@ _EFFORT_BY_STR = {"low": EffortLevel.LOW, "medium": EffortLevel.MEDIUM,
                   "max": EffortLevel.MAX}
 
 WORKER_ROLES = {Role.EXPLORER, Role.DEVELOPER, Role.REVIEWER, Role.QA}
-
-
-@dataclass(frozen=True)
-class LoopResult:
-    passed: bool
-    iterations: int
-    escalated: bool
+# role 번들이 존재해 spawn 시 로드해야 하는 role 전체 (워크플로 worker + 결정/대화 role)
+BUNDLED_ROLES = WORKER_ROLES | {Role.ORCHESTRATOR, Role.BRAIN,
+                                Role.TUTOR, Role.TUTOR_VERIFIER}
 
 
 class ReviewQueue:
@@ -69,8 +68,9 @@ class Orchestrator:
             escalation_chain_id=(replaced.escalation_chain_id or replaced.instance_id)
             if replaced else None,
         )
-        # Load role bundle for WORKER_ROLES
-        if role in WORKER_ROLES:
+        # Load role bundle for WORKER_ROLES + ORCHESTRATOR (decision sessions need
+        # their own prompt/output_schema bundle too — Task 5)
+        if role in BUNDLED_ROLES:
             bundle = load_bundle(role)
             inst.role_bundle_version = bundle.version
 
@@ -94,8 +94,14 @@ class Orchestrator:
         self.registry.upsert(inst, provider_ref=None)
         return inst
 
-    async def start_worker(self, inst: AgentInstance, initial_message: str) -> str:
+    async def start_worker(self, inst: AgentInstance, initial_message: str, *,
+                           mcp_servers: dict | None = None,
+                           conversational: bool = False) -> str:
         """Start a worker agent session with its role bundle injected.
+
+        `mcp_servers` is passed through to the adapter's start_session (Task 5/6) —
+        used by decision sessions (ORCHESTRATOR) to expose the read-only harness MCP
+        tools. Workers spawned by the engine don't pass this, so it defaults to None.
 
         Loads the bundle for the worker role and passes system_prompt and output_schema
         to the adapter's start_session method.
@@ -122,9 +128,26 @@ class Orchestrator:
         system_prompt = bundle.prompt
         if inst.task_scope:
             system_prompt = f"{bundle.prompt}\n\n## 할당 Scope\n{inst.task_scope}"
+        if inst.worktree:
+            # 워커가 자기 worktree 밖(부모 repo·다른 worktree)의 코드를 읽고 "내
+            # 작업 대상은 저쪽인데 여기에 묶여 있다"고 오판해 BLOCKED로 자폭하는
+            # 사례(2026-08-20 SLACK-3) 차단. 격리는 결함이 아니라 설계다.
+            system_prompt += (
+                f"\n\n## 작업 디렉토리 (정본)\n{inst.worktree}\n"
+                "이 디렉토리가 네 과업의 정본이다. 이 repo의 다른 경로(부모 repo, "
+                "다른 worktree)에 비슷하거나 더 최신인 코드가 보이더라도 그것은 네 "
+                "과업 대상이 아니다. 쓰기가 이 디렉토리로 제한되는 것은 하네스의 "
+                "격리 설계이지 구성 결함이 아니므로, 그걸 이유로 작업을 중단하지 "
+                "마라. 필요한 파일이 여기 없으면 여기서 만들면 된다.")
+        # conversational=True는 대화형 role(BRAIN 인터뷰) 전용: provider 구조화 출력이
+        # 매 turn을 JSON으로 강제하면 자연어 인터뷰가 불가능하므로 output_schema 주입만
+        # 생략한다. role prompt/tool policy/cwd 강제는 그대로 유지된다. 최종 brief는
+        # 별도의 비대화(conversational=False) 세션이 스키마 강제로 산출한다.
         session_id = await adapter.start_session(
             inst, initial_message,
-            system_prompt=system_prompt, output_schema=bundle.schema)
+            system_prompt=system_prompt,
+            output_schema=None if conversational else bundle.schema,
+            mcp_servers=mcp_servers)
         inst.session_id = session_id
         self.registry.upsert(inst, provider_ref=None)
         return session_id
@@ -138,12 +161,13 @@ class Orchestrator:
         (fail-closed — 신뢰할 수 없는 출력으로 상태를 전이시키지 않는다).
 
         전이 판정에 쓰는 role은 `as_role or inst.role`이다. 기본은 `inst.role`이지만,
-        `outcome`이 `inst`와 다른 role의 결과일 때(예: `run_review_loop`가 DEVELOPER
-        `dev_inst`로 루프를 돌지만 `review_fn`이 돌려주는 `TurnOutcome`은 Reviewer의
-        결과인 경우) 호출자가 `as_role=Role.REVIEWER`로 실제 판정 규칙을 명시해야
-        한다 — 그렇지 않으면 `inst.role`(DEVELOPER)로 판정해 Reviewer의 verdict가
-        완전히 무시되고 `{status: PASS, verdict: NOT_PASS}`가 status만으로 성공
-        처리되는 버그가 재발한다(재재리뷰 신규 finding).
+        `outcome`이 `inst`와 다른 role의 결과일 때 호출자가 `as_role=Role.REVIEWER`로
+        실제 판정 규칙을 명시해야 한다 — 그렇지 않으면 `inst.role`로 판정해 Reviewer의
+        verdict가 완전히 무시되고 `{status: PASS, verdict: NOT_PASS}`가 status만으로
+        성공 처리되는 버그가 재발한다(재재리뷰 신규 finding). `WorkflowEngine`(§10)은
+        모든 `TurnOutcome`을 그 결과를 생산한 노드의 instance로 전달하므로(예: review
+        노드의 결과는 그 노드의 Reviewer instance로) `as_role` 없이도 `inst.role`이
+        항상 정확한 판정 role이다.
 
         판정 role이 REVIEWER인 경우는 예외다: `structured["status"]`는 검토를
         "수행"했는지(PASS=검토를 마쳤다, BLOCKED=검토 불가 등)를 나타낼 뿐 코드에
@@ -158,10 +182,23 @@ class Orchestrator:
 
         정상 경로에서는 `WorkerResultEvent`를 남긴다 (payload: 판정에 쓰인 role,
         status, 그리고 REVIEWER 판정이 실제로 검토를 마친 경우 verdict도 포함).
+        `structured` 전문도 payload에 포함한다 (MCP get_worker_result의 데이터 소스;
+        §5 constraint상 프롬프트 원문이 아니라 구조화 결과이므로 trace payload에
+        남겨도 무방하다).
+
+        finding #2 — provider의 output_schema 강제(1차 방어)를 우회한 malformed
+        출력(예: 필수 필드 누락)을 잡는 2차 방어로, `status`만이 아니라 판정
+        role의 role bundle 전체 schema를 `missing_required_keys`(경량 required-키
+        재귀 검사, jsonschema 의존성 없음)로 확인한다. 누락이 있으면 status가
+        유효한 값이어도 malformed로 강등한다.
         """
         role = as_role or inst.role
         structured = outcome.structured
-        if not isinstance(structured, dict) or structured.get("status") not in STATUS_ENUM:
+        malformed = (
+            not isinstance(structured, dict)
+            or structured.get("status") not in STATUS_ENUM
+            or missing_required_keys(load_bundle(role).schema, structured))
+        if malformed:
             self.trace.append("MalformedResultEvent", task_id=inst.execution_id,
                               execution_id=inst.execution_id, instance_id=inst.instance_id,
                               payload={"role": role.value, "raw": structured})
@@ -175,43 +212,14 @@ class Orchestrator:
                                   execution_id=inst.execution_id, instance_id=inst.instance_id,
                                   payload={"role": role.value, "raw": structured})
                 return "NEED_REPLAN"
-            payload = {"role": role.value, "status": status, "verdict": verdict}
+            payload = {"role": role.value, "status": status, "verdict": verdict,
+                      "structured": structured}
             transition = verdict
         else:
-            payload = {"role": role.value, "status": status}
+            payload = {"role": role.value, "status": status, "structured": structured}
             transition = status
 
         self.trace.append("WorkerResultEvent", task_id=inst.execution_id,
                           execution_id=inst.execution_id, instance_id=inst.instance_id,
                           payload=payload)
         return transition
-
-    async def run_review_loop(self, dev_inst: AgentInstance, review_fn, fix_fn,
-                              *, max_iterations: int = 5,
-                              same_finding_threshold: int = 3) -> LoopResult:
-        """Bounded review loop (§10). `review_fn`은 str 전이값 또는 `TurnOutcome`을
-        반환할 수 있다 — `TurnOutcome`이면 `consume_result()` 경계를 통과시켜 구조화
-        출력 검증/Reviewer verdict 규칙을 적용한 전이값을 얻는다(재리뷰 finding #3
-        통합). `review_fn`의 결과는 항상 Reviewer의 출력이므로(루프를 돌리는
-        `dev_inst`가 어떤 role이든) `as_role=Role.REVIEWER`로 판정 규칙을 고정한다
-        — `dev_inst.role`(보통 DEVELOPER)로 판정하면 verdict가 무시되고 status만으로
-        전이가 결정돼 `{status: PASS, verdict: NOT_PASS}`가 잘못 통과 처리된다
-        (wave 3 신규 finding). 기존 str 반환 호출자는 그대로 동작한다(하위호환).
-        """
-        last_finding, same_count = None, 0
-        for i in range(1, max_iterations + 1):
-            ret = await review_fn(dev_inst)
-            verdict = (self.consume_result(dev_inst, ret, as_role=Role.REVIEWER)
-                      if isinstance(ret, TurnOutcome) else ret)
-            self.trace.append("LoopEvent", task_id=dev_inst.execution_id,
-                              execution_id=dev_inst.execution_id,
-                              instance_id=dev_inst.instance_id,
-                              payload={"iteration": i, "verdict": verdict})
-            if verdict.startswith("PASS"):
-                return LoopResult(passed=True, iterations=i, escalated=False)
-            same_count = same_count + 1 if verdict == last_finding else 1
-            last_finding = verdict
-            if same_count >= same_finding_threshold:
-                return LoopResult(passed=False, iterations=i, escalated=True)
-            await fix_fn(dev_inst)
-        return LoopResult(passed=False, iterations=max_iterations, escalated=True)

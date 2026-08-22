@@ -2,13 +2,18 @@ import pytest
 from devcrew.config import ConfigError, load
 from devcrew.schema import EffortLevel, Role
 
+# roleDefaults는 모든 Role을 요구한다 (config.REQUIRED_ROLE_DEFAULTS = frozenset(Role)).
+# 목록을 하드코딩하면 Role이 늘 때마다 무관한 테스트가 깨지므로 enum에서 파생시킨다.
+ALL_ROLES_CHEAP = "roleDefaults:\n" + "".join(
+    f"  {r.value}: {{tier: CHEAP}}\n" for r in Role)
+
 
 def test_load_default_config():
     cfg = load()   # config/harness.yaml
     assert cfg.tiers["CHEAP"].model == "claude-sonnet-5"
     assert cfg.tiers["CODEX_HIGH_REASONING"].model == "gpt-5.6-sol"
     assert cfg.role_defaults[Role.EXPLORER].tier == "CHEAP"
-    assert cfg.role_defaults[Role.REVIEWER].tier == "CODEX_DEFAULT"
+    assert cfg.role_defaults[Role.REVIEWER].tier == "CODEX_HIGH_REASONING"
 
 
 def test_missing_config_is_fail_fast(tmp_path):
@@ -65,3 +70,54 @@ def test_routing_consumes_yaml():
     from devcrew.routing import TIERS, resolve
     assert TIERS["DEFAULT"].model == "claude-sonnet-5"
     assert resolve("CHEAP").effort == "low"
+
+
+# Task 1 tests: loopPolicy + ORCHESTRATOR roleDefaults
+def test_loop_policy_loaded():
+    cfg = load()
+    assert cfg.loop_policy.max_iterations == 5
+    assert cfg.loop_policy.max_duration_minutes == 60
+    assert cfg.loop_policy.max_token_budget == 1500000
+    # role별 예산 — 모든 role에 값이 있고 합계는 실행 hard cap을 넘지 않게 두지 않는다
+    assert cfg.loop_policy.role_budgets["ORCHESTRATOR"] == 400000
+    assert cfg.loop_policy.role_budgets["DEVELOPER"] == 600000
+    assert cfg.loop_policy.same_finding_escalation_threshold == 3
+
+
+def test_loop_policy_missing_fails(tmp_path):
+    p = tmp_path / "h.yaml"
+    p.write_text(
+        "tiers:\n  CHEAP: {provider: CLAUDE_CODE, model: claude-sonnet-5, effort: LOW}\n"
+        + ALL_ROLES_CHEAP)
+    with pytest.raises(ConfigError, match="loopPolicy"):
+        load(p)
+
+
+def test_loop_policy_nonpositive_fails(tmp_path):
+    p = tmp_path / "h.yaml"
+    p.write_text(
+        "tiers:\n  CHEAP: {provider: CLAUDE_CODE, model: claude-sonnet-5, effort: LOW}\n"
+        + ALL_ROLES_CHEAP
+        + "loopPolicy:\n"
+        "  maxIterations: 0\n"
+        "  maxDurationMinutes: 60\n"
+        "  maxTokenBudget: 300000\n"
+        "  sameFindingEscalationThreshold: 3\n")
+    with pytest.raises(ConfigError, match="positive"):
+        load(p)
+
+
+def test_orchestrator_role_default_required():
+    cfg = load()
+    assert cfg.role_defaults[Role.ORCHESTRATOR].tier == "HIGH_CAPABILITY"
+
+
+def test_tutor_roles_have_defaults():
+    """출제는 Claude 고품질, 검증은 Codex — provider가 갈려야 교차 검증이다."""
+    from devcrew.config import load
+    from devcrew.schema import Provider, Role
+    cfg = load()
+    assert cfg.role_defaults[Role.TUTOR].tier == "HIGH_CAPABILITY"
+    assert cfg.role_defaults[Role.TUTOR_VERIFIER].tier == "CODEX_DEFAULT"
+    assert cfg.tiers[cfg.role_defaults[Role.TUTOR]. tier].provider == Provider.CLAUDE_CODE
+    assert cfg.tiers[cfg.role_defaults[Role.TUTOR_VERIFIER].tier].provider == Provider.CODEX

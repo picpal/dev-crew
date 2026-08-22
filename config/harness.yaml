@@ -1,5 +1,6 @@
 # §17 — tier = (full model ID, 기본 effort) 쌍. alias 금지 (#12)
 tiers:
+  HAIKU_FAST:           { provider: CLAUDE_CODE, model: claude-haiku-4-5-20251001, effort: LOW }
   CHEAP:                { provider: CLAUDE_CODE, model: claude-sonnet-5, effort: LOW }
   DEFAULT:              { provider: CLAUDE_CODE, model: claude-sonnet-5, effort: HIGH }
   HIGH_CAPABILITY:      { provider: CLAUDE_CODE, model: claude-opus-5,   effort: HIGH }
@@ -7,9 +8,50 @@ tiers:
   CODEX_HIGH_REASONING: { provider: CODEX,       model: gpt-5.6-sol,     effort: HIGH }
 
 roleDefaults:
-  EXPLORER:  { tier: CHEAP }
-  ARCHITECT: { tier: DEFAULT }
+  ORCHESTRATOR: { tier: HIGH_CAPABILITY }
+  EXPLORER:  { tier: CHEAP }   # sonnet 유지 (사용자 정정)
+  ARCHITECT: { tier: HIGH_CAPABILITY }
   DEVELOPER: { tier: DEFAULT }
-  SECURITY:  { tier: DEFAULT, effort: HIGH }
-  QA:        { tier: CHEAP }
-  REVIEWER:  { tier: CODEX_DEFAULT }
+  SECURITY:  { tier: HIGH_CAPABILITY }
+  QA:        { tier: CHEAP }   # sonnet 유지 (사용자 정정)
+  REVIEWER:  { tier: CODEX_HIGH_REASONING }  # gpt-5.6-sol
+  BRAIN:     { tier: HIGH_CAPABILITY, effort: XHIGH }  # opus + 최대 검토 품질 (사용자 결정 2026-08-19)
+  # 출제는 Claude 고품질, 검증은 Codex — provider가 갈려야 교차 검증이다 (#19 D4)
+  TUTOR:          { tier: HIGH_CAPABILITY }
+  TUTOR_VERIFIER: { tier: CODEX_DEFAULT }
+
+# §10.3 loop guard — Task 실패가 아니라 결정 지점 진입 조건
+loopPolicy:
+  maxIterations: 5
+  maxDurationMinutes: 60
+  # 실행 전체 hard cap. 300k는 실측 1회 실행(587k)보다 작아 정상 완료도 강제
+  # 종료시켰다 (2026-08-20 SLACK-1/SLACK-2) — 실측 기준으로 현실화.
+  maxTokenBudget: 1500000
+  sameFindingEscalationThreshold: 3
+  # 에이전트(role)별 토큰 경보선. adapter.send() 하나가 그 에이전트의 전체 agentic
+  # turn이라 토큰은 사후에만 보인다 — 폭주를 막지 못하므로 종료 트리거가 아니라
+  # "이 정도면 비정상" 경보로만 쓴다 (Slack 회신 + leader 스냅샷).
+  # 예외: ORCHESTRATOR만 hard stop이다. leader는 노드가 아니라서 반복 가드
+  # (iterations/node_visits)에 잡히지 않고, 가드가 켜질 때마다 호출돼 자기 자신이
+  # 원인인 루프를 만든다 (2026-08-20 SLACK-1).
+  roleBudgets:
+    ORCHESTRATOR: 400000
+    EXPLORER:     200000
+    ARCHITECT:    300000
+    DEVELOPER:    600000
+    SECURITY:     300000
+    QA:           200000
+    REVIEWER:     500000
+    BRAIN:        600000
+    TUTOR:        400000
+    TUTOR_VERIFIER: 300000
+
+# crew leader 결정 세션의 컨텍스트 정책 (사용자 결정 2026-08-20)
+# persistent: 결정마다 fresh 세션 대신 스레드 단위로 세션을 유지한다 — 이전 결정과
+#   그때 확정된 사실을 들고 판단하므로 일관성이 올라가고, 스냅샷 재설명 비용이 준다.
+# compactAtRatio: 컨텍스트 점유가 window의 이 비율에 닿으면 leader가 스스로 요약해
+#   새 세션에 인계한다 (창을 비우되 결정 맥락은 유지).
+leaderContext:
+  persistent: true
+  windowTokens: 1000000
+  compactAtRatio: 0.5

@@ -32,12 +32,15 @@ class TurnOutcome:
 class ProviderAdapter(Protocol):
     async def start_session(self, inst: AgentInstance, initial_message: str, *,
                              system_prompt: str | None = None,
-                             output_schema: dict | None = None) -> str: ...
+                             output_schema: dict | None = None,
+                             mcp_servers: dict | None = None) -> str: ...
     async def send(self, session_id: str, message: str) -> TurnOutcome: ...
     async def resume(self, session_id: str, message: str) -> TurnOutcome: ...
     async def cancel(self, session_id: str) -> str: ...
     async def archive(self, session_id: str) -> str: ...
     async def get_usage(self, session_id: str) -> Usage: ...
+    async def initial_usage(self, session_id: str) -> Usage | None: ...
+    async def context_usage(self, session_id: str) -> dict | None: ...
 
 
 class FakeAdapter:
@@ -53,21 +56,36 @@ class FakeAdapter:
         self.turns: dict[str, int] = {}
         self.last_system_prompt: str | None = None
         self.last_output_schema: dict | None = None
+        self.last_mcp_servers: dict | None = None
+        # 노드 최초 투입 메시지 기록 — crew leader 취합(handoff) 주입을 unit이 검증한다
+        self.initial_messages: list[str] = []
+        # 이어진 turn의 투입 메시지 (session_id, message) — 세션 재개 맥락 주입 검증용
+        self.sent: list[tuple[str, str]] = []
+        # context_usage()가 돌려줄 값 (None이면 미지원 어댑터처럼 동작)
+        self.context: dict | None = None
 
     async def start_session(self, inst: AgentInstance, initial_message: str, *,
                              system_prompt: str | None = None,
-                             output_schema: dict | None = None) -> str:
+                             output_schema: dict | None = None,
+                             mcp_servers: dict | None = None) -> str:
         sid = f"fake-{next(self._ids)}"
         self.turns[sid] = 0
+        self.initial_messages.append(initial_message)
         self.last_system_prompt = system_prompt
         self.last_output_schema = output_schema
+        self.last_mcp_servers = mcp_servers
         return sid
 
     async def send(self, session_id: str, message: str) -> TurnOutcome:
+        if message is None:
+            # 실 어댑터(Claude SDK/Codex SDK)는 None 프롬프트를 거부하고 크래시한다
+            # (§Task4 R2 근본원인) — Fake도 같은 계약을 가져야 이 결함류를 unit이 잡는다.
+            raise TypeError("FakeAdapter.send: message must not be None")
         n = self.turns[session_id]
         if self.fail_after is not None and n >= self.fail_after:
             raise RuntimeError("scripted failure")
         self.turns[session_id] = n + 1
+        self.sent.append((session_id, message))
         text = self.script[n] if n < len(self.script) else "done"
         structured = self.structured_script[n] if n < len(self.structured_script) else None
         return TurnOutcome(text=text, usage=Usage(output_tokens=1, raw={"fake": True}),
@@ -84,3 +102,11 @@ class FakeAdapter:
 
     async def get_usage(self, session_id: str) -> Usage:
         return Usage(output_tokens=self.turns.get(session_id, 0), raw={"fake": True})
+
+    async def initial_usage(self, session_id: str) -> Usage | None:
+        # FakeAdapter.start_session은(실 어댑터와 달리) 최초 메시지에 대해 turn을
+        # 실행하지 않는다 — 버릴 usage 자체가 없으므로 항상 None (finding #6).
+        return None
+
+    async def context_usage(self, session_id: str) -> dict | None:
+        return self.context

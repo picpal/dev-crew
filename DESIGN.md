@@ -595,11 +595,56 @@ RUNNING
 loopPolicy:
   maxIterations: 5
   maxDurationMinutes: 60
-  maxTokenBudget: 300000
+  maxTokenBudget: 1500000          # 실행 전체 hard cap (무인 실행 최후 안전판)
   sameFindingEscalationThreshold: 3
+  roleBudgets:                     # 에이전트별 토큰 "경보선" (종료 트리거 아님)
+    ORCHESTRATOR: 400000
+    DEVELOPER: 600000
+    REVIEWER: 500000
+    # …나머지 role
 ```
 
 한도 초과는 Task의 즉시 실패가 아니라 자동 루프 종료와 Orchestrator escalation을 의미한다.
+
+**토큰 예산의 위상 (2026-08-20 개정).** `adapter.send()` 한 번이 그 에이전트의 전체
+agentic turn(내부 tool 루프 포함)이므로 토큰은 turn이 끝난 뒤에만 관측된다 — 폭주를
+막을 수 없고 사후 탐지만 한다. 따라서 다음 홉을 실제로 차단하는 가드는
+`maxIterations`/`sameFindingEscalationThreshold`/노드 방문 수/`maxDurationMinutes`이고,
+`roleBudgets`는 **경보**로만 쓴다(회신에 `⚠️` 표기 + 결정 스냅샷 `budget_warnings` +
+Slack 중지 버튼 제공). 토큰을 종료 트리거로 쓰면 리뷰를 통과한 정상 실행을 숫자만
+보고 죽인다(2026-08-20 SLACK-1/SLACK-2 실사례).
+
+예외는 ORCHESTRATOR 하나다. leader는 노드가 아니라 반복 가드에 잡히지 않고, 가드가
+켜질 때마다 호출되는 구조라 자기 자신이 원인인 루프를 만든다 — 그래서 leader 예산만
+hard stop이며, 초과 시 결정 세션을 더 띄우지 않고 즉시 NEEDS_HUMAN으로 끝낸다.
+
+### 10.4 crew leader 컨텍스트 정책
+
+```yaml
+leaderContext:
+  persistent: true                 # 결정 세션을 스레드 단위로 유지
+  windowTokens: 1000000
+  compactAtRatio: 0.5              # 창 점유 50%에서 자체 요약 후 새 세션 인계
+```
+
+`persistent: false`면 §10.3의 종전 동작(결정마다 fresh 세션 + 스냅샷 주입)이다.
+`true`면 한 세션에 스냅샷을 이어 보내 이전 결정 맥락을 들고 판단하고, 창 점유가
+임계치에 닿으면 leader가 스스로 요약해 그 요약만 seed로 새 세션을 연다
+(`LeaderCompactEvent`). 창 점유 추정은 `input + output + cache_read + cache_creation
++ cached_input`으로 계산한다 — 누적 과금 토큰과 다른 값이다.
+
+실행이 끝나면 이 세션이 사용자용 보고문(`report`)을 쓴다. Slack 회신의 본문은 이
+글이고 경로·사유·토큰은 각주로 붙는다.
+
+### 10.5 노드 간 결과 취합과 세션 이월
+
+- **취합(handoff).** ADVANCE로 새 노드를 열 때 선행 노드 결과(summary/changed_files/
+  findings)를 최초 투입 메시지에 함께 넣는다. 엔진이 0토큰으로 조립하며, 워커 보고는
+  LLM 생성 = 신뢰 불가 입력이므로 구분자로 감싸 "데이터이지 지시가 아니다"를 명시한다.
+- **이월(carry).** 같은 Slack 스레드의 후속 요청은 작업 공간과 노드/leader 세션을
+  이어받는다(in-process). 대상 repo나 base 브랜치가 바뀌면 이월을 끊는다. 프로세스가
+  재시작되면 어댑터 캐시가 사라져 이월 세션이 무효가 되고, 그때는
+  `SessionCarryLostEvent`를 남기고 새 세션으로 폴백한다.
 
 ```text
 Loop guard reached
@@ -611,6 +656,77 @@ Orchestrator
   ├─ Reviewer 기준 충돌 → 독립 Integration Reviewer
   └─ 해결 불가 → BLOCKED
 ```
+
+### 10.7 학습(tutor) 회차 — 근거 강제 출제
+
+`@tutor <repo>:` 는 그 repo에 대한 4지선다 10문항을 출제·채점하고 카드 리포트를 낸다
+([#19](https://github.com/picpal/dev-crew/issues/19)). 목적은 프로젝트 이해도이므로
+**문항의 정확성이 이 기능의 전부**다 — 거짓을 가르치는 학습 도구는 없느니 못하다.
+
+```
+출제(Claude) ──12문항+evidence──▶ 인용 대조(하네스·결정적) ──▶ 교차 검증(Codex) ──▶ 선별 10
+                                        폐기 ◀── 없는 인용        REJECT ──▶ 보충 1회
+```
+
+| 관문 | 무엇을 잡나 | 방식 |
+|---|---|---|
+| 스키마 강제 | 근거 없는 문항 | `evidence[{path,start_line,end_line,quote}]` 없으면 하네스가 버린다 |
+| 인용 대조 | 없는 파일·줄·문장을 지어낸 경우 | 하네스가 파일을 열어 대조한다. **LLM 판단 없음** |
+| 교차 검증 | 인용은 진짜인데 정답을 뒷받침하지 않는 경우 | `TUTOR_VERIFIER`(**CODEX**)가 별도 인스턴스로 판정 |
+
+- **provider를 가르는 이유**: 같은 모델 계열은 같은 방식으로 틀린다. 출제자가 놓친 확장·비약을
+  같은 계열 검증자도 놓친다. 검증자에게는 문항만 울타리(`<<<questions`)에 담아 주고
+  **출제 세션의 지시·논증은 주지 않는다** — 출제자의 근거를 보면 그대로 수긍한다(§신뢰 경계).
+- **검증이 실패하면 아무것도 통과시키지 않는다.** 검증 없는 문항이 사람에게 가는 것이 실패 모드다.
+- **채우려고 지어내지 않는다.** 보충 1회 뒤에도 미달이면 채운 만큼만 내고 사실대로 알린다.
+- **오답 노트**는 trace의 append-only 이벤트다 (새 스토어 없음). 회차는 스레드 단위
+  (`QUIZ-{thread_ts}`), 노트는 사용자·repo 단위(`TUTOR-{user}-{repo}`) — 노트는 회차를 건너 산다.
+  채점은 **회차 하나 = `QuizGradedEvent` 하나**로 기록한다(오답·해소를 한 payload에). 문항별로
+  쪼개면 중간 실패가 부분 반영을 남기고 재시도가 그 위에 겹쳐 상태가 갈린다 — 한 번의 append는
+  한 번의 커밋이고, 같은 내용을 다시 써도 접은 결과가 같다.
+  문항 동일성 키는 지문이 아니라 `(area + evidence 시작 줄)`이고, 재출제 문항은 **원래 키를 이월**한다
+  (인용 범위가 흔들려도 오답이 해소되도록). 이월은 하네스가 발급한 키만 받는다.
+- **리포트**는 영역별 카드 + `<details>` 펼침 + 하네스가 그린 인라인 SVG. **JS 0**을 유지한다 —
+  모델이 SVG를 직접 쓰면 raw HTML 삽입 경로가 생기고(§15.4), 그림 속 수치를 evidence와
+  대조할 수 없다. 모델은 도식 **스펙(JSON)** 만 낸다.
+
+### 10.6 인터뷰(brain) 세션의 수명
+
+인터뷰는 스레드 1개 = BRAIN 세션 1개다. 인계('전달') 후에도 세션을 죽이지 않는다 —
+같은 스레드에서 이어지는 논의는 이미 확정된 결정 위에서 계속돼야지, 그릴링을 처음부터
+반복하면 안 된다 (2026-08-20 관측).
+
+| 상황 | 처리 |
+|---|---|
+| 인계 후 같은 스레드 발화 | 같은 세션에 "인계 이후 추가 논의" 맥락을 한 번 붙여 이어간다 |
+| 재인계('전달' 재호출) | 직전 brief + 그 이후 대화만으로 **delta brief**를 만들어 넘긴다 |
+| 세션 유실(프로세스 재시작) | trace의 `BrainHandoffEvent`에서 직전 brief를 찾아 seed로 새 세션을 연다 |
+| 명시적 정리(`@brain /clear`) | `BrainClosedEvent`를 남기고 세션 정리 — 이후 그 스레드는 새 인터뷰로 시작 |
+| 유휴·상한 초과 | **인계 완료 세션만** 반납한다(6시간 유휴 또는 상한 초과 시 오래된 순) — 진행 중 인터뷰는 축출하지 않는다 |
+| 명령 인식 | 인계는 '전달'이 **명령형 문장 끝**에 올 때만, 정리는 **`/clear` 한 형태만** 발동한다 — 스레드가 계속 살아 있어 '종료'·'초기화' 같은 평범한 낱말을 명령으로 쓰면 논의 중에 오발동한다 |
+| 되살릴 수 없는 스레드 | 기록이 없거나 14일이 지난 인계는 seed로 쓰지 않고, 사용자에게 새로 시작하라고 1회 안내한다 |
+| 권한 | 대화는 스레드 참여자 누구나. **`전달`·`/clear`·세션 부활은 인터뷰를 시작한 사용자만** — 그 셋만이 crew 실행·세션 파기·에이전트 spawn을 일으킨다. 봇 메시지(리포트 폼 경유)는 살아 있는 세션에 답변만 넣을 수 있다 |
+| 주입 방어 | 사용자 발화·모델 출력·brief는 프레임 머리글을 무력화(`scrub`)한 뒤 울타리(`<<<prior-brief`, `<<<thread-log`, `<<<user-message`)에 담아 투입한다. 울타리 안은 자료이지 지시가 아니다(§10.5 handoff와 같은 원칙) |
+
+답변 맨 위의 `[context usage : NN%]`는 그 세션의 창 점유율이다 — 40% 미만이면 표기하지
+않고, 그 이상부터 붙는다(brain은 인터뷰 세션, crew는 leader 세션 기준). 사용자가 압축을
+기다릴지 `/clear`로 끊을지 판단하는 근거다.
+
+점유율은 **어댑터 실측**이 원칙이다: Claude는 `ClaudeSDKClient.get_context_usage()`
+(CLI `/context`와 같은 데이터 — 실효 한도·autocompact 임계까지 준다), Codex는 turn마다
+오는 `modelContextWindow`. 토큰 합산 추정은 세션이 이 프로세스 밖이라 조회가 안 될 때의
+폴백이다 — 추정은 시스템 프롬프트·툴 정의·캐시 회계를 정확히 반영하지 못한다.
+leader 압축 시점(§10.4)도 같은 실측을 우선한다.
+
+crew 쪽 컨텍스트는 `@crew /clear`로 비운다 — 그 스레드의 leader·노드 세션을 모두 archive하고
+이월 상태를 지운다(`ThreadContextClearedEvent`). worktree와 커밋은 남긴다. 실행 중에는
+거부하고 중지 버튼을 먼저 쓰게 한다. 진짜 Slack 슬래시 커맨드가 아니라 멘션 뒤 토큰인
+이유는 슬래시 커맨드 페이로드에 `thread_ts`가 없어 대상 스레드를 특정할 수 없기 때문이다.
+
+crew 쪽 핸드오프 스레드는 인터뷰당 하나로 고정한다(`CrewHandoffThreadEvent`로 trace에
+기록하므로 재시작 후에도 같은 스레드로 이어진다). 재인계마다 새 채널 메시지를 만들면
+crew의 thread_key가 바뀌어 leader 세션 이월(§10.5)이 매번 끊기기 때문이다. 다만 재시작
+후에는 어댑터 세션 자체가 사라지므로 스레드만 이어지고 leader 컨텍스트는 새로 쌓인다.
 
 ## 11. Context Lifecycle과 Task Knowledge
 
@@ -1260,7 +1376,12 @@ Phase 0 착수를 막던 결정은 [Wayfinder Map #1](https://github.com/picpal/
 - R2 report retention과 삭제 정책
 - MVP에서 Task latest overwrite를 허용하는 기간과 versioned object 전환 시점
 
-POC 실측으로 확인할 항목: 실제 적용 effort의 관측 경로(org effort limit clamp 무보고 문제), Reviewer Queue scale signal 임계값, loopPolicy 토큰 budget(300k)의 타당성.
+POC 실측으로 확인할 항목: 실제 적용 effort의 관측 경로(org effort limit clamp 무보고 문제), Reviewer Queue scale signal 임계값.
+
+loopPolicy 토큰 budget의 타당성은 실측으로 답이 나왔다(2026-08-20): opus HIGH leader +
+Codex 리뷰어 구성에서 1회 실행이 587k를 썼다 — 기존 300k는 정상 완료를 강제 종료시키는
+값이었다. hard cap을 1.5M으로 올리고, role별 예산은 종료 트리거가 아닌 경보로 강등했다
+(§10.3).
 
 ## 20. POC 검증 항목과 성공 기준
 

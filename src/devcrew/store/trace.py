@@ -52,7 +52,8 @@ class TraceStore:
 
     def events(self, *, event_type: str | None = None,
                execution_id: str | None = None) -> list[dict]:
-        q, args = "SELECT ts, event_type, task_id, execution_id, instance_id, payload FROM events", []
+        q, args = ("SELECT id, ts, event_type, task_id, execution_id, instance_id, payload"
+                   " FROM events"), []
         conds = []
         if event_type:
             conds.append("event_type = ?"); args.append(event_type)
@@ -62,9 +63,11 @@ class TraceStore:
             q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY id"
         rows = self._con.execute(q, args).fetchall()
+        # id를 함께 돌려준다 — 두 이벤트의 선후는 벽시계(ts)가 아니라 rowid로 판정해야
+        # NTP 역행 같은 시계 이상에서도 순서가 뒤집히지 않는다
         return [
-            {"ts": r[0], "event_type": r[1], "task_id": r[2],
-             "execution_id": r[3], "instance_id": r[4], "payload": json.loads(r[5])}
+            {"id": r[0], "ts": r[1], "event_type": r[2], "task_id": r[3],
+             "execution_id": r[4], "instance_id": r[5], "payload": json.loads(r[6])}
             for r in rows
         ]
 

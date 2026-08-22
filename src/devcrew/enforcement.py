@@ -25,7 +25,10 @@ class RolePolicy:
 
 # DESIGN.md §3.4 표의 코드화
 ROLE_POLICY: dict[Role, RolePolicy] = {
-    Role.ORCHESTRATOR: RolePolicy(allowed_tools=[]),   # repo tool 전무
+    # repo tool 전무 — harness MCP(read-only)로만 상태를 조회한다 (Task 6, harness_mcp.py)
+    Role.ORCHESTRATOR: RolePolicy(allowed_tools=[
+        "mcp__harness__get_execution_state", "mcp__harness__get_worker_result",
+        "mcp__harness__get_trace_events"]),
     Role.EXPLORER: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash(git log:*)", "Bash(git diff:*)"]),
     Role.ARCHITECT: RolePolicy(allowed_tools=list(_READ_TOOLS)),
     Role.DEVELOPER: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash"],
@@ -34,6 +37,11 @@ ROLE_POLICY: dict[Role, RolePolicy] = {
     Role.SECURITY: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash(git log:*)"]),
     Role.REVIEWER: RolePolicy(allowed_tools=list(_READ_TOOLS), sandbox="read-only"),
     Role.QA: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash"]),
+    Role.BRAIN: RolePolicy(allowed_tools=list(_READ_TOOLS)),  # 인터뷰 근거용 읽기 전용
+    # 학습 Agent (#19) — 출제·검증 모두 repo를 **읽기만** 한다. 학습 도구가 코드를
+    # 만질 이유가 없고, Bash도 주지 않는다 (근거는 파일 읽기로 충분하다).
+    Role.TUTOR: RolePolicy(allowed_tools=list(_READ_TOOLS)),
+    Role.TUTOR_VERIFIER: RolePolicy(allowed_tools=list(_READ_TOOLS), sandbox="read-only"),
 }
 
 

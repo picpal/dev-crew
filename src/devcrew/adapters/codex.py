@@ -12,6 +12,11 @@ from ..store.trace import TraceStore
 from .base import ResumeConfigMissingError, TurnOutcome
 
 
+def _context_window(result) -> int:
+    """이 스레드의 실제 모델 컨텍스트 창 (SDK가 turn마다 보고). 없으면 0."""
+    return int(getattr(result.usage, "model_context_window", None) or 0) if result.usage else 0
+
+
 def _usage_from_turn(result) -> Usage:
     total = result.usage.total if result.usage else None
     return Usage(
@@ -43,6 +48,13 @@ class CodexAdapter:
         # (verified via inspect.signature(AsyncCodex.thread_resume), api.py:443-453),
         # so unlike claude_code.py's resume() this is not a deferred gap here.
         self._session_config: dict[str, dict] = {}
+        # thread_id -> start_session()이 소비한 최초 turn의 usage (finding #6, claude_code.py
+        # 의 동일한 캐시와 대칭) — start_session이 send()를 내부 호출해 그 결과를 버리므로
+        # 여기서 별도 보존한다.
+        self._initial_usage: dict[str, Usage] = {}
+        # thread_id -> {"used", "window", "model"} — SDK가 turn마다 보고하는 실제 창 점유
+        self._context: dict[str, dict] = {}
+        self._models: dict[str, str] = {}
 
     async def _client(self) -> AsyncCodex:
         if self._codex is None:
@@ -52,7 +64,14 @@ class CodexAdapter:
 
     async def start_session(self, inst: AgentInstance, initial_message: str, *,
                              system_prompt: str | None = None,
-                             output_schema: dict | None = None) -> str:
+                             output_schema: dict | None = None,
+                             mcp_servers: dict | None = None) -> str:
+        if mcp_servers:
+            # Orchestrator는 항상 Claude로 고정된다(§5.1) — codex 어댑터에 harness
+            # mcp_servers가 전달되는 건 호출자 배선 오류다. 조용히 무시하면 ORCHESTRATOR가
+            # harness MCP tool 없이 기동해 결정 세션이 조회 불능 상태로 새는 걸 놓친다
+            # (fail-fast, 조용한 기본값 금지).
+            raise ValueError("codex adapter does not support harness mcp_servers")
         codex = await self._client()
         kw = codex_session_kwargs(inst.role, cwd=inst.worktree)
         thread = await codex.thread_start(
@@ -65,6 +84,7 @@ class CodexAdapter:
         self._threads[thread.id] = thread
         effort = inst.effort_level.value.lower()
         self._efforts[thread.id] = effort
+        self._models[thread.id] = inst.model
         self._schemas[thread.id] = output_schema
         self._session_config[thread.id] = {
             "sandbox_name": kw["sandbox_name"],
@@ -74,7 +94,8 @@ class CodexAdapter:
             "output_schema": output_schema,
             "base_instructions": system_prompt,
         }
-        await self.send(thread.id, initial_message)
+        outcome = await self.send(thread.id, initial_message)
+        self._initial_usage[thread.id] = outcome.usage
         return thread.id
 
     async def send(self, session_id: str, message: str) -> TurnOutcome:
@@ -88,6 +109,12 @@ class CodexAdapter:
                 structured = json.loads(result.final_response)
             except json.JSONDecodeError:
                 structured = None    # provider가 스키마 강제하므로 정상 경로에선 발생 안 함
+        window = _context_window(result)
+        if window:                   # SDK가 실제 창을 보고했다 — 추정 대신 이 값을 쓴다
+            total = result.usage.total if result.usage else None
+            self._context[session_id] = {
+                "used": int(getattr(total, "total_tokens", 0) or 0), "window": window,
+                "model": self._models.get(session_id, "")}
         return TurnOutcome(text=result.final_response or "",
                            usage=_usage_from_turn(result),
                            raw={"turn_id": result.id},
@@ -157,6 +184,17 @@ class CodexAdapter:
 
     async def get_usage(self, session_id: str) -> Usage:
         raise NotImplementedError("usage는 각 TurnOutcome.usage로 수집한다")
+
+    async def context_usage(self, session_id: str) -> dict | None:
+        """turn마다 SDK가 보고한 누적 점유 / 실제 창. 보고가 없었으면 None."""
+        seen = self._context.get(session_id)
+        if not seen or not seen.get("window"):
+            return None
+        return {**seen, "pct": seen["used"] / seen["window"] * 100, "source": "sdk"}
+
+    async def initial_usage(self, session_id: str) -> Usage | None:
+        """start_session이 소비한 최초 turn의 usage (finding #6). 캐시가 없으면 None."""
+        return self._initial_usage.get(session_id)
 
     async def thread_exists(self, thread_id: str) -> bool:
         codex = await self._client()

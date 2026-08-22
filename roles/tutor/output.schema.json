@@ -1,0 +1,108 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "questions"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "NOT_PASS",
+        "NEED_REPLAN",
+        "BLOCKED",
+        "INSUFFICIENT_CAPABILITY"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "area",
+          "type",
+          "stem",
+          "options",
+          "answer_index",
+          "evidence",
+          "explanation",
+          "diagram",
+          "source_key"
+        ],
+        "properties": {
+          "area": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "CORRECT",
+              "INCORRECT"
+            ]
+          },
+          "stem": {
+            "type": "string"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "answer_index": {
+            "type": "integer"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "start_line",
+                "end_line",
+                "quote"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "start_line": {
+                  "type": "integer"
+                },
+                "end_line": {
+                  "type": "integer"
+                },
+                "quote": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "explanation": {
+            "type": "string"
+          },
+          "diagram": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "source_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

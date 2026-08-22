@@ -1,0 +1,63 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "NOT_PASS",
+        "NEED_REPLAN",
+        "BLOCKED",
+        "INSUFFICIENT_CAPABILITY"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "decision": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "PROCEED",
+            "RETRY_NODE",
+            "ESCALATE_MODEL",
+            "SKIP_NODE",
+            "REPLAN",
+            "ASK_USER",
+            "ABORT"
+          ]
+        },
+        "target_node": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rationale": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "target_node",
+        "rationale"
+      ],
+      "additionalProperties": false
+    },
+    "report": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "status",
+    "summary",
+    "decision",
+    "report"
+  ],
+  "additionalProperties": false
+}

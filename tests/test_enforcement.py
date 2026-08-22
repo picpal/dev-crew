@@ -1,3 +1,5 @@
+import pytest
+
 from devcrew.enforcement import (
     ROLE_POLICY, claude_options_kwargs, codex_session_kwargs, make_can_use_tool,
 )
@@ -11,8 +13,12 @@ def test_role_policy_matches_design_3_4():
     # Developer는 Write를 scoped_write_tools로 관리 (경로 제한)
     assert "Write" not in ROLE_POLICY[Role.DEVELOPER].allowed_tools
     assert "Write" in ROLE_POLICY[Role.DEVELOPER].scoped_write_tools
-    # Orchestrator는 repo tool 전무 (#13, 불변 조건 2)
-    assert ROLE_POLICY[Role.ORCHESTRATOR].allowed_tools == []
+    # Orchestrator는 repo tool 전무(#13, 불변 조건 2) — harness MCP read-only tool
+    # 3종만 허용된다(Task 6).
+    assert ROLE_POLICY[Role.ORCHESTRATOR].allowed_tools == [
+        "mcp__harness__get_execution_state", "mcp__harness__get_worker_result",
+        "mcp__harness__get_trace_events"]
+    assert not ROLE_POLICY[Role.ORCHESTRATOR].scoped_write_tools
     assert ROLE_POLICY[Role.REVIEWER].sandbox == "read-only"
 
 
@@ -102,3 +108,29 @@ async def test_sibling_prefix_dir_is_not_allowed(tmp_path):
     evs = trace.events(event_type="PermissionDeniedEvent")
     assert len(evs) == 1
     assert evs[0]["payload"]["reason"] == "path_outside_workspace"
+
+
+def test_every_role_has_a_policy():
+    """새 Role을 추가하고 정책을 빼면 spawn이 KeyError로 죽는다. 이름을 하나씩
+    검사하는 테스트로는 '빠진 role'을 못 잡는다 — enum 전수로 검사한다.
+    (2026-08-21: TUTOR·TUTOR_VERIFIER가 이렇게 빠져 첫 회차가 통째로 실패했다)"""
+    missing = [r.value for r in Role if r not in ROLE_POLICY]
+    assert missing == [], f"ROLE_POLICY에 없는 role: {missing}"
+
+
+@pytest.mark.parametrize("role", list(Role))
+def test_option_builders_work_for_every_role(role):
+    """spawn 경로가 실제로 부르는 두 빌더가 모든 role에서 서야 한다."""
+    assert claude_options_kwargs(role, cwd="/tmp")["cwd"] == "/tmp"
+    assert codex_session_kwargs(role, cwd="/tmp")["approval_mode_name"] == "deny_all"
+
+
+def test_tutor_roles_are_read_only():
+    """출제·검증은 repo를 읽기만 한다. 쓰기나 Bash를 주면 학습 도구가 코드를 만진다."""
+    for role in (Role.TUTOR, Role.TUTOR_VERIFIER):
+        p = ROLE_POLICY[role]
+        assert "Read" in p.allowed_tools and "Grep" in p.allowed_tools
+        assert p.scoped_write_tools == []
+        assert not any(t.startswith("Bash") for t in p.allowed_tools)
+    # 검증자는 Codex 세션이다 — 샌드박스도 읽기 전용으로 못 박는다
+    assert ROLE_POLICY[Role.TUTOR_VERIFIER].sandbox == "read-only"

@@ -41,37 +41,6 @@ async def test_escalation_spawns_new_instance_with_handoff(tmp_path):
     assert [r["instance_id"] for r in reg.active()] == [dev2.instance_id]
 
 
-async def test_review_loop_bounded_and_escalates_on_no_progress(tmp_path):
-    orch, trace, _ = make_orch(tmp_path)
-    dev = await orch.spawn(Role.DEVELOPER, "DEFAULT", execution_id="E1",
-                           node_id="n1", task_scope="*")
-    finding = {"n": 0}
-
-    async def review(_): return "NOT_PASS: same-finding"     # 항상 같은 finding
-    async def fix(_): finding["n"] += 1
-
-    result = await orch.run_review_loop(dev, review, fix, max_iterations=5)
-    assert result.passed is False
-    assert result.escalated is True          # 같은 finding 3회 → no-progress escalation
-    assert result.iterations == 3
-    assert len(trace.events(event_type="LoopEvent")) == 3
-
-
-async def test_review_loop_passes(tmp_path):
-    orch, _, _ = make_orch(tmp_path)
-    dev = await orch.spawn(Role.DEVELOPER, "DEFAULT", execution_id="E1",
-                           node_id="n1", task_scope="*")
-    calls = {"n": 0}
-
-    async def review(_):
-        calls["n"] += 1
-        return "PASS" if calls["n"] >= 2 else "NOT_PASS: missing test"
-    async def fix(_): pass
-
-    result = await orch.run_review_loop(dev, review, fix)
-    assert result.passed is True and result.iterations == 2
-
-
 def test_review_queue_scale_signal():
     q = ReviewQueue(max_reviewers=3)
     assert q.scale_signal() == 1                  # 기본 1 유지 (§9.1)
@@ -127,12 +96,14 @@ async def test_consume_result_valid_explorer_pass(tmp_path):
     orch, trace, _ = make_orch(tmp_path)
     inst = await orch.spawn(Role.EXPLORER, "CHEAP", execution_id="E1",
                             node_id="n1", task_scope="*")
-    outcome = TurnOutcome(text="", usage=Usage(),
-                          structured={"status": "PASS", "summary": "ok", "findings": []})
+    # EXPLORER output.schema.json required: status, summary, findings, affected_files
+    # (finding #2 — consume_result가 이제 role bundle schema 전체를 검증한다)
+    structured = {"status": "PASS", "summary": "ok", "findings": [], "affected_files": []}
+    outcome = TurnOutcome(text="", usage=Usage(), structured=structured)
     result = orch.consume_result(inst, outcome)
     assert result == "PASS"
     evs = trace.events(event_type="WorkerResultEvent")
-    assert evs[0]["payload"] == {"role": "EXPLORER", "status": "PASS"}
+    assert evs[0]["payload"] == {"role": "EXPLORER", "status": "PASS", "structured": structured}
 
 
 async def test_consume_result_reviewer_uses_verdict_not_status(tmp_path):
@@ -146,7 +117,8 @@ async def test_consume_result_reviewer_uses_verdict_not_status(tmp_path):
     result = orch.consume_result(inst, outcome)
     assert result == "NOT_PASS"
     evs = trace.events(event_type="WorkerResultEvent")
-    assert evs[0]["payload"] == {"role": "REVIEWER", "status": "PASS", "verdict": "NOT_PASS"}
+    assert evs[0]["payload"] == {"role": "REVIEWER", "status": "PASS", "verdict": "NOT_PASS",
+                                 "structured": outcome.structured}
 
 
 async def test_consume_result_malformed_structured_logs_event(tmp_path):
@@ -159,6 +131,40 @@ async def test_consume_result_malformed_structured_logs_event(tmp_path):
     evs = trace.events(event_type="MalformedResultEvent")
     assert len(evs) == 1
     assert evs[0]["payload"]["role"] == "EXPLORER"
+
+
+async def test_consume_result_valid_status_but_missing_required_fields_is_malformed(tmp_path):
+    """finding #2 회귀: codex 리뷰가 재현한 그대로 — status만 유효(PASS)하고 role bundle
+    schema의 나머지 required(summary/changed_files/build/tests)가 전부 빠진 DEVELOPER
+    출력은 더 이상 그대로 PASS 처리되지 않는다. malformed로 강등돼 NEED_REPLAN이 된다."""
+    orch, trace, _ = make_orch(tmp_path)
+    inst = await orch.spawn(Role.DEVELOPER, "DEFAULT", execution_id="E1",
+                            node_id="n1", task_scope="*")
+    outcome = TurnOutcome(text="", usage=Usage(), structured={"status": "PASS"})
+    result = orch.consume_result(inst, outcome)
+    assert result == "NEED_REPLAN"
+    evs = trace.events(event_type="MalformedResultEvent")
+    assert len(evs) == 1
+    assert evs[0]["payload"]["role"] == "DEVELOPER"
+
+
+async def test_consume_result_reviewer_findings_array_item_missing_fields_is_malformed(tmp_path):
+    """wave 2 F2 회귀: codex 재리뷰가 재현한 그대로 — top-level/verdict는 다 갖춘
+    REVIEWER 결과라도 findings 배열의 원소 내부(severity/file/line/description)가
+    비어 있으면(`findings: [{}]`) malformed로 강등돼야 한다. wave 1의
+    missing_required_keys()는 array item으로 재귀하지 않아 이 케이스를 그대로
+    PASS 처리했다(빈 누락 목록)."""
+    orch, trace, _ = make_orch(tmp_path)
+    inst = await orch.spawn(Role.REVIEWER, "CODEX_DEFAULT", execution_id="E1",
+                            node_id="n1", task_scope="*")
+    outcome = TurnOutcome(text="", usage=Usage(),
+                          structured={"status": "PASS", "summary": "ok",
+                                      "verdict": "PASS", "findings": [{}]})
+    result = orch.consume_result(inst, outcome)
+    assert result == "NEED_REPLAN"
+    evs = trace.events(event_type="MalformedResultEvent")
+    assert len(evs) == 1
+    assert evs[0]["payload"]["role"] == "REVIEWER"
 
 
 async def test_consume_result_reviewer_blocked_status_not_overridden_by_verdict(tmp_path):
@@ -174,31 +180,8 @@ async def test_consume_result_reviewer_blocked_status_not_overridden_by_verdict(
     result = orch.consume_result(inst, outcome)
     assert result == "BLOCKED"
     evs = trace.events(event_type="WorkerResultEvent")
-    assert evs[0]["payload"] == {"role": "REVIEWER", "status": "BLOCKED"}
-
-
-async def test_review_loop_consumes_turn_outcome_via_consume_result(tmp_path):
-    """W2-1: review_fn이 TurnOutcome을 반환하면 run_review_loop이 consume_result()
-    경계를 통과시켜 전이값을 얻는다 — Reviewer verdict=NOT_PASS면 재시도, PASS면
-    통과."""
-    orch, trace, _ = make_orch(tmp_path)
-    reviewer_inst = await orch.spawn(Role.REVIEWER, "CODEX_DEFAULT", execution_id="E1",
-                                     node_id="n1", task_scope="*")
-    calls = {"n": 0}
-
-    async def review(_):
-        calls["n"] += 1
-        verdict = "NOT_PASS" if calls["n"] == 1 else "PASS"
-        return TurnOutcome(text="", usage=Usage(),
-                           structured={"status": "PASS", "summary": "ok",
-                                       "verdict": verdict, "findings": []})
-
-    async def fix(_): pass
-
-    result = await orch.run_review_loop(reviewer_inst, review, fix)
-    assert result.passed is True and result.iterations == 2
-    evs = trace.events(event_type="LoopEvent")
-    assert [e["payload"]["verdict"] for e in evs] == ["NOT_PASS", "PASS"]
+    assert evs[0]["payload"] == {"role": "REVIEWER", "status": "BLOCKED",
+                                 "structured": outcome.structured}
 
 
 async def test_consume_result_as_role_override(tmp_path):
@@ -213,31 +196,28 @@ async def test_consume_result_as_role_override(tmp_path):
     result = orch.consume_result(dev, outcome, as_role=Role.REVIEWER)
     assert result == "NOT_PASS"
     evs = trace.events(event_type="WorkerResultEvent")
-    assert evs[0]["payload"] == {"role": "REVIEWER", "status": "PASS", "verdict": "NOT_PASS"}
+    assert evs[0]["payload"] == {"role": "REVIEWER", "status": "PASS", "verdict": "NOT_PASS",
+                                 "structured": outcome.structured}
 
 
-async def test_review_loop_uses_reviewer_verdict_even_when_dev_inst_is_developer(tmp_path):
-    """W3 회귀 (재재리뷰 신규 finding): 실제 운영 시나리오처럼 dev_inst가 DEVELOPER
-    role이어도, review_fn이 반환한 TurnOutcome은 Reviewer 판정 규칙(verdict)으로
-    소비돼야 한다. dev_inst.role(DEVELOPER)로 판정하면 REVIEWER 분기를 타지 않아
-    status만 보고 첫 회에 통과 처리되는 버그가 있었다 — as_role=Role.REVIEWER 고정
-    으로 고쳤다."""
-    orch, trace, _ = make_orch(tmp_path)
-    dev = await orch.spawn(Role.DEVELOPER, "DEFAULT", execution_id="E1",
-                           node_id="n1", task_scope="*")
-    calls = {"n": 0}
+@pytest.mark.asyncio
+async def test_worker_system_prompt_pins_worktree_as_authoritative(tmp_path):
+    """워커가 자기 worktree 밖의 코드를 보고 '내 대상은 저쪽인데 여기 묶였다'며
+    BLOCKED로 자폭하던 사례(2026-08-20 SLACK-3) 회귀 고정."""
+    from devcrew.adapters.base import FakeAdapter
+    from devcrew.orchestrator import Orchestrator
+    from devcrew.schema import Provider, Role
+    from devcrew.store.registry import SessionRegistry
+    from devcrew.store.trace import TraceStore
 
-    async def review(_):
-        calls["n"] += 1
-        verdict = "NOT_PASS" if calls["n"] == 1 else "PASS"
-        return TurnOutcome(text="", usage=Usage(),
-                           structured={"status": "PASS", "summary": "ok",
-                                       "verdict": verdict, "findings": []})
-
-    async def fix(_): pass
-
-    result = await orch.run_review_loop(dev, review, fix)
-    # verdict=NOT_PASS인 1회차에 통과 처리됐다면 iterations==1, passed=True였을 것.
-    assert result.passed is True and result.iterations == 2
-    evs = trace.events(event_type="LoopEvent")
-    assert [e["payload"]["verdict"] for e in evs] == ["NOT_PASS", "PASS"]
+    fake = FakeAdapter()
+    orch = Orchestrator(TraceStore(tmp_path / "t.db"), SessionRegistry(tmp_path / "h.db"),
+                        {Provider.CLAUDE_CODE: fake, Provider.CODEX: fake})
+    inst = await orch.spawn(Role.DEVELOPER, "DEFAULT", execution_id="E", node_id="develop",
+                            task_scope="calc.py에 mul 추가", worktree="/tmp/wt/slack-9")
+    await orch.start_worker(inst, "go")
+    sp = fake.last_system_prompt
+    assert "/tmp/wt/slack-9" in sp
+    assert "정본" in sp
+    assert "격리 설계" in sp and "중단하지" in sp
+    assert "calc.py에 mul 추가" in sp          # 기존 할당 Scope 주입은 유지
