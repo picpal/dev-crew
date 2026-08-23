@@ -11,3 +11,8 @@ poc/_artifacts/
 
 # wrangler 로컬 캐시 (계정 ID·이메일 포함)
 worker/.wrangler/
+
+# 런타임 상태 (trace.db·harness.db·브릿지 로그). 저장소는 공개이고 여기엔 실제
+# 작업 지시문과 에이전트 출력이 그대로 들어간다 — 코드가 아니라 그 코드가 처리한
+# 내용물이므로 추적하지 않는다 (2026-08-23).
+.devcrew-runtime/
