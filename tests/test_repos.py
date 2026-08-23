@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from devcrew.repos import RepoRegistryError, load_repos, split_repo_prefix
+from devcrew.repos import (RepoRegistryError, format_repo_names, load_repo_bases, load_repos,
+                           split_repo_prefix)
 
 
 def _git_repo(tmp_path, name):
@@ -138,3 +139,72 @@ def test_config_branch_is_validated_too(tmp_path):
     cfg.write_text(f"repos:\n  x:\n    path: {repo}\n    branch: '--force'\n")
     with pytest.raises(RepoRegistryError, match="쓸 수 없는 값"):
         load_repos(cfg)
+
+
+# ── workspace 자동 탐색 ──────────────────────────────────────────────────────
+
+def test_workspace_root_registers_every_git_child(tmp_path):
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    a, b = _git_repo(ws, "alpha"), _git_repo(ws, "beta")
+    (ws / "not-a-repo").mkdir()          # git repo가 아니면 조용히 건너뛴다
+    y = tmp_path / "repos.yaml"
+    y.write_text(f"workspace_roots:\n  - {ws}\n")
+    assert load_repos(y) == {"alpha": a.resolve(), "beta": b.resolve()}
+
+
+def test_workspace_root_skips_hidden_and_unaddressable_names(tmp_path):
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    ok = _git_repo(ws, "alpha")
+    _git_repo(ws, ".hidden")             # 점으로 시작하면 작업 디렉토리가 아니다
+    _git_repo(ws, "has space")           # `이름:` 접두로 쓸 수 없는 이름
+    y = tmp_path / "repos.yaml"
+    y.write_text(f"workspace_roots:\n  - {ws}\n")
+    assert load_repos(y) == {"alpha": ok.resolve()}
+
+
+def test_explicit_entry_wins_over_discovered(tmp_path):
+    """자동 탐색은 기본값이다 — 브랜치를 고정한 명시 등록을 덮어쓰면 안 된다."""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    repo = _git_repo(ws, "alpha")
+    subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=repo, check=True)
+    subprocess.run(["git", "branch", "work"], cwd=repo, check=True)
+    y = tmp_path / "repos.yaml"
+    y.write_text(f"workspace_roots:\n  - {ws}\n"
+                 f"repos:\n  alpha:\n    path: {repo}\n    branch: work\n")
+    assert load_repos(y) == {"alpha": repo.resolve()}
+    assert load_repo_bases(y)["alpha"] == "work"
+
+
+def test_discovered_repo_base_is_head(tmp_path):
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    _git_repo(ws, "alpha")
+    y = tmp_path / "repos.yaml"
+    y.write_text(f"workspace_roots:\n  - {ws}\n")
+    assert load_repo_bases(y) == {"alpha": "HEAD"}
+
+
+def test_missing_workspace_root_fails_loudly(tmp_path):
+    """탐색 실패는 조용한 빈 목록이 되면 안 된다 — 전 repo가 사라진 것처럼 보인다."""
+    y = tmp_path / "repos.yaml"
+    y.write_text("workspace_roots:\n  - /no/such/workspace\n")
+    with pytest.raises(RepoRegistryError, match="workspace_root"):
+        load_repos(y)
+
+
+def test_format_repo_names_caps_the_listing():
+    names = {f"repo-{i:02d}": None for i in range(30)}
+    out = format_repo_names(names, limit=5)
+    assert "repo-00" in out and "repo-29" not in out
+    assert "외 25개" in out
+
+
+def test_format_repo_names_short_list_has_no_tail():
+    assert format_repo_names({"a": None, "b": None}, limit=5) == "a, b"
+
+
+def test_format_repo_names_empty():
+    assert format_repo_names({}, limit=5) == "(없음)"

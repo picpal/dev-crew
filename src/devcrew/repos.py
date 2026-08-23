@@ -13,6 +13,16 @@
 `branch`는 실행용 worktree(`wt/slack-N`)를 어느 커밋에서 딸지 정한다. 작업 코드가
 아직 병합되지 않은 브랜치에 있으면 이걸 지정해야 한다 — HEAD(main)에서 따면
 워커가 그 코드가 없는 트리에서 작업하게 된다 (2026-08-20 SLACK-3).
+
+`workspace_roots`를 주면 그 디렉토리 **바로 아래**의 git repo를 모두 디렉토리명으로
+자동 등록한다. repo 하나 늘 때마다 설정을 고치는 일을 없애기 위한 것이다 — 등록되지
+않았다는 이유로 요청이 반려되던 마찰이 사라진다.
+
+    workspace_roots:
+      - ~/Desktop/workspace
+
+자동 등록분의 base는 언제나 HEAD다. 브랜치를 고정해야 하는 repo는 `repos:`에 명시로
+적는다 — **명시 등록이 자동 탐색을 이긴다.**
 """
 from __future__ import annotations
 
@@ -53,23 +63,61 @@ def _entry(name: str, loc) -> tuple[Path, str]:
     return rp, base
 
 
-def load_repos(path: str | Path | None = None) -> dict[str, Path]:
+# 자동 등록 이름은 Slack의 `이름:` 접두로 그대로 쓰인다. 공백·한글·`@`가 든 디렉토리는
+# 접두로 지목할 수 없으므로 (`@`는 `이름@브랜치` 구분자다) 탐색에서 제외한다.
+_AUTO_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def discover_repos(roots) -> dict[str, tuple[Path, str]]:
+    """workspace_roots 바로 아래의 git repo를 이름→(경로, "HEAD")로 모은다.
+
+    루트가 없으면 fail-fast한다. 오타 난 루트를 조용히 건너뛰면 등록된 repo가 통째로
+    사라진 채로 엔진이 뜨고, 모든 요청이 "등록되지 않은 repo"로 반려된다.
+    """
+    found: dict[str, tuple[Path, str]] = {}
+    for raw in roots or []:
+        root = Path(str(raw)).expanduser()
+        if not root.is_dir():
+            raise RepoRegistryError(f"workspace_root 경로 없음 — {root}")
+        for child in sorted(root.iterdir()):
+            name = child.name
+            if name.startswith(".") or not _AUTO_NAME_RE.fullmatch(name):
+                continue
+            if not child.is_dir() or not (child / ".git").exists():
+                continue
+            found.setdefault(name, (child.resolve(), "HEAD"))
+    return found
+
+
+def _registry(path: str | Path | None = None) -> dict[str, tuple[Path, str]]:
+    """설정 파일 → 이름→(경로, base ref). 명시 등록이 자동 탐색을 덮어쓴다."""
     p = Path(path) if path else DEFAULT_PATH
     if not p.exists():
         return {}
     raw = yaml.safe_load(p.read_text()) or {}
-    return {str(n): _entry(str(n), loc)[0]
-            for n, loc in (raw.get("repos") or {}).items()}
+    reg = discover_repos(raw.get("workspace_roots"))
+    for n, loc in (raw.get("repos") or {}).items():
+        reg[str(n)] = _entry(str(n), loc)
+    return dict(sorted(reg.items()))
+
+
+def load_repos(path: str | Path | None = None) -> dict[str, Path]:
+    return {n: v[0] for n, v in _registry(path).items()}
 
 
 def load_repo_bases(path: str | Path | None = None) -> dict[str, str]:
     """repo 이름 → worktree base ref. 지정 없으면 "HEAD"."""
-    p = Path(path) if path else DEFAULT_PATH
-    if not p.exists():
-        return {}
-    raw = yaml.safe_load(p.read_text()) or {}
-    return {str(n): _entry(str(n), loc)[1]
-            for n, loc in (raw.get("repos") or {}).items()}
+    return {n: v[1] for n, v in _registry(path).items()}
+
+
+def format_repo_names(repos, limit: int = 12) -> str:
+    """사람에게 보여줄 repo 목록. 자동 등록이면 수십 개라 Slack 한 줄을 넘긴다."""
+    names = sorted(repos)
+    if not names:
+        return "(없음)"
+    if len(names) <= limit:
+        return ", ".join(names)
+    return f"{', '.join(names[:limit])} … 외 {len(names) - limit}개"
 
 
 _REPO_HEAD_RE = re.compile(r"[A-Za-z0-9._@/-]+")
@@ -110,7 +158,7 @@ def split_repo_target(task: str, repos: dict[str, Path]) -> tuple[str | None, st
         return name, branch, rest.strip()
     if _REPO_HEAD_RE.fullmatch(head):
         raise RepoRegistryError(
-            f"등록되지 않은 repo {name!r} — 사용 가능: {', '.join(sorted(repos)) or '(없음)'}")
+            f"등록되지 않은 repo {name!r} — 사용 가능: {format_repo_names(repos)}")
     return None, None, task
 
 
