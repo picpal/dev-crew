@@ -32,8 +32,12 @@ brain·crew만 쓰던 환경은 그대로 돈다. 기동 로그에 `devcrew: @tu
 @tutor message-gate:
 ```
 
-`config/repos.yaml`에 등록된 repo 이름을 접두로 준다. 출제는 그 repo를 읽는 agentic turn이라
-수십 초가 걸린다. 문항은 버튼으로만 답한다 — 자유 답글은 받지 않는다.
+`config/repos.yaml`에 등록된 repo 이름을 접두로 준다. `workspace_roots` 바로 아래의 git repo는
+디렉토리명으로 **자동 등록**되므로 대개 따로 적을 것이 없다 — 다만 목록은 엔진 기동 시 한 번
+읽으므로, workspace에 repo를 새로 만들었다면 엔진을 재시작해야 보인다.
+
+출제는 그 repo를 읽는 agentic turn이라 수십 초가 걸린다. 문항은 버튼으로만 답한다 —
+자유 답글은 받지 않는다.
 
 - 진행 중에는 정답을 공개하지 않는다. 채점은 마지막에 한 번에 한다.
 - 미완 회차는 24시간 안에는 같은 스레드에서 이어 풀 수 있다 (프로세스를 재시작해도).
