@@ -20,7 +20,7 @@ from .quiz import (ANSWER_EVENT, ISSUED_EVENT, NoteUnavailable, Question, Scorec
                    from_raw, grade, note_id, open_misses, record_scorecard, to_raw)
 from .report.quiz_report import render_quiz_report
 from .report.uploader import publish_report
-from .repos import RepoRegistryError, split_repo_prefix
+from .repos import RepoRegistryError, format_repo_names, split_repo_prefix
 from .slack_brain import to_mrkdwn
 from .tutor import issue_quiz
 
@@ -243,7 +243,7 @@ class TutorHandler:
             await say(text=f"⚠️ {e}", thread_ts=thread_ts)
             return
         if not repo_name:
-            await say(text=NEED_REPO.format(repos=", ".join(f"`{r}`" for r in self.repos)),
+            await say(text=NEED_REPO.format(repos=format_repo_names(self.repos)),
                       thread_ts=thread_ts)
             return
         if thread_ts in self.sessions or thread_ts in self._opening:

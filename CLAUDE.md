@@ -144,7 +144,7 @@ uv run python -u -m devcrew.slack_engine   # 브리지 (env 필요)
 | 입력 | 동작 |
 |---|---|
 | `@crew <작업>` | 휘발성 toy repo에서 실행 |
-| `@crew <repo>: <작업>` | `config/repos.yaml`의 repo, 그 repo의 base 브랜치에서 worktree 생성 |
+| `@crew <repo>: <작업>` | `config/repos.yaml`의 repo (`workspace_roots` 하위는 자동 등록), 그 repo의 base 브랜치에서 worktree 생성 |
 | `@crew <repo>@<브랜치>: <작업>` | 이번 요청에 한해 base 브랜치 덮어쓰기 |
 | 같은 스레드에 후속 멘션 | 세션 이월 (재탐색 없음) |
 | `@crew /clear` | 그 스레드 컨텍스트 초기화 |

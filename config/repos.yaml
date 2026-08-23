@@ -1,13 +1,16 @@
 # repo registry (#16) — Slack 요청의 `이름:` 접두가 여기 이름으로 해석된다.
-# 경로는 절대경로 또는 ~ 확장. 등록된 repo는 git repo여야 한다.
 #
-# `branch`를 주면 실행용 worktree(wt/slack-N)를 그 브랜치에서 딴다. 작업 코드가
-# 아직 병합되지 않았다면 반드시 지정한다 — 없으면 HEAD(main)에서 따서 워커가
-# 그 코드가 없는 트리에서 작업하게 된다 (2026-08-20 SLACK-3).
+# `workspace_roots` 바로 아래의 git repo는 **디렉토리명으로 자동 등록**된다.
+# repo가 하나 늘 때마다 이 파일을 고치지 않기 위한 것이다 (2026-08-23). 자동
+# 등록분의 worktree base는 언제나 HEAD다.
+workspace_roots:
+  - ~/Desktop/workspace
+
+# 명시 등록은 자동 탐색을 이긴다. `branch`를 주면 실행용 worktree(wt/slack-N)를
+# 그 브랜치에서 딴다 — 작업 코드가 아직 병합되지 않았다면 반드시 지정한다.
+# 없으면 HEAD에서 따서 워커가 그 코드가 없는 트리에서 작업하게 된다
+# (2026-08-20 SLACK-3).
 repos:
-  work-note:       ~/Desktop/workspace/work-note
-  message-gate:    ~/Desktop/workspace/message-gate
-  claude-code-hub: ~/Desktop/workspace/claude-code-hub
   dev-crew:
     path: ~/Desktop/workspace/dev-crew
-    branch: feat/orchestrator-loop   # 하네스 작업 브랜치 (main 병합 전)
+    branch: wt/tutor      # 하네스 작업 브랜치 (main 병합 전)
