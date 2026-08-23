@@ -9,6 +9,7 @@ SDK가 받는 옵션 객체 자체를 봐야 한다 — mock이 아니라 실제
 """
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -163,3 +164,53 @@ async def test_resume_allow_unconfigured_bypasses_fail_closed(tmp_path, monkeypa
     resume_opts = FakeSDKClient.captured_options[0]
     assert resume_opts.resume == "unknown-session"
     assert resume_opts.system_prompt is None
+
+
+# ── 첫 turn이 실패·취소될 때 세션을 남기지 않는다 ─────────────────────────────
+
+class HangingSDKClient(FakeSDKClient):
+    """첫 turn이 끝나지 않는 대역. 상한에 걸려 취소되는 상황을 만든다."""
+
+    disconnected: list = []
+
+    async def receive_response(self):
+        await asyncio.sleep(3600)
+        yield ResultMessage(session_id="never")
+
+    async def disconnect(self):
+        HangingSDKClient.disconnected.append(self)
+
+
+async def test_cancelled_first_turn_disconnects_the_client(tmp_path, monkeypatch):
+    """`start_session`이 취소되면 session_id가 없어 `archive`로 회수할 방법이 없다.
+    여기서 끊지 않으면 워커 프로세스가 고아로 남아 계속 돈다 (2026-08-24)."""
+    HangingSDKClient.disconnected = []
+    monkeypatch.setattr(claude_code_module, "ClaudeSDKClient", HangingSDKClient)
+    trace = TraceStore(tmp_path / "trace.db")
+    adapter = ClaudeCodeAdapter(trace, SessionRegistry(tmp_path / "harness.db"))
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(adapter.start_session(make_inst(), "시작"), timeout=0.2)
+    assert len(HangingSDKClient.disconnected) == 1, "취소된 세션이 끊기지 않았다"
+
+
+class FailingSDKClient(FakeSDKClient):
+    disconnected: list = []
+
+    async def receive_response(self):
+        raise RuntimeError("provider 폭발")
+        yield  # pragma: no cover — 제너레이터로 만들기 위한 것
+
+    async def disconnect(self):
+        FailingSDKClient.disconnected.append(self)
+
+
+async def test_failed_first_turn_disconnects_the_client(tmp_path, monkeypatch):
+    FailingSDKClient.disconnected = []
+    monkeypatch.setattr(claude_code_module, "ClaudeSDKClient", FailingSDKClient)
+    trace = TraceStore(tmp_path / "trace.db")
+    adapter = ClaudeCodeAdapter(trace, SessionRegistry(tmp_path / "harness.db"))
+
+    with pytest.raises(RuntimeError):
+        await adapter.start_session(make_inst(), "시작")
+    assert len(FailingSDKClient.disconnected) == 1

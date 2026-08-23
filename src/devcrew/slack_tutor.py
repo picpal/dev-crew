@@ -314,6 +314,11 @@ class TutorHandler:
             await say(text="⚠️ 오답 노트를 읽지 못해 회차를 시작하지 않았습니다. "
                            "잠시 후 다시 시도해 주세요.", thread_ts=thread_ts)
             return
+        if self._lock.locked():
+            # 출제는 한 번에 하나만 돈다. 그 사실을 말해 주지 않으면 기다리는 쪽에는
+            # 그냥 무반응으로 보이고, 사용자는 멘션을 반복하게 된다 (2026-08-24).
+            await say(text="⏳ 다른 회차를 출제하는 중입니다. 끝나면 이어서 시작합니다.",
+                      thread_ts=thread_ts)
         try:
             async with self._lock:
                 res = await issue_quiz(self.orch, self.cfg, repo_name=repo_name,

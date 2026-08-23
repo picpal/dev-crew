@@ -1,4 +1,5 @@
 """slack_tutor — 퀴즈 세션·문항 진행·재개·채점 발행 (FakeAdapter, Slack 없음)."""
+import asyncio
 import dataclasses
 
 import pytest
@@ -417,3 +418,24 @@ def test_area_lines_are_cut_by_line_not_by_character():
         if b["type"] == "section" and "영역별" in b["text"]["text"])
     assert "외 5개 영역" in text                        # 자른 사실을 숨기지 않는다
     assert all(l.strip() for l in text.splitlines())    # 잘린 반쪽 줄이 없다
+
+
+@pytest.mark.asyncio
+async def test_second_round_says_it_is_waiting_instead_of_going_silent(tmp_path, repo):
+    """출제는 한 번에 하나만 돈다. 말해 주지 않으면 기다리는 쪽에는 무반응으로 보이고,
+    사용자는 멘션을 반복한다 (2026-08-24 실사고)."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h._lock.acquire()             # 다른 회차가 출제 중인 상태
+    try:
+        task = asyncio.create_task(h.on_mention(mention(ts="200.1", event_id="Ev2"), say))
+        for _ in range(50):             # 안내가 나갈 때까지만 양보한다
+            await asyncio.sleep(0)
+            if say.messages:
+                break
+        assert say.messages, "대기 중이라는 안내가 없다"
+        assert "출제하는 중" in say.messages[0]["text"]
+    finally:
+        h._lock.release()
+    await asyncio.wait_for(task, timeout=10)
+    assert "1 / 10" in say.messages[-1]["text"]      # 풀리면 이어서 시작한다

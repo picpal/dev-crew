@@ -25,7 +25,9 @@ from .untrusted import NOTE, fence
 DRAFT_COUNT = 12          # 통과 후 10문항이 남도록 여유를 두고 출제한다
 QUIZ_COUNT = 10
 MAX_CARRIED = 3           # 한 회차에서 오답 노트가 가져갈 수 있는 자리
-TURN_TIMEOUT = 600.0      # 출제는 repo를 읽는 agentic turn이라 인터뷰보다 길다
+# 출제는 repo를 읽는 agentic turn이라 인터뷰보다 길다. **세션 하나의 전체 예산**이다 —
+# 첫 turn(읽기·작성)과 제출 turn을 합쳐 이 시간을 넘기면 그 세션은 실패로 접는다.
+TURN_TIMEOUT = 600.0
 
 
 @dataclass
@@ -112,9 +114,17 @@ async def _ask(orch, cfg, role: Role, *, exec_id: str, node_id: str, scope: str,
     try:
         inst = await orch.spawn(role, tier, execution_id=exec_id, node_id=node_id,
                                 task_scope=scope, worktree=worktree)
-        sid = await orch.start_worker(inst, intro)
-        out = await asyncio.wait_for(
-            orch.adapters[inst.provider].send(sid, nudge), timeout=TURN_TIMEOUT)
+
+        async def _both_turns():
+            # **첫 turn이 실제 작업이다.** repo를 읽고 문항을 쓰는 일은 전부
+            # `start_worker` 안에서 일어나고, 이어지는 nudge는 스키마대로 제출만
+            # 시킨다. 상한을 nudge에만 걸면 정작 매달리는 쪽이 무방비가 된다
+            # (2026-08-24: 첫 turn이 끝나지 않아 `_lock` 뒤의 모든 회차가 조용히
+            # 멈췄다 — 사용자에게는 "@tutor가 무반응"으로만 보였다).
+            sid = await orch.start_worker(inst, intro)
+            return await orch.adapters[inst.provider].send(sid, nudge)
+
+        out = await asyncio.wait_for(_both_turns(), timeout=TURN_TIMEOUT)
     except Exception as e:
         if notes is not None:
             notes.append(f"{role.value} 세션 실패: {type(e).__name__}: {e}")
