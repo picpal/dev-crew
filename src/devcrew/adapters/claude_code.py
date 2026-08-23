@@ -62,7 +62,18 @@ class ClaudeCodeAdapter:
         )
         client = ClaudeSDKClient(options)
         await client.connect()
-        outcome = await self._turn(client, initial_message)
+        try:
+            outcome = await self._turn(client, initial_message)
+        except BaseException:
+            # 첫 turn이 끝나야 session_id가 나온다. 여기서 실패하거나 상한에 걸려
+            # 취소되면 `_clients`에 등록되지 않아 `archive()`로 회수할 방법이 없고,
+            # 워커 프로세스는 고아로 남아 계속 돈다 (2026-08-24). CancelledError는
+            # Exception이 아니므로 BaseException으로 받는다.
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            raise
         session_id = outcome.raw["session_id"]
         self._clients[session_id] = client
         self._initial_usage[session_id] = outcome.usage

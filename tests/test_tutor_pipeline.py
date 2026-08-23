@@ -1,4 +1,5 @@
 """tutor 파이프라인 — 출제 → 인용 대조 → Codex 교차 검증 → 선별 (FakeAdapter)."""
+import asyncio
 import collections
 import dataclasses
 
@@ -265,3 +266,40 @@ async def test_spawn_failure_reason_reaches_the_user(tmp_path, repo):
     assert res.questions == [] and res.shortfall is True
     joined = " ".join(res.notes)
     assert "KeyError" in joined and "TUTOR" in joined
+
+
+# ── 세션이 매달렸을 때 ────────────────────────────────────────────────────────
+
+class Hanging(Scripted):
+    """첫 turn(`start_session`)이 끝나지 않는 provider — 2026-08-24 실사고 재현."""
+
+    async def start_session(self, inst, initial_message, **kw):
+        await asyncio.sleep(3600)
+
+
+@pytest.mark.asyncio
+async def test_hanging_first_turn_is_bounded_by_the_turn_timeout(tmp_path, repo, monkeypatch):
+    """출제의 실제 작업은 **첫 turn**에서 일어난다. 거기에 시간 상한이 없으면 세션이
+    영원히 매달리고, `_lock` 뒤의 모든 회차가 조용히 멈춘다 (2026-08-24)."""
+    import devcrew.tutor as tutor_mod
+    monkeypatch.setattr(tutor_mod, "TURN_TIMEOUT", 0.2)
+    orch, _ = make_orch(tmp_path, Hanging([]), Scripted([]))
+    # 회귀하면 매달린다. 테스트가 함께 매달리지 않도록 바깥에서도 상한을 건다.
+    res = await asyncio.wait_for(
+        tutor_mod.issue_quiz(orch, load_config(), repo_name="r",
+                             repo_path=str(repo), exec_id="E", misses=[]),
+        timeout=10)
+    assert res.questions == []
+    assert any("TimeoutError" in n for n in res.notes), res.notes
+
+
+@pytest.mark.asyncio
+async def test_hanging_session_does_not_hold_the_pipeline_forever(tmp_path, repo, monkeypatch):
+    """상한이 걸리면 파이프라인은 **반환된다** — 다음 회차가 lock을 얻을 수 있어야 한다."""
+    import devcrew.tutor as tutor_mod
+    monkeypatch.setattr(tutor_mod, "TURN_TIMEOUT", 0.2)
+    orch, _ = make_orch(tmp_path, Hanging([]), Scripted([]))
+    await asyncio.wait_for(
+        tutor_mod.issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
+                             exec_id="E", misses=[]),
+        timeout=10)
