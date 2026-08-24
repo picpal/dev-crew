@@ -233,3 +233,97 @@ async def test_missing_answer_field_is_an_error_not_an_empty_message(tmp_path):
         await ask(_orch(tmp_path, a), load_config(), exec_id="QUIZ-1",
                   repo_path=str(tmp_path), question="왜?", session_id=None,
                   context="회차 맥락")
+
+
+# --- Fix round 1 (2026-08-24): 세션 유출 · KeyError 노출 · 죽은 session_id ---
+
+
+class HangingSend(Scripted):
+    """start_session은 성공하지만 실제 질문을 보내는 두 번째 turn(send)이 매달린다.
+
+    상한이 걸려 취소돼도 그 시점엔 sid가 아직 호출자에게 전달되지 않았다 — `_open`이
+    그 자리에서 archive/registry.finish로 회수하지 않으면 회수할 손잡이가 프로그램
+    어디에도 남지 않는다 (2026-08-24 재발, 오늘 아침 어댑터 패치는 첫 turn만 지킨다).
+    """
+
+    def __init__(self, outs):
+        super().__init__(outs)
+        self.archived: list[str] = []
+        self.started_sid: str | None = None
+
+    async def start_session(self, inst, initial_message, **kw):
+        self.started_sid = await super().start_session(inst, initial_message, **kw)
+        return self.started_sid
+
+    async def send(self, session_id, message):
+        await asyncio.sleep(3600)
+
+    async def archive(self, session_id):
+        self.archived.append(session_id)
+        return await super().archive(session_id)
+
+
+@pytest.mark.asyncio
+async def test_hanging_second_turn_archives_the_orphaned_session(tmp_path, monkeypatch):
+    """두 번째 turn(실제 질문 — repo를 읽는 무거운 turn)이 매달리는 경로도 첫 turn과
+    똑같이 회수돼야 한다. `test_hanging_first_turn_is_bounded`는 첫 turn만 매다는
+    경우라 이 경로를 전혀 덮지 못한다."""
+    import devcrew.tutor_ta as mod
+    from devcrew.tutor_ta import TutorTAError, ask
+
+    monkeypatch.setattr(mod, "TURN_TIMEOUT", 0.2)
+    a = HangingSend([])
+    with pytest.raises(TutorTAError):
+        await asyncio.wait_for(
+            ask(_orch(tmp_path, a), load_config(), exec_id="QUIZ-1",
+                repo_path=str(tmp_path), question="왜?", session_id=None,
+                context="회차 맥락"),
+            timeout=10)
+    assert a.archived == [a.started_sid]
+
+
+@pytest.mark.asyncio
+async def test_session_id_without_provider_is_a_clear_error_not_a_keyerror(tmp_path):
+    """provider 없이 session_id만 오면 orch.adapters[None]이 raw KeyError를 내고 그게
+    그대로 학습자 화면에 노출된다 — 여기서 미리 잡아 사유를 남긴다."""
+    from devcrew.tutor_ta import TutorTAError, ask
+
+    a = Scripted([_out()])
+    with pytest.raises(TutorTAError, match="provider"):
+        await ask(_orch(tmp_path, a), load_config(), exec_id="QUIZ-1",
+                  repo_path=str(tmp_path), question="그럼 그건?",
+                  session_id="아무세션", context="맥락", provider=None)
+
+
+@pytest.mark.asyncio
+async def test_unknown_session_recovers_when_context_is_given(tmp_path):
+    """이 adapter 인스턴스가 session_id를 모르면(cross-process 재시작 등으로 유실) —
+    context가 있으면 학습자가 사유를 몰라도 새 세션으로 자연 복구한다."""
+    from devcrew.tutor_ta import ask
+
+    a = Scripted([_out("새 세션 답")])
+    res = await ask(_orch(tmp_path, a), load_config(), exec_id="QUIZ-1",
+                    repo_path=str(tmp_path), question="그럼 그건?",
+                    session_id="모르는세션", context="회차 맥락",
+                    provider=Provider.CLAUDE_CODE)
+    assert res.text == "새 세션 답"
+    assert res.session_id != "모르는세션"
+    assert a.starts == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_session_without_context_raises_a_clear_error(tmp_path):
+    """context 없이는 복구할 회차 맥락이 없다 — raw KeyError 대신 사유를 남기고, 같은
+    죽은 session_id로 되돌아가 무한 재시도에 갇히지 않게 한다."""
+    from devcrew.tutor_ta import TutorTAError, ask
+
+    a = Scripted([_out()])
+    with pytest.raises(TutorTAError) as ei:
+        await ask(_orch(tmp_path, a), load_config(), exec_id="QUIZ-1",
+                  repo_path=str(tmp_path), question="그럼 그건?",
+                  session_id="모르는세션", context=None,
+                  provider=Provider.CLAUDE_CODE)
+    # raw KeyError("모르는세션")도 우연히 "세션"을 포함하므로, 사유를 담은 새 문장인지
+    # ("다시 시작") 확인해야 raw KeyError 노출과 구분된다.
+    assert "다시 시작" in str(ei.value)
+    assert a.starts == 0

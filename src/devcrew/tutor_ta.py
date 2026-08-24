@@ -113,14 +113,35 @@ class Answer:
 
 
 async def _open(orch, cfg, *, exec_id: str, repo_path: str, context: str, first: str):
-    """세션을 열고 첫 질문까지 한 코루틴에서 끝낸다 — 상한이 전 구간을 덮게 한다."""
+    """세션을 열고 첫 질문까지 한 코루틴에서 끝낸다 — 상한이 전 구간을 덮게 한다.
+
+    두 turn 중 무거운 쪽은 두 번째다 — `start_worker`(위 INTRO)는 회차 맥락만 주는
+    가벼운 turn이고, 실제 질문(`first`)이 들어가는 `send`에서 모델이 repo를 읽는다.
+    `send`가 이 함수 안에서 실패하거나 상한에 걸려 취소되면 `sid`는 아직 호출자에게
+    반환되지 않은 상태다 — 프로그램 어디에도 이 세션을 가리키는 손잡이가 남지 않고,
+    워커 프로세스는 archive 없이 계속 돈다(2026-08-24 재발; 그날 아침 어댑터에 넣은
+    가드는 `start_session`의 첫 turn만 지키고 여기(호출자 쪽 두 번째 turn)는 비어
+    있었다). 그래서 여기가 이 sid를 회수할 수 있는 마지막 자리다. 정리는 best-effort로
+    한다 — 정리 실패가 원래 예외를 가려서는 안 된다.
+    """
     tier = cfg.role_defaults[Role.TUTOR_TA].tier
     inst = await orch.spawn(Role.TUTOR_TA, tier, execution_id=exec_id,
                             node_id="followup", task_scope="회차 후속 질문 답변",
                             worktree=repo_path)
     sid = await orch.start_worker(inst, INTRO.format(context=context),
                                   conversational=True)
-    out = await orch.adapters[inst.provider].send(sid, first)
+    try:
+        out = await orch.adapters[inst.provider].send(sid, first)
+    except BaseException:
+        try:
+            await orch.adapters[inst.provider].archive(sid)
+        except Exception:
+            pass
+        try:
+            orch.registry.finish(inst.instance_id)
+        except Exception:
+            pass
+        raise
     return sid, inst.provider, out
 
 
@@ -131,14 +152,42 @@ async def ask(orch, cfg, *, exec_id: str, repo_path: str, question: str,
 
     `context`는 세션을 새로 열 때만 쓴다 — 이미 열린 세션은 회차를 이미 알고 있다.
 
-    상한은 `spawn` 이후 **전 구간**을 감싼다. 실제 작업(repo 읽기)은 `start_worker` 안의
-    첫 turn에서 일어나므로 `send`에만 걸면 정작 매달리는 쪽이 무방비다 (lessons C14).
+    상한은 `spawn` 이후 **전 구간**을 감싼다. `_open`의 두 turn 중 실제 작업(repo
+    읽기)은 두 번째(`send`)에서 일어나므로, 상한을 그 turn 하나에만 걸면 정작
+    매달리는 쪽이 무방비다 (lessons C14) — 그래서 `_open` 전체를 감싼다.
+
+    `session_id`와 `provider`는 항상 짝이다 — 두 번째 질문부터는 이전 `Answer`의
+    `provider`를 그대로 넘겨야 한다. 짝 없이 `session_id`만 오면 `orch.adapters[None]`이
+    raw `KeyError`를 내고 그게 그대로 학습자 화면에 노출되므로 여기서 미리 막는다.
+
+    이 adapter 인스턴스가 `session_id`를 모르면(예: cross-process 재시작으로 세션이
+    유실) — `context`가 있으면 새 세션으로 자연 복구한다. `context`가 없으면 복구할
+    회차 맥락이 없다는 뜻이라, 죽은 session_id로 되돌아가 무한 재시도에 갇히지 않도록
+    사유를 남기고 멈춘다.
     """
+    if session_id and provider is None:
+        raise TutorTAError(
+            "session_id는 있는데 provider가 없다 — 두 번째 질문부터는 이전 "
+            "Answer.provider를 그대로 넘겨야 한다")
+
     fenced = ASK.format(question=fence("question", question))
 
     async def _turn():
         if session_id:
-            return session_id, provider, await orch.adapters[provider].send(session_id, fenced)
+            try:
+                return session_id, provider, await orch.adapters[provider].send(
+                    session_id, fenced)
+            except KeyError as e:
+                # 이 프로세스의 이 adapter 인스턴스가 session_id를 모른다는 신호다
+                # (`send`가 내부 딕셔너리에서 session_id를 못 찾음) — cross-process
+                # 재시작 등으로 흔히 생긴다. context가 있으면 그걸로 새 세션을 열어
+                # 자연 복구하고, 없으면 죽은 session_id로 되돌아가지 않도록 멈춘다.
+                if not context:
+                    raise TutorTAError(
+                        "이전 대화 세션을 더 이상 찾을 수 없고, 다시 열 회차 맥락도 "
+                        "없습니다 — 새 질문으로 다시 시작해 주세요.") from e
+                return await _open(orch, cfg, exec_id=exec_id, repo_path=repo_path,
+                                   context=context, first=fenced)
         return await _open(orch, cfg, exec_id=exec_id, repo_path=repo_path,
                            context=context or "", first=fenced)
 
@@ -146,6 +195,8 @@ async def ask(orch, cfg, *, exec_id: str, repo_path: str, question: str,
         sid, prov, out = await asyncio.wait_for(_turn(), timeout=TURN_TIMEOUT)
     except asyncio.TimeoutError as e:
         raise TutorTAError("TimeoutError") from e
+    except TutorTAError:
+        raise
     except Exception as e:
         raise TutorTAError(f"{type(e).__name__}: {e}") from e
 
