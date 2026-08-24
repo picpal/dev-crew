@@ -1072,3 +1072,100 @@ async def test_ta_answer_event_records_status_and_summary(tmp_path, repo):
     assert evs, "TA 답변 이벤트가 없다"
     p = evs[-1]["payload"]
     assert "status" in p and "summary" in p, p
+
+
+def _long_answer(n=2600):
+    return ("*핵심*: 여기가 요점이다.\n\n" + "본문이 길게 이어진다. " * (n // 12))
+
+
+@pytest.mark.asyncio
+async def test_long_answer_goes_to_a_report_link(tmp_path, repo, monkeypatch):
+    """Slack 한 메시지에 못 담는 답변은 HTML 리포트로 흘리고 머리말+링크만 남긴다.
+
+    예전에는 2000자에서 잘라 "답변이 길어 잘렸습니다"만 남았고, 학습자는 나머지를 볼
+    방법이 없었다. **trace에는 전문이 그대로 남는다** — 화면 표시가 기록을 깎으면 안 된다.
+    """
+    import devcrew.slack_tutor as st
+    from devcrew.quiz import TA_ANSWER_EVENT
+    from devcrew.tutor_ta import Answer
+
+    body = _long_answer()
+    h, trace, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=body, citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    await h.on_question(thread_ts="100.1", text="길게 설명해줘", say=say,
+                        user="U-OWNER", channel="C1")
+
+    last = say.messages[-1]["text"]
+    assert "여기가 요점이다" in last, "무엇에 대한 답인지 스레드에서 보여야 한다"
+    assert "reports.example" in last, "리포트 링크가 없다"
+    assert len(last) < 1000, f"머리말만 남아야 한다 ({len(last)}자)"
+    assert any("ta-" in tid for tid, _ in pub), [tid for tid, _ in pub]
+
+    stored = trace.events(event_type=TA_ANSWER_EVENT)[-1]["payload"]["answer"]
+    assert stored == body, "기록은 전문이어야 한다"
+
+
+@pytest.mark.asyncio
+async def test_short_answer_still_posts_inline(tmp_path, repo, monkeypatch):
+    """짧은 답변까지 링크로 보내면 매번 브라우저를 열어야 한다 — 그대로 스레드에 쓴다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+
+    h, _, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    before = len(pub)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text="짧은 답이다.", citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    await h.on_question(thread_ts="100.1", text="왜?", say=say, user="U-OWNER",
+                        channel="C1")
+
+    assert say.messages[-1]["text"] == "짧은 답이다."
+    assert len(pub) == before, "짧은 답변은 리포트를 만들지 않는다"
+
+
+@pytest.mark.asyncio
+async def test_report_failure_falls_back_to_the_truncated_body(tmp_path, repo, monkeypatch):
+    """발행이 실패해도 답변은 준다 — 잘라서라도 보내고, 사유를 남긴다.
+
+    링크를 못 만들었다고 답을 통째로 삼키면, 모델은 제대로 답했는데 학습자만 잃는다.
+    """
+    import devcrew.slack_tutor as st
+    from devcrew.quiz import REPORT_FAILED_EVENT
+    from devcrew.tutor_ta import Answer
+
+    h, trace, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    def boom(task_id, html):
+        raise RuntimeError("R2 거부")
+
+    h.publish = boom
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=_long_answer(), citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    await h.on_question(thread_ts="100.1", text="길게", say=say, user="U-OWNER",
+                        channel="C1")
+
+    joined = "\n".join(m["text"] or "" for m in say.messages)
+    assert "여기가 요점이다" in joined and "본문이 길게 이어진다" in joined
+    reasons = [e["payload"]["reason"] for e in trace.events(event_type=REPORT_FAILED_EVENT)]
+    assert any("R2 거부" in r for r in reasons), reasons

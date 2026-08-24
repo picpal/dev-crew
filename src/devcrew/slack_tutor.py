@@ -20,12 +20,13 @@ from .quiz import (ANSWER_EVENT, ISSUED_EVENT, QUESTION_EVENT,
                    REPORT_FAILED_EVENT, ROUND_GRADED_EVENT,
                    TA_ANSWER_EVENT, NoteUnavailable, Question, Scorecard,
                    from_raw, grade, note_id, open_misses, record_scorecard, to_raw)
-from .report.quiz_report import render_quiz_report
+from .report.quiz_report import render_quiz_report, render_ta_answer
 from .report.uploader import publish_report
 from .repos import RepoRegistryError, format_repo_names, split_repo_prefix
 from .slack_brain import to_mrkdwn
 from .tutor import issue_quiz
-from .tutor_ta import TutorTAError, ask, round_context
+from .tutor_ta import (SLACK_LIMIT, TRUNCATED_NOTE, TutorTAError, ask,
+                       round_context, slack_head)
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 _WS_RE = re.compile(r"\s+")
@@ -440,7 +441,47 @@ class TutorHandler:
         # 같은 파일의 문항은 전부 rich()를 거치는데 TA 답변만 원문으로 나가고 있었다 —
         # `**굵게**`가 날문자로 찍히고 `Callable[<T>]`의 `<T>`는 Slack이 엔티티로 먹어
         # 통째로 사라진다. 방어를 프롬프트("별 하나로 써라")에 맡기지 않는다.
-        await say(text=rich(res.text), thread_ts=thread_ts)
+        await self._post_answer(thread_ts, question, res, sess, say)
+
+    async def _post_answer(self, thread_ts: str, question: str, res, sess,
+                           say) -> None:
+        """답변을 스레드에 낸다. 한 메시지에 안 들어가면 리포트로 흘린다.
+
+        예전에는 SLACK_LIMIT에서 그냥 잘라 "답변이 길어 잘렸습니다"만 남았다 — 학습자는
+        나머지를 볼 방법이 없었고, 모델이 제대로 쓴 설명의 뒷부분이 매번 버려졌다.
+
+        **발행이 실패해도 답은 준다.** 링크를 못 만들었다고 답을 통째로 삼키면 모델은
+        제대로 답했는데 학습자만 잃는다 — 잘라서라도 보내고 사유를 남긴다.
+        """
+        if len(res.text) <= SLACK_LIMIT:
+            await say(text=rich(res.text), thread_ts=thread_ts)
+            return
+        try:
+            html = render_ta_answer(question=question, answer=res.text,
+                                    citations=res.citations, repo=sess.repo_name)
+            url = await asyncio.to_thread(self.publish,
+                                          self._ta_report_id(thread_ts, question), html)
+        except Exception as e:
+            try:
+                self.orch.trace.append(REPORT_FAILED_EVENT, task_id=round_id(thread_ts),
+                                       execution_id=round_id(thread_ts),
+                                       payload={"reason": f"{type(e).__name__}: {e}",
+                                                "kind": "ta_answer"})
+            except Exception:
+                pass
+            url = None
+        if not url:
+            # rich()가 2900자에서 자른다 — 잘렸다는 사실은 말해 준다 (lessons C12).
+            await say(text=rich(res.text) + TRUNCATED_NOTE, thread_ts=thread_ts)
+            return
+        head = slack_head(res.text, dropped=res.dropped)
+        await say(text=f"{rich(head)}\n\n📄 전체 답변: {url}", thread_ts=thread_ts)
+
+    @staticmethod
+    def _ta_report_id(thread_ts: str, question: str) -> str:
+        import hashlib
+        seed = f"ta:{thread_ts}:{question}"
+        return "ta-" + hashlib.sha256(seed.encode()).hexdigest()[:10]
 
     # ── 회차 ────────────────────────────────────────────────────────────────
     async def _start(self, thread_ts, channel, user, repo_name, say) -> None:

@@ -76,12 +76,20 @@ def test_clean_answer_says_nothing_when_every_citation_holds(tmp_path):
     assert text == "본문" and kept == [real] and dropped == 0
 
 
-def test_clean_answer_truncates_and_says_so(tmp_path):
-    from devcrew.tutor_ta import ANSWER_LIMIT, clean_answer
+def test_clean_answer_keeps_long_bodies_for_the_report(tmp_path):
+    """SLACK_LIMIT을 넘겼다고 자르지 않는다 — 넘치는 답변은 리포트로 흘린다.
 
-    text, _, _ = clean_answer("가" * (ANSWER_LIMIT + 500), [], str(tmp_path))
-    assert len(text) < ANSWER_LIMIT + 200
-    assert "잘렸습니다" in text
+    자르는 자리는 **HARD_LIMIT** 하나뿐이다. 예전에는 2000자에서 무조건 잘라
+    "답변이 길어 잘렸습니다"만 남았고, 학습자는 나머지를 볼 방법이 없었다.
+    """
+    from devcrew.tutor_ta import HARD_LIMIT, SLACK_LIMIT, clean_answer
+
+    long_body = "가" * (SLACK_LIMIT + 3000)
+    text, _, _ = clean_answer(long_body, [], str(tmp_path))
+    assert text == long_body, "SLACK_LIMIT에서는 자르지 않는다"
+
+    text, _, _ = clean_answer("나" * (HARD_LIMIT + 500), [], str(tmp_path))
+    assert len(text) < HARD_LIMIT + 200 and "잘렸습니다" in text
 
 
 def test_round_context_treats_out_of_range_choice_as_unanswered():
@@ -104,13 +112,13 @@ def test_clean_answer_shows_disclosure_even_when_truncated(tmp_path):
 
     잘림 처리 후 인용 공개를 붙여야 순서 흔들려도 메시지가 손실되지 않는다.
     """
-    from devcrew.tutor_ta import ANSWER_LIMIT, clean_answer
+    from devcrew.tutor_ta import HARD_LIMIT, clean_answer
 
     (tmp_path / "a.py").write_text("line1\n")
     real = Evidence(path="a.py", start_line=1, end_line=1, quote="line1")
     fake = Evidence(path="a.py", start_line=1, end_line=1, quote="지어낸")
 
-    text, _, dropped = clean_answer("X" * (ANSWER_LIMIT + 100), [real, fake], str(tmp_path))
+    text, _, dropped = clean_answer("X" * (HARD_LIMIT + 100), [real, fake], str(tmp_path))
 
     # 본문이 잘렸고
     assert "잘렸습니다" in text
@@ -407,3 +415,22 @@ async def test_answer_carries_the_instance_handle_for_reclamation(tmp_path):
                        question="그럼?", session_id=first.session_id, context=None,
                        provider=first.provider, instance_id=first.instance_id)
     assert second.instance_id == first.instance_id
+
+
+def test_slack_head_takes_the_first_paragraph_and_keeps_the_disclosure():
+    """리포트로 흘린 답변의 스레드 머리말 — 첫 문단만.
+
+    프롬프트가 "핵심 한 문장을 먼저 쓰라"고 지시하므로 첫 문단이 곧 요약이다.
+    **버린 인용 공개는 머리말에도 남긴다** — 본문 끝에만 붙이면 리포트를 안 연
+    학습자에게는 공개가 사라진다. 조용히 지우면 고친 것이 새 거짓말이 된다 (C12).
+    """
+    from devcrew.tutor_ta import HEAD_LIMIT, slack_head
+
+    body = "*핵심*: 이건 이렇게 된다.\n\n두 번째 문단은 길게 이어진다."
+    assert slack_head(body) == "*핵심*: 이건 이렇게 된다."
+
+    assert "대조에 실패" in slack_head(body, dropped=2)
+
+    long_first = "가" * (HEAD_LIMIT + 200)
+    head = slack_head(long_first)
+    assert len(head) <= HEAD_LIMIT + 1 and head.endswith("…")

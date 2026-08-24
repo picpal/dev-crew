@@ -16,7 +16,14 @@ from .quiz import Evidence, Question, verify_evidence
 from .schema import Role
 from .untrusted import NOTE, fence
 
-ANSWER_LIMIT = 2000       # Slack 본문 상한보다 넉넉히 아래. 프롬프트에도 같은 값을 적었다
+# 이 길이를 넘으면 **자르지 않고 HTML 리포트로 흘린다** — 예전에는 여기서 무조건
+# 잘라 "답변이 길어 잘렸습니다"만 남았고 학습자는 나머지를 볼 방법이 없었다.
+# Slack 한 메시지 상한(3000)보다 넉넉히 아래에 둔다.
+SLACK_LIMIT = 2000
+# 리포트도 무한하지 않다. 여기서만 자른다 — 모델이 폭주해도 페이지가 터지지 않게 하는
+# 마지막 방어선이고, 정상 답변은 여기 근처에도 오지 않는다.
+HARD_LIMIT = 20000
+HEAD_LIMIT = 400          # 리포트로 흘렸을 때 스레드에 남기는 머리말(첫 문단) 상한
 LETTERS = "ABCDEFGH"
 DROPPED_NOTE = "\n\n_근거 {n}건은 대조에 실패해 제외했습니다_"
 TRUNCATED_NOTE = "\n\n_… 답변이 길어 잘렸습니다_"
@@ -77,14 +84,36 @@ def clean_answer(text: str, citations: list[Evidence],
     출제와 달리 **대조 실패가 답변 폐기 사유가 아니다.** 틀린 인용만 떼고 본문은 낸다.
     다만 뗐다는 사실은 화면에 적는다 — 조용히 지우면 고친 것이 새 거짓말이 된다
     (lessons C12).
+
+    **길다고 자르지 않는다.** SLACK_LIMIT을 넘는 본문은 호출자가 HTML 리포트로 흘리고
+    스레드에는 머리말+링크만 남긴다(`slack_head`). 여기서 자르는 자리는 HARD_LIMIT
+    하나뿐이고, 그건 폭주 방어선이지 표시 정책이 아니다.
     """
     kept, dropped = verify_evidence(citations, repo_path)
     body = (text or "").strip()
-    if len(body) > ANSWER_LIMIT:
-        body = body[:ANSWER_LIMIT] + TRUNCATED_NOTE
+    if len(body) > HARD_LIMIT:
+        body = body[:HARD_LIMIT] + TRUNCATED_NOTE
     if dropped:
         body += DROPPED_NOTE.format(n=len(dropped))
     return body, kept, len(dropped)
+
+
+def slack_head(body: str, *, dropped: int = 0, limit: int = HEAD_LIMIT) -> str:
+    """리포트로 흘린 답변의 스레드 머리말 — **첫 문단**.
+
+    프롬프트가 "핵심 한 문장을 먼저 쓰라"고 지시하므로 첫 문단이 곧 요약이다. 링크만
+    남기면 무엇에 대한 답인지 스레드만 봐서는 알 수 없고, 2000자를 그대로 남기면
+    리포트로 뺀 의미가 없다.
+
+    **버린 인용 공개는 머리말에도 붙인다.** 본문 끝에만 있으면 리포트를 열지 않은
+    학습자에게는 공개가 사라진다 (lessons C12).
+    """
+    head = (body or "").strip().split("\n\n")[0].strip()
+    if len(head) > limit:
+        head = head[:limit].rstrip() + "…"
+    if dropped:
+        head += DROPPED_NOTE.format(n=dropped)
+    return head
 
 
 # 세션 **하나의 전체 예산**이다 — 첫 turn(repo 읽기)과 답변 turn을 합쳐 이 시간을
