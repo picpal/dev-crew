@@ -11,7 +11,9 @@
 2. **Socket Mode** 켜기 → App-Level Token 생성 (scope: `connections:write`) → `xapp-…`
 3. **OAuth & Permissions** → Bot Token Scopes:
    `app_mentions:read`, `chat:write`, `reactions:write`, `channels:history`, `groups:history`
-4. **Event Subscriptions** → Subscribe to bot events: `app_mention`
+4. **Event Subscriptions** → Subscribe to bot events: `app_mention`, `message.channels`, `message.groups`
+   후속 질문은 스레드 답글(plain `message`)과 멘션(mention과 함께 오는 `app_mention`)으로 온다. 이 둘이 없으면 사용자가 멘션을 달 때만 봇이 깨어나고 답글은 무시된다.
+   (봇 자신의 메시지는 자동 걸러진다 — 무한 루프가 생기지 않는다)
 5. **Interactivity & Shortcuts** 켜기 (버튼 응답을 받는다)
 6. 워크스페이스에 설치 → Bot User OAuth Token `xoxb-…`
 7. 사용할 채널에 `/invite @tutor`
@@ -42,6 +44,18 @@ brain·crew만 쓰던 환경은 그대로 돈다. 기동 로그에 `devcrew: @tu
 - 진행 중에는 정답을 공개하지 않는다. 채점은 마지막에 한 번에 한다.
 - 미완 회차는 24시간 안에는 같은 스레드에서 이어 풀 수 있다 (프로세스를 재시작해도).
 - 오답은 사용자·repo 단위로 누적되고, 다음 회차에서 같은 지점을 맞히면 지워진다.
+
+### 채점 뒤에 더 묻기
+
+채점이 끝나면 같은 스레드에서 이어 물을 수 있다. 답글을 달거나 `@tutor`를 붙여 묻는다.
+
+- 답변 에이전트는 회차 전체(문항·정답·근거·해설·내가 고른 답)를 알고 있고, **repo를 직접
+  읽어** 확인한다. 해설을 되풀이하지 않는다
+- 이어지는 질문은 앞선 답변을 기억한다 — "그럼 그건 왜?"가 통한다
+- 근거는 기계로 대조한다. 지어낸 인용은 폐기되고, 폐기됐다는 사실이 답변에 표시된다
+- **회차 주인만** 물을 수 있다. 회차가 만료되면(24시간) 새로 시작해야 한다
+
+진행 중에는 받지 않는다. 채점 전에 답하면 정답이 새기 때문이다.
 
 ## 4. 문항이 적게 나올 때
 

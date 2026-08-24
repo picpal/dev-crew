@@ -153,6 +153,7 @@ uv run python -u -m devcrew.slack_engine   # 브리지 (env 필요)
 | `전달` | brief 산출 → crew 인계 (재인계는 delta만) |
 | `@brain /clear` | 인터뷰 세션 정리 |
 | `@tutor <repo>:` | 그 repo에 대한 10문항 학습 회차 시작 (버튼으로 응답) |
+| `@tutor` 스레드에 답글·멘션 | 채점 후 후속 질문. `TUTOR_TA`가 repo를 읽고 근거를 달아 답한다 |
 
 응답 형태로 의도가 구분된다: **버튼 = 골라야 할 결정**, **본문 산문 = 이어갈 논의**,
 **📄 링크 = 읽고 넘어갈 결론**(최종 brief 또는 3,000자 초과분).

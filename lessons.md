@@ -162,6 +162,13 @@
   → 막은 방법: `for r in Role: assert r in ROLE_POLICY` 전수 검사 + 모든 role에 대해
     `claude_options_kwargs`/`codex_session_kwargs`를 실제로 부르는 파라미터 테스트.
 
+- **2026-08-24 · `TUTOR_TA` 추가 — 이번엔 하네스가 먼저 막았다** (`#19`)
+  Role을 늘리자 `config.REQUIRED_ROLE_DEFAULTS`(= `frozenset(Role)`)가 `roleDefaults`
+  누락으로 기동을 거부했고, `test_enforcement.py`의 `list(Role)` 파라미터라이즈가
+  `ROLE_POLICY` 누락을 즉시 빨간불로 만들었다.
+  → 왜 잘 됐나: C10 이후 **정책 테이블을 Role 집합으로 강제**해 뒀기 때문이다. 잊는 것을
+    막은 게 아니라, 잊으면 못 뜨게 만들었다.
+
 **규칙**: role·provider·tier처럼 **enum과 테이블이 짝을 이루는 곳**은 개별 항목이
 아니라 **enum 전수**로 검사한다. 그리고 예외를 삼키는 자리에는 반드시 사유를 남긴다 —
 삼킨 예외는 로그에도 trace에도 없어서 원인 추적이 처음부터 불가능해진다.
