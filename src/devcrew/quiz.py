@@ -173,6 +173,25 @@ def _check_evidence(ev: Evidence, root: Path) -> str | None:
     return None
 
 
+def verify_evidence(evs: list[Evidence],
+                    root: str | Path) -> tuple[list[Evidence], list[tuple[Evidence, str]]]:
+    """근거를 파일에 대조해 실재하는 것만 남긴다 (LLM 없음, 결정적).
+
+    반환: `(통과, [(버린 evidence, 사유)])`.
+
+    **처분은 호출자가 정한다.** 출제는 하나라도 가짜면 문항을 버리지만(장식 근거가
+    정답의 근거인 척할 수 있다), 후속 질문 답변은 틀린 인용만 떼고 본문은 낸다.
+    검사 자체는 하나여야 하므로 여기로 꺼냈다.
+    """
+    root = Path(root).resolve()
+    kept: list[Evidence] = []
+    dropped: list[tuple[Evidence, str]] = []
+    for e in evs:
+        reason = _check_evidence(e, root)
+        (dropped.append((e, reason)) if reason else kept.append(e))
+    return kept, dropped
+
+
 def verify_citations(questions: list[Question],
                      root: str | Path) -> tuple[list[Question], list[tuple[Question, str]]]:
     """근거를 실제 파일에 대조해 지어낸 문항을 버린다 (LLM 없음, 결정적).
@@ -189,8 +208,8 @@ def verify_citations(questions: list[Question],
         if not q.evidence:
             dropped.append((q, "no-evidence"))
             continue
-        reason = next((r for e in q.evidence if (r := _check_evidence(e, root))), None)
-        (dropped.append((q, reason)) if reason else passed.append(q))
+        _kept, drops = verify_evidence(q.evidence, root)
+        (dropped.append((q, drops[0][1])) if drops else passed.append(q))
     return passed, dropped
 
 
