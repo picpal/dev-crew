@@ -461,6 +461,36 @@ def make_tutor_action(tutor, client):
     return on_action
 
 
+_TUTOR_MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
+
+
+def make_tutor_question(tutor, client):
+    """스레드 후속 질문 라우터 (#19). `message`와 `app_mention` 둘 다 여기로 모은다.
+
+    **봇 메시지와 subtype 붙은 메시지는 진입 전에 버린다.** tutor 응답은 채널에
+    `reply_broadcast`로 게시되고 그건 다시 `message` 이벤트로 돌아온다 — 거르지 않으면
+    봇이 자기 답변에 답하는 무한 루프가 된다.
+
+    스레드 밖(최상위) 메시지도 버린다. 회차는 스레드 단위이므로 스레드가 없으면
+    후속 질문일 수 없다.
+    """
+    async def route(body: dict) -> None:
+        ev = body.get("event") or {}
+        if ev.get("bot_id") or ev.get("subtype"):
+            return
+        thread = ev.get("thread_ts")
+        if not thread or thread == ev.get("ts"):
+            return
+        text = _TUTOR_MENTION_RE.sub("", ev.get("text") or "").strip()
+        if not text:
+            return
+        ch = ev.get("channel", "")
+        say = make_tutor_say(client, ch, thread)
+        await tutor.on_question(thread_ts=thread, text=text,
+                                user=ev.get("user") or "", say=say, channel=ch)
+    return route
+
+
 def make_crew_dispatch(post_handoff, post_crew, handler, roots: dict | None = None,
                        trace=None):
     """brain → crew 핸드오프 디스패처 (bolt 클라이언트와 분리된 순수 로직).
@@ -732,17 +762,25 @@ async def _amain() -> None:
         tutor = TutorHandler(runner.orch, runner.cfg, runner.repos,
                              react=tutor_react, status=tutor_status)
         tutor_action = make_tutor_action(tutor, tutor_app.client)
+        tutor_question = make_tutor_question(tutor, tutor_app.client)
 
         @tutor_app.event("app_mention")
         async def on_tutor_mention(body, say):
             ev = body["event"]
+            # 스레드 **안**의 멘션은 새 회차 요청이 아니라 질문이다. 이걸 빠뜨리면
+            # "@tutor 이거 왜 이래?"가 아무 반응 없이 사라진다 (#19).
+            if ev.get("thread_ts") and ev["thread_ts"] != ev.get("ts"):
+                await tutor_question(body)
+                return
             tsay = make_tutor_say(tutor_app.client, ev["channel"],
                                   ev.get("thread_ts") or ev.get("ts"))
             await tutor.on_mention(body, tsay)
 
         @tutor_app.event("message")
         async def on_tutor_message(body, say):
-            return                       # 회차 진행은 버튼으로만 — 자유 답글은 받지 않는다
+            # 회차 진행(보기 선택)은 버튼으로만 받는다. 자유 답글은 채점이 끝난
+            # 회차의 **후속 질문**으로만 취급한다 (#19).
+            await tutor_question(body)
 
         @tutor_app.action(re.compile("tutor_answer_.*"))
         async def on_tutor_answer(ack, body):

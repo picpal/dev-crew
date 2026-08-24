@@ -815,3 +815,102 @@ async def test_tutor_say_never_broadcasts_without_a_thread():
     client = Client()
     await make_tutor_say(client, "C1", None)(text="스레드 없음")
     assert client.calls[0]["reply_broadcast"] is False
+
+
+@pytest.mark.asyncio
+async def test_tutor_question_router_ignores_bot_messages():
+    """tutor 응답은 채널에 broadcast되고 그건 다시 message 이벤트로 돌아온다.
+    거르지 않으면 봇이 자기 답변에 답하는 무한 루프가 된다."""
+    from devcrew.slack_engine import make_tutor_question
+
+    class H:
+        def __init__(self):
+            self.calls = []
+
+        async def on_question(self, **kw):
+            self.calls.append(kw)
+
+    class Client:
+        async def chat_postMessage(self, **kw):
+            return {"ts": "1"}
+
+    h = H()
+    route = make_tutor_question(h, Client())
+
+    await route({"event": {"type": "message", "bot_id": "B1", "text": "내 답변",
+                           "thread_ts": "100.1", "channel": "C1", "user": "U1"}})
+    await route({"event": {"type": "message", "subtype": "message_changed",
+                           "text": "수정됨", "thread_ts": "100.1",
+                           "channel": "C1", "user": "U1"}})
+    assert h.calls == []
+
+
+@pytest.mark.asyncio
+async def test_tutor_question_router_forwards_thread_replies():
+    from devcrew.slack_engine import make_tutor_question
+
+    class H:
+        def __init__(self):
+            self.calls = []
+
+        async def on_question(self, **kw):
+            self.calls.append(kw)
+
+    class Client:
+        async def chat_postMessage(self, **kw):
+            return {"ts": "1"}
+
+    h = H()
+    await make_tutor_question(h, Client())(
+        {"event": {"type": "message", "text": "왜 그런가요?", "thread_ts": "100.1",
+                   "ts": "100.9", "channel": "C1", "user": "U-OWNER"}})
+    assert h.calls[0]["thread_ts"] == "100.1"
+    assert h.calls[0]["user"] == "U-OWNER"
+    assert h.calls[0]["text"] == "왜 그런가요?"
+
+
+@pytest.mark.asyncio
+async def test_top_level_message_is_not_a_question():
+    """스레드 밖 채널 메시지는 회차와 무관하다 — 건드리지 않는다."""
+    from devcrew.slack_engine import make_tutor_question
+
+    class H:
+        def __init__(self):
+            self.calls = []
+
+        async def on_question(self, **kw):
+            self.calls.append(kw)
+
+    class Client:
+        async def chat_postMessage(self, **kw):
+            return {"ts": "1"}
+
+    h = H()
+    await make_tutor_question(h, Client())(
+        {"event": {"type": "message", "text": "잡담", "ts": "200.1",
+                   "channel": "C1", "user": "U1"}})
+    assert h.calls == []
+
+
+@pytest.mark.asyncio
+async def test_mention_strips_the_bot_handle_from_the_question():
+    """스레드에서 `@tutor 이거 왜 이래?`가 가장 자연스러운 형태다."""
+    from devcrew.slack_engine import make_tutor_question
+
+    class H:
+        def __init__(self):
+            self.calls = []
+
+        async def on_question(self, **kw):
+            self.calls.append(kw)
+
+    class Client:
+        async def chat_postMessage(self, **kw):
+            return {"ts": "1"}
+
+    h = H()
+    await make_tutor_question(h, Client())(
+        {"event": {"type": "app_mention", "text": "<@U0BRV19AMLL> 이거 왜 이래?",
+                   "thread_ts": "100.1", "ts": "100.9",
+                   "channel": "C1", "user": "U-OWNER"}})
+    assert h.calls[0]["text"] == "이거 왜 이래?"
