@@ -129,8 +129,8 @@ h1{margin:.25em 0 .18em;font-size:1.38rem;line-height:1.32}
 .bar button{font:inherit;font-size:.84rem}
 .bar .pos{font-variant-numeric:tabular-nums;color:var(--ink-2);min-width:3.6em;
   text-align:center}
-.play .ico::before{content:"\25b6"}
-.js[data-play="1"] .play .ico::before{content:"\23f8"}
+.play .ico::before{content:"▶"}
+.js[data-play="1"] .play .ico::before{content:"⏸"}
 .keys{color:var(--ink-3);font-size:.78rem}
 
 /* ── 무대 ────────────────────────────────────────────────────────────────── */
@@ -138,10 +138,20 @@ h1{margin:.25em 0 .18em;font-size:1.38rem;line-height:1.32}
   align-items:start}
 @media (max-width:900px){.stage{grid-template-columns:minmax(0,1fr)}}
 
-.code{--lh:1.55rem;position:relative;overflow:auto;background:var(--surface);
+/* **세로 이동 방식이 모드마다 다르다.** JS가 없으면 `translateY`로 따라가야 하므로
+   컨테이너는 스크롤하지 않는다(`overflow:hidden`). JS가 붙으면 진짜 `scrollTop`으로
+   움직이고 transform은 끈다 — 둘을 같이 켜면 콘텐츠는 transform으로 올라가 있는데
+   스크롤 컨테이너는 그걸 모르므로 **위로 되돌아갈 수 없다**(2026-08-25 회귀). */
+.code{--lh:1.55rem;position:relative;overflow:hidden;background:var(--surface);
   border:1px solid var(--line);border-radius:12px;padding:14px 0;
   max-height:calc(24*var(--lh) + 28px)}
+/* `scroll-behavior:smooth`를 쓰지 않는다 — 켜 두면 스크립트가 거는 스크롤이
+   **아예 적용되지 않는다**(scrollTop 대입도, scrollTo({behavior:'smooth'})도
+   최종값이 0으로 남는 것을 실측했다, 2026-08-25). 2초에 한 칸이라 즉시 이동으로
+   충분하고, 무엇보다 확실하게 동작한다. */
+.js .code{overflow:auto}
 .track{position:relative;min-width:max-content;transition:transform .22s ease}
+.js .track{transform:none}
 .row{display:grid;grid-template-columns:3.4rem 1fr;height:var(--lh);align-items:center;
   font:.82rem/var(--lh) ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   white-space:pre;position:relative;z-index:1;margin:0}
@@ -174,7 +184,7 @@ h1{margin:.25em 0 .18em;font-size:1.38rem;line-height:1.32}
 .vk{color:var(--ink-3)}
 .vv{color:var(--ink-1);overflow-wrap:anywhere}
 .is-changed .vk,.is-changed .vv{color:var(--good);font-weight:600}
-.is-changed .vv::after{content:" \2190";opacity:.7}
+.is-changed .vv::after{content:" ←";opacity:.7}
 .novars{margin:0;font-size:.84rem;color:var(--ink-3)}
 .note{margin:12px 0 0;font-size:.83rem;color:var(--ink-3)}
 """
@@ -196,7 +206,14 @@ d.documentElement.className+=' js';
 var i=0,on=false,t=null,ms=(parseFloat(d.body.getAttribute('data-step'))||2)*1000;
 var pos=d.getElementById('pos');
 function sync(){if(pos)pos.textContent=(i+1)+' / '+r.length;}
-function go(k){i=(k%r.length+r.length)%r.length;r[i].checked=true;sync();}
+function see(k){
+var pane=d.querySelector('.code'),el=d.querySelector('.hl'+k);
+if(!pane||!el)return;
+var pr=pane.getBoundingClientRect(),er=el.getBoundingClientRect(),m=er.height*3;
+if(er.top<pr.top+m)pane.scrollTop-=(pr.top+m-er.top);
+else if(er.bottom>pr.bottom-m)pane.scrollTop+=(er.bottom-(pr.bottom-m));
+}
+function go(k){i=(k%r.length+r.length)%r.length;r[i].checked=true;sync();see(i);}
 function stop(){on=false;d.documentElement.setAttribute('data-play','0');
 clearInterval(t);t=null;}
 function play(){on=true;d.documentElement.setAttribute('data-play','1');
@@ -212,7 +229,7 @@ else if(k==='prev'){stop();go(i-1);}
 else if(k==='restart'){go(0);play();}
 });
 d.addEventListener('change',function(e){
-var x=r.indexOf(e.target);if(x<0)return;i=x;stop();sync();
+var x=r.indexOf(e.target);if(x<0)return;i=x;stop();sync();see(i);
 });
 d.addEventListener('keydown',function(e){
 if(e.metaKey||e.ctrlKey||e.altKey)return;
@@ -294,7 +311,7 @@ def render_code_report(trace, *, question: str, repo: str | None = None) -> str:
                      for i in range(n))
     manual = "".join(
         f'#st{i}:checked~.stage .st{i},#st{i}:checked~.stage .hl{i}{{opacity:1}}'
-        f'#st{i}:checked~.stage .track{{transform:translateY(calc(-1*'
+        f'html:not(.js) #st{i}:checked~.stage .track{{transform:translateY(calc(-1*'
         f'{_scroll_row(rows[i], len(lines))}*var(--lh)))}}' for i in range(n))
 
     lead, rest = _lead(trace.role_of_code)

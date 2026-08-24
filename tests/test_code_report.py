@@ -222,3 +222,46 @@ def test_controls_degrade_without_javascript():
     assert ".jsonly{display:none}" in html and ".js .jsonly{display:inline-flex}" in html
     assert 'class="replay nojs"' in html and ".js .nojs{display:none}" in html
     assert 'data-act="play"' in html and 'data-act="next"' in html
+
+
+def test_scroll_mechanisms_never_run_together():
+    """세로 이동은 **모드마다 하나씩만** 돈다 (2026-08-25 회귀).
+
+    `overflow:auto`(진짜 스크롤)와 `translateY`(transform)를 같이 켜면, 콘텐츠는
+    transform으로 올라가 있는데 스크롤 컨테이너는 그걸 모른다 — 사용자가 위로 올리면
+    scrollTop 0에서 멈추는데 화면은 여전히 아래쪽이라 **위로 되돌아갈 수 없다.**
+    라인을 클릭하면 의도보다 더 내려가 클릭한 줄이 가려지는 것도 같은 원인이다.
+    """
+    from devcrew.report.code_report import render_code_report
+
+    html = render_code_report(_trace(3), question="q")
+    # JS 없음 = transform으로 따라가므로 컨테이너는 스크롤하지 않는다
+    assert ".code{--lh:1.55rem;position:relative;overflow:hidden" in html
+    # JS 있음 = 진짜 스크롤, transform은 끈다
+    assert ".js .code{overflow:auto" in html and ".js .track{transform:none}" in html
+    # 수동 선택의 transform 규칙은 no-JS 전용이어야 한다
+    assert "html:not(.js) #st0:checked~.stage .track{transform:" in html
+    assert "\n#st0:checked~.stage .track{transform:" not in html
+
+
+def test_control_glyphs_are_not_mangled_by_python_escapes():
+    """CSS `content:"\\25b6"` 을 파이썬 문자열에 그대로 쓰면 `\\25` 가 8진 이스케이프로
+    먹혀 화면에 "b6" 이 찍힌다 — 실제로 재생 버튼이 `b6`, 변경 표시가 `90` 이었다."""
+    from devcrew.report.code_report import _CSS
+
+    assert '"▶"' in _CSS and '"⏸"' in _CSS and '" ←"' in _CSS
+    assert "\x15" not in _CSS and "\x11" not in _CSS and "\x13" not in _CSS
+
+
+def test_code_pane_does_not_use_smooth_scrolling():
+    """`scroll-behavior:smooth`면 스크립트가 거는 스크롤이 적용되지 않는다 (실측 2026-08-25).
+
+    scrollTop 대입도, `scrollTo({behavior:'smooth'})`도 최종값이 0으로 남았다 — 그래서
+    라인을 클릭해도 그 줄로 안 갔다. 2초에 한 칸이라 즉시 이동으로 충분하다.
+    """
+    import re
+
+    from devcrew.report.code_report import _CSS
+
+    rules = re.sub(r"/\*.*?\*/", "", _CSS, flags=re.S)   # 주석의 설명까지 잡지 않는다
+    assert "scroll-behavior" not in rules

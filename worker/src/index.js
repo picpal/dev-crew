@@ -8,7 +8,7 @@ const CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-
 // 해시 원본: `src/devcrew/report/code_report.py: JS_SRC`.
 // 어긋나면 스크립트가 조용히 차단되므로
 // `tests/test_code_report.py::test_worker_csp_matches_the_script_hash`가 대조한다.
-const CODE_SCRIPT_HASH = "sha256-UknGIPsIBw7jr75VLqy+VzW2DOw6shMC4ARt1jvAPio=";
+const CODE_SCRIPT_HASH = "sha256-RcLeU86abWMUnIPPnRECpLxPzpalL4NNLwqlZc2ILZI=";
 const CODE_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
   + `form-action 'self'; script-src '${CODE_SCRIPT_HASH}';`;
 const MARKER = "\ud83d\udce9 \uc120\ud0dd \ub2f5\ubcc0:"; // 📩 선택 답변:
