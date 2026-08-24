@@ -109,6 +109,11 @@ class Answer:
     text: str
     citations: list[Evidence]
     dropped: int = 0
+    # 모델이 스스로 붙인 판정과 한 줄 요약. 화면에는 안 나가지만 **trace에는 남긴다** —
+    # 스키마 거절 루프에 걸린 모델은 검증만 통과할 최소 payload를 내는데(`answer: "test"`,
+    # `summary: "test"`), 본문만 기록해서는 성실한 답인지 때운 것인지 구분할 수 없다 (C15).
+    status: str = ""
+    summary: str = ""
     provider: object | None = None
     # 반납 손잡이. `archive`는 session_id로 하지만 `registry.finish`는 instance_id로만
     # 할 수 있어서, 호출자가 회차를 닫을 때 둘 다 필요하다.
@@ -234,10 +239,13 @@ async def ask(orch, cfg, *, exec_id: str, repo_path: str, question: str,
             raise TutorTAError("빈 답변")
         text, kept, dropped = clean_answer(body, parse_citations(raw.get("citations")),
                                            repo_path)
+        status = str(raw.get("status") or "")
+        summary = str(raw.get("summary") or "")
     except BaseException:
         if inst is not None:
             await _reclaim(orch, inst, sid)
         raise
     return Answer(session_id=sid, text=text, citations=kept, dropped=dropped,
+                  status=status, summary=summary,
                   provider=inst.provider if inst is not None else provider,
                   instance_id=inst.instance_id if inst is not None else instance_id)

@@ -303,3 +303,48 @@ async def test_hanging_session_does_not_hold_the_pipeline_forever(tmp_path, repo
         tutor_mod.issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
                              exec_id="E", misses=[]),
         timeout=10)
+
+
+class Exploding(Scripted):
+    """첫 turn은 되고 nudge에서 터진다 — 세션은 이미 떴고 sid는 살아 있는 상태."""
+
+    async def send(self, session_id, message):
+        raise RuntimeError("provider 폭발")
+
+
+@pytest.mark.asyncio
+async def test_ask_archives_the_worker_on_success(tmp_path, repo):
+    """1회용 출제 세션은 반납한다 — `registry.finish`만으로는 프로세스가 안 죽는다.
+
+    2026-08-24: `_ask`가 `finish`만 하고 `archive`를 하지 않아 회차마다 워커가 쌓였다.
+    `sid`가 내부 코루틴 지역변수뿐이라 꺼낼 수 없었던 것이 구조적 원인이다.
+    """
+    from devcrew.tutor import issue_quiz
+    author = Scripted([_authored([_q(i, start=i + 1) for i in range(12)])])
+    verifier = Scripted([_verdicts(12)])
+    orch, _ = make_orch(tmp_path, author, verifier)
+    await issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
+                     exec_id="E", misses=[])
+    assert author.archived and verifier.archived
+
+
+@pytest.mark.asyncio
+async def test_ask_archives_and_records_reason_when_the_turn_fails(tmp_path, repo):
+    """실패해도 반납하고, **사유를 trace에 남긴다.**
+
+    사유가 메모리 `notes`에만 있으면 회차가 끝나는 순간 사라진다 — 2026-08-24
+    15:52 출제자가 6분 반을 쓰고 0문항을 냈는데 왜인지 어디에도 없었다.
+    """
+    from devcrew.quiz import AUTHOR_FAILED_EVENT
+    from devcrew.tutor import issue_quiz
+    author = Exploding([])
+    verifier = Scripted([])
+    orch, trace = make_orch(tmp_path, author, verifier)
+    res = await issue_quiz(orch, load_config(), repo_name="r", repo_path=str(repo),
+                           exec_id="E", misses=[])
+    assert res.questions == []
+    assert author.archived, "실패 경로에서도 워커를 반납해야 한다"
+    reasons = [e["payload"]["reason"] for e in trace.events(event_type=AUTHOR_FAILED_EVENT)]
+    assert any("provider 폭발" in r for r in reasons), reasons
+    assert any("TUTOR" in e["payload"]["role"] for e in trace.events(
+        event_type=AUTHOR_FAILED_EVENT))

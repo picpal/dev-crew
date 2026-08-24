@@ -16,7 +16,8 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from .quiz import (ANSWER_EVENT, ISSUED_EVENT, QUESTION_EVENT, ROUND_GRADED_EVENT,
+from .quiz import (ANSWER_EVENT, ISSUED_EVENT, QUESTION_EVENT,
+                   REPORT_FAILED_EVENT, ROUND_GRADED_EVENT,
                    TA_ANSWER_EVENT, NoteUnavailable, Question, Scorecard,
                    from_raw, grade, note_id, open_misses, record_scorecard, to_raw)
 from .report.quiz_report import render_quiz_report
@@ -429,6 +430,7 @@ class TutorHandler:
                 TA_ANSWER_EVENT, task_id=round_id(thread_ts),
                 execution_id=round_id(thread_ts),
                 payload={"answer": res.text, "dropped": res.dropped,
+                         "status": res.status, "summary": res.summary,
                          "citations": [{"path": c.path, "start_line": c.start_line,
                                         "end_line": c.end_line} for c in res.citations]})
         except Exception as e:
@@ -456,11 +458,20 @@ class TutorHandler:
             # 그냥 무반응으로 보이고, 사용자는 멘션을 반복하게 된다 (2026-08-24).
             await say(text="⏳ 다른 회차를 출제하는 중입니다. 끝나면 이어서 시작합니다.",
                       thread_ts=thread_ts)
+        # **보이는 곳에 적는다.** `_set_status`는 `assistant_threads_setStatus`로 가는데
+        # 그건 AI 어시스턴트 스레드 전용이라 일반 채널 스레드에서는 실패하고 조용히
+        # 삼켜진다 — 코드는 진행을 알린다고 믿었지만 사용자 화면은 완전히 비어 있었다.
+        # 출제는 실측 18분까지 걸린다. 그 침묵은 고장과 구분되지 않아 멘션을 반복하게 된다.
+        async def _tick(stage: str) -> None:
+            await self._set_status(channel, thread_ts, stage)
+            await say(text=f"⏳ {stage}", thread_ts=thread_ts)
+
         try:
             async with self._lock:
                 res = await issue_quiz(self.orch, self.cfg, repo_name=repo_name,
                                        repo_path=str(self.repos[repo_name]),
-                                       exec_id=round_id(thread_ts), misses=misses)
+                                       exec_id=round_id(thread_ts), misses=misses,
+                                       progress=_tick)
         except Exception as e:
             await say(text=f"💥 출제에 실패했습니다: {type(e).__name__}: {e}",
                       thread_ts=thread_ts)
@@ -473,6 +484,7 @@ class TutorHandler:
                       thread_ts=thread_ts)
             return
         total = len(res.questions)
+        await _tick(f"회차 게시 중… ({total}문항)")
         # **기록이 먼저다.** 안내를 먼저 보내고 기록에 실패하면 사용자에게는 시작했다는
         # 메시지만 남고 이어 풀 수도, 되살릴 수도 없는 회차가 된다 (lessons.md C7).
         try:
@@ -545,18 +557,33 @@ class TutorHandler:
                                    execution_id=round_id(sess.thread_ts), payload={})
         except Exception:
             pass
-        url = None
+        url, why = None, None
         try:
             html = render_quiz_report(card, repo=sess.repo_name, added=added,
                                       cleared=cleared)
             url = await asyncio.to_thread(self.publish, self._report_id(sess), html)
-        except Exception:
-            url = None
+        except Exception as e:
+            # **사유를 삼키지 않는다.** 2026-08-24 16:29 실제로 발행이 실패했는데
+            # `except: url = None`이 사유를 통째로 버려, 나중에 채점·렌더·업로드를 전부
+            # 다시 확인하고도 원인을 알 수 없었다. 채점은 이미 끝났으므로 회차를
+            # 되돌리지는 않는다 — 링크만 없이 가고, 왜 없는지는 남긴다.
+            url, why = None, f"{type(e).__name__}: {e}"
+            try:
+                self.orch.trace.append(REPORT_FAILED_EVENT,
+                                       task_id=round_id(sess.thread_ts),
+                                       execution_id=round_id(sess.thread_ts),
+                                       payload={"reason": why})
+            except Exception:
+                pass
         await self._say_blocks(
             say, sess.thread_ts,
             score_text(card, url=url, added=added, cleared=cleared),
             score_blocks(card, repo_name=sess.repo_name, url=url,
                          added=added, cleared=cleared))
+        if why:
+            # 링크가 없는 이유를 사용자도 봐야 한다 — 채점 결과는 위에 이미 나갔다.
+            await say(text=f"⚠️ 리포트 발행에 실패했습니다: {plain(why, 200)}",
+                      thread_ts=sess.thread_ts)
 
     def _report_id(self, sess: QuizSession) -> str:
         import hashlib

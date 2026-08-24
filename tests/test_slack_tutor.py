@@ -980,7 +980,9 @@ async def test_the_cap_counts_live_ta_sessions_not_every_round(tmp_path, repo):
 
     await ask_once(h, say, text="그럼 그건?")
     assert h.sessions["100.1"].ta_session_id == sid      # 같은 세션을 이어 쓴다
-    assert h.orch.adapters[Provider.CLAUDE_CODE].archived == []
+    # **이 회차의 TA 세션이** 반납되지 않았는지만 본다. 전역 `archived`가 비었는지
+    # 보면 안 된다 — 출제/검증은 1회용이라 정상적으로 반납되고 여기에 쌓인다.
+    assert sid not in h.orch.adapters[Provider.CLAUDE_CODE].archived
 
 
 @pytest.mark.asyncio
@@ -1007,3 +1009,66 @@ async def test_an_answer_survives_being_evicted_mid_turn(tmp_path, repo):
     assert "100.1" in h.sessions, "답변이 끝난 회차가 sessions에 없다 — 손잡이 소실"
     assert h.sessions["100.1"].ta_session_id
     assert h.sessions["100.1"].ta_session_id == sess.ta_session_id
+
+
+@pytest.mark.asyncio
+async def test_report_publish_failure_records_the_reason(tmp_path, repo):
+    """리포트 발행이 실패하면 **사유를** trace에 남기고 스레드에도 한 줄 적는다.
+
+    2026-08-24 16:29 실제로 발행이 실패했는데 `except Exception: url = None`이 사유를
+    통째로 삼켜, 나중에 채점·렌더·업로드를 전부 다시 확인하고도 원인을 알 수 없었다.
+    채점 자체는 이미 끝났으므로 회차를 되돌리지는 않는다 — 사유만 남긴다.
+    """
+    from devcrew.quiz import REPORT_FAILED_EVENT
+
+    def boom(task_id, html):
+        raise RuntimeError("R2 업로드 거부")
+
+    h, trace, _ = make_handler(tmp_path, repo)
+    h.publish = boom
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    reasons = [e["payload"]["reason"] for e in trace.events(event_type=REPORT_FAILED_EVENT)]
+    assert any("R2 업로드 거부" in r for r in reasons), reasons
+    assert any("R2 업로드 거부" in (m["text"] or "") for m in say.messages), \
+        "사용자도 왜 링크가 없는지 알아야 한다"
+
+
+@pytest.mark.asyncio
+async def test_authoring_posts_a_line_per_stage(tmp_path, repo):
+    """출제는 몇 분씩 걸린다 — 단계마다 한 줄을 적는다.
+
+    2026-08-24 회차 시작부터 첫 문항까지 18분 동안 스레드가 완전히 조용했다.
+    사용자에게는 무반응과 구분되지 않아 멘션을 반복하게 된다.
+    """
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    joined = "\n".join(m["text"] or "" for m in say.messages)
+    for stage in ("출제", "검증", "게시"):
+        assert stage in joined, f"{stage} 단계 표시가 없다:\n{joined}"
+
+
+@pytest.mark.asyncio
+async def test_ta_answer_event_records_status_and_summary(tmp_path, repo):
+    """TA 답변 이벤트에 `status`/`summary`를 남긴다.
+
+    2026-08-24: 모델이 스키마 거절 루프에 걸려 `answer: "test"`, `summary: "test"`인
+    최소 payload를 냈고 하네스는 그것을 정상 답변으로 서빙했다. 그때 trace에는 `answer`만
+    있어서 "성실한 답인가 스키마를 때운 것인가"를 기록만으로 판별할 수 없었다 (C15).
+    """
+    from devcrew.quiz import TA_ANSWER_EVENT
+
+    h, trace, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    await h.on_question(thread_ts="100.1", text="왜 그런가요?", say=say,
+                        user="U-OWNER", channel="C1")
+
+    evs = trace.events(event_type=TA_ANSWER_EVENT)
+    assert evs, "TA 답변 이벤트가 없다"
+    p = evs[-1]["payload"]
+    assert "status" in p and "summary" in p, p

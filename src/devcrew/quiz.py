@@ -256,6 +256,12 @@ TA_ANSWER_EVENT = "QuizTAAnswerEvent"    # 그 답변
 # "어느 회차가" 채점됐는지 특정하지 못한다. 회차 자신의 execution_id(QUIZ-*)에 남기는
 # 이 이벤트만이 "이 회차가 채점됐다"를 안전하게 뜻한다 (#19, 리뷰 2026-08-24).
 ROUND_GRADED_EVENT = "QuizRoundGradedEvent"
+# 출제·검증 세션이 실패한 **사유**. `notes`는 메모리라 회차가 끝나면 사라지고,
+# 사용자에게는 "문항을 만들지 못했습니다"만 남는다 — 그러면 원인을 영영 못 본다
+# (2026-08-24 15:52 출제자가 6분 반을 쓰고 0문항을 냈는데 이유가 어디에도 없었다).
+AUTHOR_FAILED_EVENT = "QuizAuthorFailedEvent"
+# 리포트 발행이 실패한 사유. 같은 이유로 남긴다 (2026-08-24 16:29 실제 실패).
+REPORT_FAILED_EVENT = "QuizReportFailedEvent"
 
 
 def note_id(user: str, repo: str) -> str:
