@@ -30,6 +30,10 @@ _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 _WS_RE = re.compile(r"\s+")
 _MD_MARKS_RE = re.compile(r"[*_`~#]")
 ROUND_TTL = 24 * 3600.0     # 미완 회차의 수명 — 하루가 지나면 코드도 기억도 달라진다
+# 후속 질문 세션(TUTOR_TA)의 반납 규칙. 스레드당 **살아 있는 워커 프로세스** 하나이므로
+# 반납은 선택이 아니다 — slack_brain(같은 모양의 스레드당 대화형 세션)과 같은 값을 쓴다.
+TA_IDLE_TTL = 6 * 3600.0    # 마지막 질문 뒤 이만큼 방치되면 세션을 반납한다
+MAX_TA_SESSIONS = 50        # 초과 시 가장 오래 방치된 회차부터 축출
 ANSWER_RE = re.compile(r"^(\d+):([0-3])$")
 REGRADE_VALUE = "__REGRADE__"   # 채점 실패 후 다시 채점하는 버튼의 sentinel
 LETTERS = "ABCDEFGH"
@@ -44,6 +48,8 @@ NOT_OWNER = "⚠️ 이 회차를 시작한 사람만 답할 수 있습니다."
 NEED_GRADED = "⚠️ 회차가 진행 중입니다 — 채점이 끝난 뒤에 물어봐 주세요."
 TA_BUSY = "⏳ 앞선 질문에 답하는 중입니다. 끝나면 이어서 답합니다."
 TA_FAIL = "💥 답변에 실패했습니다: {reason}. 같은 질문을 다시 물어봐 주세요."
+NO_REPO = ("⚠️ 이 회차의 repo `{repo}` 를 더 이상 찾을 수 없어 답하지 않습니다 — "
+           "다른 repo의 코드를 근거로 답하게 됩니다.\n등록된 repo: {repos}")
 
 
 def round_id(thread_ts: str) -> str:
@@ -62,6 +68,9 @@ class QuizSession:
     done: bool = False
     ta_session_id: str | None = None    # 후속 질문 대화 세션 (#19)
     ta_provider: object | None = None
+    ta_instance_id: str | None = None   # 반납용 — registry.finish는 이것으로만 한다
+    ta_busy: bool = False               # 답변 중 — 축출 대상에서 뺀다
+    ta_touched: float = field(default_factory=time.monotonic)
     warned: bool = False                # 진행 중 안내를 이미 보냈는가
     started_at: float = field(default_factory=time.time)
 
@@ -237,7 +246,8 @@ class TutorHandler:
         self._max_seen = max_seen
         self._opening: set[str] = set()
         self._lock = asyncio.Lock()
-        self._ta_lock = asyncio.Lock()
+        self._ta_locks: dict[str, asyncio.Lock] = {}
+        self._expired: set[str] = set()      # 만료 안내를 이미 보낸 스레드
 
     # ── 진입점 ──────────────────────────────────────────────────────────────
     async def on_mention(self, body: dict, say) -> None:
@@ -331,36 +341,58 @@ class TutorHandler:
                 sess.warned = True       # 답글마다 안내하면 알림이 아니라 잔소리다
                 await say(text=NEED_GRADED, thread_ts=thread_ts)
             return
-        if sess.owner and user != sess.owner:
+        if not sess.owner or user != sess.owner:
+            # **fail-closed.** owner가 빈 문자열이면 `sess.owner and ...`는 통째로
+            # False가 되어 누구나 통과했다 — `_resume`이 `payload.get("owner", "")`로
+            # 복원하므로 필드가 없던 옛 회차·손상된 페이로드가 곧바로 개방이 된다.
+            # 답변에는 정답·근거·해설이 그대로 들어가므로 실패 방향은 닫힘이어야 한다.
             await say(text=NOT_OWNER, thread_ts=thread_ts)
             return
         if time.time() - sess.started_at > ROUND_TTL:
             # 하루가 지나면 코드도 기억도 달라진다. 그때의 근거로 답하는 것이 오히려
             # 틀린 설명이 된다. 메모리 세션이 살아 있어도 같은 규칙을 쓴다.
-            await say(text=STALE_MSG, thread_ts=thread_ts)
+            await self._expire(thread_ts, say, sess=sess)
             return
-        if self._ta_lock.locked():
+        repo_path = str(self.repos.get(sess.repo_name) or "")
+        if not repo_path:
+            # 빈 경로는 조용히 넘어가지 않는다: `spawn(worktree="")`는 작업 디렉토리
+            # 고정 블록을 건너뛰어 워커가 **엔진 프로세스의 cwd**(= 하네스 자기 repo)에서
+            # 뜨고, `Path("").resolve()`도 같은 곳이라 인용 대조까지 하네스 기준이 된다 —
+            # 틀린 repo의 인용이 "대조 통과"로 표시된다. 거짓을 가르치느니 답하지 않는다.
+            await say(text=NO_REPO.format(repo=plain(sess.repo_name, 60),
+                                          repos=format_repo_names(self.repos)),
+                      thread_ts=thread_ts)
+            return
+        lock = self._ta_lock_for(thread_ts)
+        if lock.locked():
             await say(text=TA_BUSY, thread_ts=thread_ts)
         await self._set_status(channel or sess.channel, thread_ts, "답변 준비 중…")
-        repo_path = str(self.repos.get(sess.repo_name) or "")
         try:
-            async with self._ta_lock:
+            async with lock:
                 # context는 세션을 새로 열 때만 쓰이지만 항상 계산해 넘긴다 — ask()는
                 # 이 adapter 인스턴스가 session_id를 모르게 됐을 때(cross-process 재시작
                 # 등) context가 있어야만 새 세션으로 자연 복구한다. 재사용 경로에서
                 # None을 넘기면 그 복구 코드가 죽은 채로 남고, 세션을 잃은 학습자는
                 # "새 질문으로 다시 시작해 주세요"만 영원히 본다. round_context 조립은
                 # 순수 문자열 작업이라 매번 계산해도 비용은 없다.
-                res = await ask(
-                    self.orch, self.cfg, exec_id=round_id(thread_ts),
-                    repo_path=repo_path, question=question,
-                    session_id=sess.ta_session_id, provider=sess.ta_provider,
-                    context=round_context(sess.questions, sess.answers,
-                                          repo_name=sess.repo_name))
+                sess.ta_busy = True      # 답변 중인 회차는 축출하지 않는다
+                try:
+                    res = await ask(
+                        self.orch, self.cfg, exec_id=round_id(thread_ts),
+                        repo_path=repo_path, question=question,
+                        session_id=sess.ta_session_id, provider=sess.ta_provider,
+                        instance_id=sess.ta_instance_id,
+                        context=round_context(sess.questions, sess.answers,
+                                              repo_name=sess.repo_name))
+                finally:
+                    sess.ta_busy = False
         except TutorTAError as e:
             await say(text=TA_FAIL.format(reason=e), thread_ts=thread_ts)
             return
         sess.ta_session_id, sess.ta_provider = res.session_id, res.provider
+        sess.ta_instance_id = res.instance_id
+        sess.ta_touched = time.monotonic()
+        await self._evict_ta()
         # **기록이 먼저다.** 기록에 실패했는데 답을 보이면, 사용자는 답을 봤는데 우리는
         # 무엇을 답했는지 모르는 상태가 된다 (lessons C7) — 그래서 기록이 실패하면
         # `on_answer`와 같은 원칙으로 답을 보이지 않고 실패를 알린다. 세션(ta_session_id)은
@@ -380,7 +412,10 @@ class TutorHandler:
             await say(text=f"💥 답변 기록에 실패했습니다: {type(e).__name__}. "
                            "같은 질문을 다시 물어봐 주세요.", thread_ts=thread_ts)
             return
-        await say(text=res.text, thread_ts=thread_ts)
+        # 같은 파일의 문항은 전부 rich()를 거치는데 TA 답변만 원문으로 나가고 있었다 —
+        # `**굵게**`가 날문자로 찍히고 `Callable[<T>]`의 `<T>`는 Slack이 엔티티로 먹어
+        # 통째로 사라진다. 방어를 프롬프트("별 하나로 써라")에 맡기지 않는다.
+        await say(text=rich(res.text), thread_ts=thread_ts)
 
     # ── 회차 ────────────────────────────────────────────────────────────────
     async def _start(self, thread_ts, channel, user, repo_name, say) -> None:
@@ -509,6 +544,78 @@ class TutorHandler:
     def _next_index(sess: QuizSession) -> int | None:
         return next((i for i in range(len(sess.questions)) if i not in sess.answers), None)
 
+    # ── TA 세션 수명 ────────────────────────────────────────────────────────
+    def _ta_lock_for(self, thread_ts: str) -> asyncio.Lock:
+        """스레드당 lock 하나 (`slack_engine._lock_for`와 같은 패턴).
+
+        전역 lock 하나면 스레드 B의 학습자가 **남의 질문** 때문에 최대
+        `TURN_TIMEOUT`(300초)을 기다리고, 그러면서 "앞선 질문에 답하는 중"이라는
+        존재하지 않는 질문에 대한 안내를 받는다. 스펙의 동시성 단위는 스레드다.
+        """
+        return self._ta_locks.setdefault(thread_ts, asyncio.Lock())
+
+    async def _drop(self, sess: QuizSession) -> None:
+        """회차를 메모리에서 놓고 열려 있던 TA 세션을 반납한다 — best-effort.
+
+        회차 자체는 trace가 진실이라 `_resume`이 언제든 되살린다. 여기서 반드시
+        회수해야 하는 것은 살아 있는 워커 서브프로세스(`archive`)와 registry 행이다 —
+        `archive`만이 SDK 클라이언트를 disconnect한다.
+        """
+        if sess.ta_session_id:
+            try:
+                await self.orch.adapters[sess.ta_provider].archive(sess.ta_session_id)
+            except Exception:
+                pass
+        if sess.ta_instance_id:
+            try:
+                self.orch.registry.finish(sess.ta_instance_id)
+            except Exception:
+                pass
+        sess.ta_session_id = sess.ta_provider = sess.ta_instance_id = None
+        self.sessions.pop(sess.thread_ts, None)
+        lock = self._ta_locks.get(sess.thread_ts)
+        if lock is not None and not lock.locked():
+            self._ta_locks.pop(sess.thread_ts, None)
+
+    async def _evict_ta(self) -> None:
+        """유휴 반납 + 상한 초과 축출 (`slack_brain._evict`와 같은 규칙).
+
+        **답변 중인 회차와 TA 세션이 없는 회차는 건드리지 않는다.** 전자를 말없이
+        죽이면 학습자에겐 답이 끊긴 스레드만 남고, 후자는 아직 풀고 있는 회차라
+        반납할 자원 자체가 없다.
+        """
+        now = time.monotonic()
+        live = sorted((s for s in self.sessions.values()
+                       if s.ta_session_id and not s.ta_busy),
+                      key=lambda s: s.ta_touched)
+        for sess in list(live):
+            if now - sess.ta_touched <= TA_IDLE_TTL:
+                break                    # ta_touched 오름차순 — 뒤는 더 최근이다
+            await self._drop(sess)
+            live.remove(sess)
+        while len(self.sessions) > MAX_TA_SESSIONS and live:
+            await self._drop(live.pop(0))
+
+    async def _expire(self, thread_ts: str, say, sess: QuizSession | None = None) -> None:
+        """만료된 회차를 닫는다 — 세션을 반납하고, 안내는 **회차당 한 번만**.
+
+        게이트가 없으면 그 스레드의 모든 답글마다 안내가 나간다. tutor 메시지는 전부
+        `reply_broadcast`라 그때마다 채널이 울리고, owner 검사보다 앞이라 남의 답글에도
+        나간다 — "봇과 무관한 대화마다 끼어들지 않는다"는 규칙을 정면으로 어기는 자리다.
+
+        그리고 **거절하면서 워커를 살려 두지 않는다.** "이 회차는 못 쓴다"고 말하는
+        바로 여기가 그 회차의 세션을 반납할 마지막 자리다.
+        """
+        sess = sess if sess is not None else self.sessions.get(thread_ts)
+        if sess is not None:
+            await self._drop(sess)
+        if thread_ts in self._expired:
+            return
+        if len(self._expired) >= self._max_seen:
+            self._expired.clear()
+        self._expired.add(thread_ts)
+        await say(text=STALE_MSG, thread_ts=thread_ts)
+
     # ── 재개 ────────────────────────────────────────────────────────────────
     async def _resume(self, thread_ts: str, say) -> QuizSession | None:
         """세션이 사라진 스레드 — trace의 회차 기록에서 되살린다."""
@@ -523,7 +630,7 @@ class TutorHandler:
             return None
         last = issued[-1]
         if time.time() - last["ts"] > ROUND_TTL:
-            await say(text=STALE_MSG, thread_ts=thread_ts)
+            await self._expire(thread_ts, say)
             return None
         payload = last["payload"]
         questions = from_raw(payload.get("questions") or [])
