@@ -250,6 +250,8 @@ def grade(questions: list[Question], answers: dict[int, int]) -> Scorecard:
 GRADED_EVENT = "QuizGradedEvent"   # 회차 채점 결과 — 오답·해소를 한 이벤트에 담는다
 ISSUED_EVENT = "QuizIssuedEvent"
 ANSWER_EVENT = "QuizAnswerEvent"
+QUESTION_EVENT = "QuizQuestionEvent"     # 후속 질문 (#19)
+TA_ANSWER_EVENT = "QuizTAAnswerEvent"    # 그 답변
 
 
 def note_id(user: str, repo: str) -> str:

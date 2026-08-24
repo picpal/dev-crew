@@ -57,8 +57,12 @@ def repo(tmp_path):
 
 def make_handler(tmp_path, repo, *, n=12, published=None):
     trace = TraceStore(tmp_path / "t.db")
+    # 두 번째 항목은 TUTOR_TA(후속 질문)용 — 이 role도 tier DEFAULT(CLAUDE_CODE)라
+    # 같은 author adapter를 쓴다. 출제가 첫 send()에서 첫 항목을 소비하므로, 후속
+    # 질문의 send()는 이 두 번째 항목을 받는다.
     author = Scripted([{"status": "PASS", "summary": "s",
-                        "questions": [_q(i, start=i + 1) for i in range(n)]}])
+                        "questions": [_q(i, start=i + 1) for i in range(n)]},
+                       {"answer": "후속 질문에 대한 답변입니다.", "citations": []}])
     verifier = Scripted([{"status": "PASS", "summary": "v",
                           "verdicts": [{"index": i, "verdict": "PASS", "reason": "ok"}
                                        for i in range(n)]}])
@@ -439,3 +443,103 @@ async def test_second_round_says_it_is_waiting_instead_of_going_silent(tmp_path,
         h._lock.release()
     await asyncio.wait_for(task, timeout=10)
     assert "1 / 10" in say.messages[-1]["text"]      # 풀리면 이어서 시작한다
+
+
+@pytest.mark.asyncio
+async def test_question_during_an_open_round_is_refused_once(tmp_path, repo):
+    """진행 중에는 정답을 공개하지 않는다 — 질문은 그 원칙을 우회하는 경로다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    before = len(say.messages)
+
+    await h.on_question(thread_ts="100.1", text="3번 답이 뭐야?", user="U-OWNER", say=say)
+    assert "채점" in say.messages[-1]["text"]
+    after_first = len(say.messages)
+
+    await h.on_question(thread_ts="100.1", text="그래도 알려줘", user="U-OWNER", say=say)
+    assert len(say.messages) == after_first     # 두 번째부터는 조용히 버린다
+    assert after_first == before + 1
+
+
+@pytest.mark.asyncio
+async def test_question_after_grading_gets_an_answer(tmp_path, repo):
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)                     # 10문항을 다 풀어 채점까지
+    await h.on_question(thread_ts="100.1", text="왜 그런가요?", user="U-OWNER", say=say)
+    assert say.messages[-1]["thread_ts"] == "100.1"
+    assert say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_only_the_round_owner_may_ask(tmp_path, repo):
+    """답변에는 정답과 근거가 그대로 들어간다 — 남에게는 스포일러다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    n = len(say.messages)
+    await h.on_question(thread_ts="100.1", text="왜?", user="U-STRANGER", say=say)
+    assert len(say.messages) == n + 1
+    assert "시작한 사람" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_question_on_an_unknown_thread_is_ignored(tmp_path, repo):
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_question(thread_ts="999.9", text="왜?", user="U-OWNER", say=say)
+    assert say.messages == []
+
+
+@pytest.mark.asyncio
+async def test_answer_failure_is_reported_not_swallowed(tmp_path, repo, monkeypatch):
+    """조용히 삼키면 사용자도 우리도 원인을 못 찾는다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import TutorTAError
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def boom(*a, **kw):
+        raise TutorTAError("TimeoutError")
+
+    monkeypatch.setattr(st, "ask", boom)
+    await h.on_question(thread_ts="100.1", text="왜?", user="U-OWNER", say=say)
+    assert "TimeoutError" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_expired_round_refuses_questions(tmp_path, repo):
+    """하루가 지나면 그때의 근거로 답하는 것이 오히려 틀린 설명이 된다."""
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    h.sessions["100.1"].started_at -= st.ROUND_TTL + 1
+
+    n = len(say.messages)
+    await h.on_question(thread_ts="100.1", text="왜?", user="U-OWNER", say=say)
+    assert len(say.messages) == n + 1
+    assert "하루가 지나" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_question_and_answer_are_recorded_in_trace(tmp_path, repo):
+    """세션은 프로세스와 함께 사라지지만 trace는 남는다."""
+    from devcrew.quiz import QUESTION_EVENT, TA_ANSWER_EVENT
+
+    h, trace, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    await h.on_question(thread_ts="100.1", text="왜 그런가요?", user="U-OWNER", say=say)
+
+    kinds = [e["event_type"] for e in trace.events(execution_id="QUIZ-100.1")]
+    assert QUESTION_EVENT in kinds and TA_ANSWER_EVENT in kinds

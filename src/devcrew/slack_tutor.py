@@ -16,13 +16,15 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from .quiz import (ANSWER_EVENT, ISSUED_EVENT, NoteUnavailable, Question, Scorecard,
+from .quiz import (ANSWER_EVENT, GRADED_EVENT, ISSUED_EVENT, QUESTION_EVENT,
+                   TA_ANSWER_EVENT, NoteUnavailable, Question, Scorecard,
                    from_raw, grade, note_id, open_misses, record_scorecard, to_raw)
 from .report.quiz_report import render_quiz_report
 from .report.uploader import publish_report
 from .repos import RepoRegistryError, format_repo_names, split_repo_prefix
 from .slack_brain import to_mrkdwn
 from .tutor import issue_quiz
+from .tutor_ta import TutorTAError, ask, round_context
 
 _MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
 _WS_RE = re.compile(r"\s+")
@@ -39,6 +41,9 @@ NEED_REPO = ("⚠️ 대상 repo를 지정해 주세요 — `@tutor <repo명>: `
 STALE_MSG = ("⚠️ 이 회차는 하루가 지나 이어서 풀 수 없습니다. "
              "`@tutor <repo명>:` 로 다시 시작해 주세요.")
 NOT_OWNER = "⚠️ 이 회차를 시작한 사람만 답할 수 있습니다."
+NEED_GRADED = "⚠️ 회차가 진행 중입니다 — 채점이 끝난 뒤에 물어봐 주세요."
+TA_BUSY = "⏳ 앞선 질문에 답하는 중입니다. 끝나면 이어서 답합니다."
+TA_FAIL = "💥 답변에 실패했습니다: {reason}. 같은 질문을 다시 물어봐 주세요."
 
 
 def round_id(thread_ts: str) -> str:
@@ -55,6 +60,10 @@ class QuizSession:
     questions: list[Question]
     answers: dict[int, int] = field(default_factory=dict)
     done: bool = False
+    ta_session_id: str | None = None    # 후속 질문 대화 세션 (#19)
+    ta_provider: object | None = None
+    warned: bool = False                # 진행 중 안내를 이미 보냈는가
+    started_at: float = field(default_factory=time.time)
 
 
 def escape_slack(text: str) -> str:
@@ -228,6 +237,7 @@ class TutorHandler:
         self._max_seen = max_seen
         self._opening: set[str] = set()
         self._lock = asyncio.Lock()
+        self._ta_lock = asyncio.Lock()
 
     # ── 진입점 ──────────────────────────────────────────────────────────────
     async def on_mention(self, body: dict, say) -> None:
@@ -302,6 +312,70 @@ class TutorHandler:
             await self._finish(sess, say)
             return
         await self._post_question(sess, nxt, say)
+
+    async def on_question(self, *, thread_ts: str, text: str, user: str, say,
+                          channel: str = "") -> None:
+        """채점이 끝난 회차에 대한 후속 질문 (#19).
+
+        해설을 읽고도 막힌 지점을 푸는 것이 목적이므로 **채점 후에만** 받는다.
+        진행 중에 받으면 "3번 보기 B가 왜 틀려?"가 형식상 질문인 채로 정답을 흘린다.
+        """
+        question = (text or "").strip()
+        if not question:
+            return
+        sess = self.sessions.get(thread_ts) or await self._resume(thread_ts, say)
+        if sess is None:
+            return                       # 회차가 없는 스레드 — 우리 일이 아니다
+        if not sess.done:
+            if not sess.warned:
+                sess.warned = True       # 답글마다 안내하면 알림이 아니라 잔소리다
+                await say(text=NEED_GRADED, thread_ts=thread_ts)
+            return
+        if sess.owner and user != sess.owner:
+            await say(text=NOT_OWNER, thread_ts=thread_ts)
+            return
+        if time.time() - sess.started_at > ROUND_TTL:
+            # 하루가 지나면 코드도 기억도 달라진다. 그때의 근거로 답하는 것이 오히려
+            # 틀린 설명이 된다. 메모리 세션이 살아 있어도 같은 규칙을 쓴다.
+            await say(text=STALE_MSG, thread_ts=thread_ts)
+            return
+        if self._ta_lock.locked():
+            await say(text=TA_BUSY, thread_ts=thread_ts)
+        await self._set_status(channel or sess.channel, thread_ts, "답변 준비 중…")
+        repo_path = str(self.repos.get(sess.repo_name) or "")
+        try:
+            async with self._ta_lock:
+                # context는 세션을 새로 열 때만 쓰이지만 항상 계산해 넘긴다 — ask()는
+                # 이 adapter 인스턴스가 session_id를 모르게 됐을 때(cross-process 재시작
+                # 등) context가 있어야만 새 세션으로 자연 복구한다. 재사용 경로에서
+                # None을 넘기면 그 복구 코드가 죽은 채로 남고, 세션을 잃은 학습자는
+                # "새 질문으로 다시 시작해 주세요"만 영원히 본다. round_context 조립은
+                # 순수 문자열 작업이라 매번 계산해도 비용은 없다.
+                res = await ask(
+                    self.orch, self.cfg, exec_id=round_id(thread_ts),
+                    repo_path=repo_path, question=question,
+                    session_id=sess.ta_session_id, provider=sess.ta_provider,
+                    context=round_context(sess.questions, sess.answers,
+                                          repo_name=sess.repo_name))
+        except TutorTAError as e:
+            await say(text=TA_FAIL.format(reason=e), thread_ts=thread_ts)
+            return
+        sess.ta_session_id, sess.ta_provider = res.session_id, res.provider
+        # **기록이 먼저다.** 기록에 실패했는데 답이 나가면, 사용자는 답을 봤는데 우리는
+        # 무엇을 답했는지 모르는 상태가 된다 (lessons C7).
+        try:
+            self.orch.trace.append(QUESTION_EVENT, task_id=round_id(thread_ts),
+                                   execution_id=round_id(thread_ts),
+                                   payload={"user": user, "question": question})
+            self.orch.trace.append(
+                TA_ANSWER_EVENT, task_id=round_id(thread_ts),
+                execution_id=round_id(thread_ts),
+                payload={"answer": res.text, "dropped": res.dropped,
+                         "citations": [{"path": c.path, "start_line": c.start_line,
+                                        "end_line": c.end_line} for c in res.citations]})
+        except Exception:
+            pass          # 기록 실패가 답변을 막지는 않는다 — 답은 이미 만들어졌다
+        await say(text=res.text, thread_ts=thread_ts)
 
     # ── 회차 ────────────────────────────────────────────────────────────────
     async def _start(self, thread_ts, channel, user, repo_name, say) -> None:
@@ -448,7 +522,22 @@ class TutorHandler:
         sess = QuizSession(channel=payload.get("channel", ""), thread_ts=thread_ts,
                            owner=payload.get("owner", ""),
                            repo_name=payload.get("repo_name", ""),
-                           questions=questions, answers=answers)
+                           questions=questions, answers=answers,
+                           started_at=last["ts"])
+        # 채점 이벤트가 있으면 끝난 회차다. 이걸 복원하지 않으면 재시작 뒤에는
+        # 채점이 끝난 스레드가 "진행 중"으로 보여 후속 질문이 거절된다.
+        # GRADED_EVENT는 이 회차의 execution_id(QUIZ-*)가 아니라 오답 노트의
+        # execution_id(note_id: 사용자·repo 단위)에 쌓인다 — record_scorecard가
+        # 거기에 적기 때문이다. id는 이벤트 테이블 전체에서 단조 증가하므로,
+        # 네임스페이스가 달라도 "이 회차가 출제된 뒤에 채점 이벤트가 있었는가"는
+        # id 비교로 그대로 판정할 수 있다.
+        try:
+            graded = self.orch.trace.events(
+                execution_id=note_id(sess.owner, sess.repo_name))
+        except Exception:
+            graded = []
+        sess.done = any(e["id"] > last["id"] and e["event_type"] == GRADED_EVENT
+                        for e in graded)
         self.sessions[thread_ts] = sess
         return sess
 
