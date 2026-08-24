@@ -1,5 +1,6 @@
 import pytest
 from devcrew.roles import RoleBundleError, load_bundle, missing_required_keys
+from devcrew.orchestrator import BUNDLED_ROLES
 from devcrew.schema import Role
 
 WORKERS = [Role.EXPLORER, Role.DEVELOPER, Role.REVIEWER, Role.QA]
@@ -201,3 +202,23 @@ def test_brain_scalars_precede_arrays():
     first_array = next(i for i, (_, t) in enumerate(kinds) if t == "array")
     after = [k for k, t in kinds[first_array:] if t != "array"]
     assert not after, f"배열 뒤에 스칼라가 있다: {after}"
+
+
+@pytest.mark.parametrize("role", sorted(BUNDLED_ROLES, key=lambda r: r.value))
+def test_every_bundled_role_actually_has_a_bundle(role):
+    """`BUNDLED_ROLES`에 든 role은 **전부** 디스크에 번들이 있어야 한다.
+
+    이 테스트가 없어서, 지금까지는 role을 enum·정책·config에 등록하고 `roles/<name>/`을
+    만들지 않아도 전 테스트가 초록이었다 — 실패는 프로덕션에서 첫 spawn 때 났다
+    (lessons C10의 원래 사례가 그것이다). 목록을 하드코딩한 파라미터로 돌면 새 role이
+    자동으로 빠지므로, **BUNDLED_ROLES 자체를** 돌린다.
+    """
+    from devcrew.roles import load_bundle
+
+    b = load_bundle(role)
+    assert len(b.prompt) > 200, f"{role.value}: 프롬프트가 비어 있다"
+    props = b.schema["properties"]
+    assert props["status"]["enum"] == STATUS_ENUM
+    assert set(b.schema["required"]) == set(props), \
+        f"{role.value}: required가 모든 property를 담지 않았다 (불변조건 5)"
+    _assert_strict(b.schema)

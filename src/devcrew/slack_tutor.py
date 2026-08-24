@@ -20,11 +20,13 @@ from .quiz import (ANSWER_EVENT, ISSUED_EVENT, QUESTION_EVENT,
                    REPORT_FAILED_EVENT, ROUND_GRADED_EVENT,
                    TA_ANSWER_EVENT, NoteUnavailable, Question, Scorecard,
                    from_raw, grade, note_id, open_misses, record_scorecard, to_raw)
+from .report.code_report import render_code_report
 from .report.quiz_report import render_quiz_report, render_ta_answer
 from .report.uploader import publish_report
 from .repos import RepoRegistryError, format_repo_names, split_repo_prefix
 from .slack_brain import to_mrkdwn
 from .tutor import issue_quiz
+from .tutor_code import trace_code
 from .tutor_ta import (SLACK_LIMIT, TRUNCATED_NOTE, TutorTAError, ask,
                        round_context, slack_head)
 
@@ -453,6 +455,15 @@ class TutorHandler:
         **발행이 실패해도 답은 준다.** 링크를 못 만들었다고 답을 통째로 삼키면 모델은
         제대로 답했는데 학습자만 잃는다 — 잘라서라도 보내고 사유를 남긴다.
         """
+        if res.code_focus:
+            # 실행 흐름 질문이면 산문보다 좌우 분할 리포트가 낫다. **실패해도 답은
+            # 준다** — 리포트는 곁다리지 답이 아니다.
+            url = await self._code_report(thread_ts, question, res, sess)
+            if url:
+                head = slack_head(res.text, dropped=res.dropped)
+                await say(text=f"{rich(head)}\n\n▶️ 실행 흐름 보기: {url}",
+                          thread_ts=thread_ts)
+                return
         if len(res.text) <= SLACK_LIMIT:
             await say(text=rich(res.text), thread_ts=thread_ts)
             return
@@ -476,6 +487,39 @@ class TutorHandler:
             return
         head = slack_head(res.text, dropped=res.dropped)
         await say(text=f"{rich(head)}\n\n📄 전체 답변: {url}", thread_ts=thread_ts)
+
+    async def _code_report(self, thread_ts: str, question: str, res, sess) -> str | None:
+        """실행 추적 → 리포트 발행 → URL. 어디서 실패하든 None을 돌려주고 사유만 남긴다.
+
+        추적은 별도 세션(TUTOR_CODE)이다 — TA 스키마에 스텝까지 담으면 큰 필드가 둘이
+        되어 C15가 돌아오고, 실행 추적은 질문 답변과 다른 과업이라 프롬프트도 갈려야 한다.
+        """
+        repo_path = str(self.repos.get(sess.repo_name) or "")
+        if not repo_path:
+            return None
+        try:
+            tr = await trace_code(
+                self.orch, self.cfg, exec_id=round_id(thread_ts), repo_path=repo_path,
+                focus_path=res.code_focus.get("path"),
+                focus_symbol=res.code_focus.get("symbol"), question=question)
+            html = render_code_report(tr, question=question, repo=sess.repo_name)
+            return await asyncio.to_thread(
+                self.publish, self._code_report_id(thread_ts, question), html)
+        except Exception as e:
+            try:
+                self.orch.trace.append(REPORT_FAILED_EVENT, task_id=round_id(thread_ts),
+                                       execution_id=round_id(thread_ts),
+                                       payload={"reason": f"{type(e).__name__}: {e}",
+                                                "kind": "code_report"})
+            except Exception:
+                pass
+            return None
+
+    @staticmethod
+    def _code_report_id(thread_ts: str, question: str) -> str:
+        import hashlib
+        seed = f"code:{thread_ts}:{question}"
+        return "code-" + hashlib.sha256(seed.encode()).hexdigest()[:10]
 
     @staticmethod
     def _ta_report_id(thread_ts: str, question: str) -> str:

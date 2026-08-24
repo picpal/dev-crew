@@ -33,6 +33,9 @@ class Role(str, enum.Enum):
     TUTOR = "TUTOR"           # 학습 퀴즈 출제 — 대화형, 워크플로 노드 아님 (#19)
     TUTOR_VERIFIER = "TUTOR_VERIFIER"   # 문항 교차 검증 — 출제와 다른 provider
     TUTOR_TA = "TUTOR_TA"     # 채점 후 후속 질문 답변 — 대화형, 워크플로 노드 아님 (#19)
+    # 코드 실행 흐름 추적 — 스텝별 줄·이유·변수 변화를 낸다. 코드는 내지 않는다:
+    # 하네스가 파일에서 직접 읽는다(지어낸 코드가 화면에 오르지 않게).
+    TUTOR_CODE = "TUTOR_CODE"
 
 
 class InstanceStatus(str, enum.Enum):

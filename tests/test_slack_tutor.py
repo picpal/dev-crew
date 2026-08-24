@@ -1169,3 +1169,71 @@ async def test_report_failure_falls_back_to_the_truncated_body(tmp_path, repo, m
     assert "여기가 요점이다" in joined and "본문이 길게 이어진다" in joined
     reasons = [e["payload"]["reason"] for e in trace.events(event_type=REPORT_FAILED_EVENT)]
     assert any("R2 거부" in r for r in reasons), reasons
+
+
+@pytest.mark.asyncio
+async def test_code_question_produces_an_execution_report(tmp_path, repo, monkeypatch):
+    """TA가 `code_focus`를 달면 실행 리포트를 만들어 링크를 준다.
+
+    산문 열 줄보다 "코드 좌 / 상태 우, 2초에 한 칸"이 훨씬 잘 보인다는 것이 이 경로의
+    이유다. 짧은 답변이라도 code_focus가 있으면 리포트를 만든다.
+    """
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+    from devcrew.tutor_code import Line, Step, Trace, Var
+
+    h, _, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text="짧은 요약이다.", citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1",
+                      code_focus={"path": "a.py", "symbol": "f"})
+
+    async def fake_trace(*a, **kw):
+        return Trace(title="a.py 실행", role_of_code="역할", path="a.py",
+                     lines=[Line(number=1, text="line1"), Line(number=2, text="line2")],
+                     steps=[Step(line=1, reason="첫 줄", vars=[Var("x", "1", True)]),
+                            Step(line=2, reason="둘째 줄", vars=[])])
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    monkeypatch.setattr(st, "trace_code", fake_trace)
+    await h.on_question(thread_ts="100.1", text="이 코드 어떻게 돌아?", say=say,
+                        user="U-OWNER", channel="C1")
+
+    last = say.messages[-1]["text"]
+    assert "짧은 요약이다" in last and "reports.example" in last
+    assert any(tid.startswith("code-") for tid, _ in pub), [tid for tid, _ in pub]
+    html = next(html for tid, html in pub if tid.startswith("code-"))
+    assert "@keyframes" in html and "첫 줄" in html
+
+
+@pytest.mark.asyncio
+async def test_trace_failure_still_delivers_the_answer(tmp_path, repo, monkeypatch):
+    """추적에 실패해도 답변은 준다 — 리포트는 곁다리지 답이 아니다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+    from devcrew.tutor_code import TraceUnavailable
+
+    h, trace, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text="그래도 이 답은 나가야 한다.", citations=[],
+                      dropped=0, provider=Provider.CLAUDE_CODE, instance_id="i1",
+                      code_focus={"path": "a.py", "symbol": None})
+
+    async def boom(*a, **kw):
+        raise TraceUnavailable("대상을 찾지 못했습니다")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    monkeypatch.setattr(st, "trace_code", boom)
+    await h.on_question(thread_ts="100.1", text="이 코드?", say=say, user="U-OWNER",
+                        channel="C1")
+
+    joined = "\n".join(m["text"] or "" for m in say.messages)
+    assert "그래도 이 답은 나가야 한다" in joined

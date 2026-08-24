@@ -44,6 +44,8 @@ ROLE_POLICY: dict[Role, RolePolicy] = {
     Role.TUTOR_VERIFIER: RolePolicy(allowed_tools=list(_READ_TOOLS), sandbox="read-only"),
     # 후속 질문 답변 — 저장된 해설에 갇히지 않고 repo를 직접 읽는다. 읽기만 한다.
     Role.TUTOR_TA: RolePolicy(allowed_tools=list(_READ_TOOLS)),
+    # 학습 도구가 코드를 만질 이유가 없다 — TUTOR_TA와 같은 격리.
+    Role.TUTOR_CODE: RolePolicy(allowed_tools=list(_READ_TOOLS)),
 }
 
 

@@ -26,7 +26,8 @@ WORKER_ROLES = {Role.EXPLORER, Role.DEVELOPER, Role.REVIEWER, Role.QA}
 # 여기 빠지면 spawn()이 role_bundle_version을 안 찍고, start_worker()가 재로드한
 # 번들과 버전이 달라(None != 실제 버전) RoleBundleError로 죽는다.
 BUNDLED_ROLES = WORKER_ROLES | {Role.ORCHESTRATOR, Role.BRAIN,
-                                Role.TUTOR, Role.TUTOR_VERIFIER, Role.TUTOR_TA}
+                                Role.TUTOR, Role.TUTOR_VERIFIER, Role.TUTOR_TA,
+                                Role.TUTOR_CODE}
 
 
 class ReviewQueue:

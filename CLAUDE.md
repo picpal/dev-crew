@@ -56,6 +56,7 @@ LLM(leader)은 정책이 답을 못 정하는 **5개 트리거에서만** 호출
 | `slack_brain.py` | brain 봇 — 인터뷰 세션, brief 산출, 핸드오프 |
 | `slack_tutor.py` | tutor 봇 — 학습 회차, 문항 진행, 채점 발행 |
 | `quiz.py` `tutor.py` | 문항 모델·인용 대조·채점·오답 노트 / 출제 파이프라인 |
+| `tutor_ta.py` `tutor_code.py` | 후속 질문 답변 / 코드 실행 흐름 추적 (좌우 분할 리포트) |
 | `store/trace.py` | append-only 이벤트(진실) + projection. `store/registry.py` = 세션 레지스트리 |
 | `usage.py` | 컨텍스트 점유 실측/표기 |
 | `repos.py` `worktree.py` | repo 레지스트리(+base 브랜치), git worktree 격리 |
@@ -78,6 +79,12 @@ LLM(leader)은 정책이 답을 못 정하는 **5개 트리거에서만** 호출
 5. **strict JSON schema 규약**: `required`는 모든 property를 포함한다. 선택 필드는
    nullable 타입으로 표현한다(`tests/test_roles.py::_assert_strict`가 강제).
 6. **HTML 리포트는 단일 파일** — 인라인 CSS, JS 없음, 모든 출력 이스케이프, strict CSP.
+   JS 금지는 취향이 아니라 **worker가 강제한다**: `worker/src/index.js`의
+   `default-src 'none'`이 스크립트를 실행 자체 안 시킨다(`style-src 'unsafe-inline'`만
+   열려 있다). 코드 실행 리포트의 2초 자동 진행·수동 스텝이 전부 CSS(`@keyframes` +
+   `animation-delay`, 라디오 + `:checked ~`)로 서 있는 이유다. JS 제어를 얹으려면
+   worker CSP를 고치고 재배포해야 하고, 그건 모델이 쓴 내용을 렌더하는 **모든** 리포트의
+   backstop을 여는 거래다.
 7. **main 병합·외부 발신은 사용자 결정.** 임의로 하지 않는다.
 
 ---
@@ -154,6 +161,8 @@ uv run python -u -m devcrew.slack_engine   # 브리지 (env 필요)
 | `@brain /clear` | 인터뷰 세션 정리 |
 | `@tutor <repo>:` | 그 repo에 대한 10문항 학습 회차 시작 (버튼으로 응답) |
 | `@tutor` 스레드에 답글·멘션 | 채점 후 후속 질문. `TUTOR_TA`가 repo를 읽고 근거를 달아 답한다 |
+| 그중 **코드 실행** 질문 | `TUTOR_CODE`가 좌: 코드 / 우: 스텝별 변수 상태 리포트를 만든다 (2초에 한 칸) |
+| 답변이 2,000자 초과 | 자르지 않고 HTML 리포트로 흘리고 첫 문단 + 📄 링크를 남긴다 |
 
 응답 형태로 의도가 구분된다: **버튼 = 골라야 할 결정**, **본문 산문 = 이어갈 논의**,
 **📄 링크 = 읽고 넘어갈 결론**(최종 brief 또는 3,000자 초과분).

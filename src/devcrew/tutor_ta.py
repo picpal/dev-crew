@@ -143,6 +143,10 @@ class Answer:
     # `summary: "test"`), 본문만 기록해서는 성실한 답인지 때운 것인지 구분할 수 없다 (C15).
     status: str = ""
     summary: str = ""
+    # 실행 흐름을 보여줄 대상. 있으면 호출자가 TUTOR_CODE로 리포트를 만든다.
+    # **작게 유지한다** — 여기에 코드나 스텝을 담으면 스키마에 큰 필드가 둘이 되고,
+    # 순서로는 하나밖에 못 지켜 앞엣것이 뒤엣것을 삼킨다 (lessons C15).
+    code_focus: dict | None = None
     provider: object | None = None
     # 반납 손잡이. `archive`는 session_id로 하지만 `registry.finish`는 instance_id로만
     # 할 수 있어서, 호출자가 회차를 닫을 때 둘 다 필요하다.
@@ -270,11 +274,17 @@ async def ask(orch, cfg, *, exec_id: str, repo_path: str, question: str,
                                            repo_path)
         status = str(raw.get("status") or "")
         summary = str(raw.get("summary") or "")
+        focus = raw.get("code_focus")
+        # 모델 출력은 신뢰하지 않는다 — 형태가 아니면 없는 것으로 본다. 경로의
+        # 실재·repo 안 여부는 `tutor_code.resolve_source`가 파일을 열어 따로 막는다.
+        if not isinstance(focus, dict) or not isinstance(focus.get("path"), str) \
+                or not focus["path"].strip():
+            focus = None
     except BaseException:
         if inst is not None:
             await _reclaim(orch, inst, sid)
         raise
     return Answer(session_id=sid, text=text, citations=kept, dropped=dropped,
-                  status=status, summary=summary,
+                  status=status, summary=summary, code_focus=focus,
                   provider=inst.provider if inst is not None else provider,
                   instance_id=inst.instance_id if inst is not None else instance_id)
