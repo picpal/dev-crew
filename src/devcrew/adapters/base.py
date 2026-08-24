@@ -54,6 +54,8 @@ class FakeAdapter:
         self.fail_after = fail_after
         self.structured_script = list(structured_script or [])
         self.turns: dict[str, int] = {}
+        # 세션별로 스키마를 받았는지 기억한다 — 구조화 출력 계약이 세션 단위이기 때문이다
+        self.session_schemas: dict[str, dict | None] = {}
         self.last_system_prompt: str | None = None
         self.last_output_schema: dict | None = None
         self.last_mcp_servers: dict | None = None
@@ -70,11 +72,17 @@ class FakeAdapter:
                              mcp_servers: dict | None = None) -> str:
         sid = f"fake-{next(self._ids)}"
         self.turns[sid] = 0
+        self.session_schemas[sid] = output_schema
         self.initial_messages.append(initial_message)
         self.last_system_prompt = system_prompt
         self.last_output_schema = output_schema
         self.last_mcp_servers = mcp_servers
         return sid
+
+    def _next_structured(self, session_id: str, n: int) -> dict | None:
+        """이 turn이 낼 구조화 출력. **하위 대역이 스크립트를 갈아끼우는 자리다** —
+        `send`를 통째로 덮어쓰면 아래 스키마 계약까지 함께 우회하게 된다."""
+        return self.structured_script[n] if n < len(self.structured_script) else None
 
     async def send(self, session_id: str, message: str) -> TurnOutcome:
         if message is None:
@@ -87,7 +95,14 @@ class FakeAdapter:
         self.turns[session_id] = n + 1
         self.sent.append((session_id, message))
         text = self.script[n] if n < len(self.script) else "done"
-        structured = self.structured_script[n] if n < len(self.structured_script) else None
+        structured = self._next_structured(session_id, n)
+        if self.session_schemas.get(session_id) is None:
+            # `output_schema` 없이 시작한 세션은 CLI에 `--json-schema`가 붙지 않고,
+            # 그런 세션은 `structured_output`을 **절대** 내지 않는다. Fake가 이 계약을
+            # 어기면 "대화형 세션을 열어 놓고 out.structured를 읽는" 결함이 unit을
+            # 전부 통과한다 — 후속 질문 기능이 그 이유로 프로덕션에서 한 번도 동작하지
+            # 않았다 (2026-08-24 최종 리뷰 C1).
+            structured = None
         return TurnOutcome(text=text, usage=Usage(output_tokens=1, raw={"fake": True}),
                            structured=structured)
 

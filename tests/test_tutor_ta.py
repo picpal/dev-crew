@@ -119,7 +119,6 @@ def test_clean_answer_shows_disclosure_even_when_truncated(tmp_path):
 
 
 import asyncio
-import dataclasses
 
 import pytest
 
@@ -143,11 +142,10 @@ class Scripted(FakeAdapter):
         self.starts += 1
         return await super().start_session(inst, initial_message, **kw)
 
-    async def send(self, session_id, message):
-        out = await super().send(session_id, message)
-        if not self.queue:
-            return out
-        return dataclasses.replace(out, structured=self.queue.pop(0))
+    def _next_structured(self, session_id, n):
+        # `send`가 아니라 이 훅을 덮는다 — `send`를 덮으면 "스키마 없는 세션은 구조화
+        # 출력을 내지 않는다"는 실 어댑터 계약까지 함께 우회한다 (base.py 참조).
+        return self.queue.pop(0) if self.queue else super()._next_structured(session_id, n)
 
 
 def _out(answer="답변", citations=None):
@@ -171,6 +169,25 @@ async def test_first_question_opens_a_session_and_answers(tmp_path):
                     session_id=None, context="회차 맥락")
     assert res.text == "이래서 그렇다" and res.session_id
     assert a.starts == 1
+
+
+@pytest.mark.asyncio
+async def test_ta_session_is_opened_with_the_output_schema(tmp_path):
+    """세션은 **반드시** output_schema를 달고 열려야 한다.
+
+    스키마 없이 뜬 세션은 `structured_output`을 절대 내지 않으므로 모든 질문이
+    "빈 답변"으로 실패한다 — `conversational=True`(스키마 주입 생략 스위치)를 붙였다가
+    기능 전체가 프로덕션에서 한 번도 동작하지 않았다 (2026-08-24 최종 리뷰 C1).
+    답변이 나온다는 것만으로는 이 계약이 고정되지 않으므로 어댑터 기록을 직접 본다.
+    """
+    from devcrew.tutor_ta import ask
+
+    a = Scripted([_out("답")])
+    await ask(_orch(tmp_path, a), load_config(), exec_id="QUIZ-1",
+              repo_path=str(tmp_path), question="왜?", session_id=None,
+              context="회차 맥락")
+    assert a.last_output_schema is not None
+    assert "answer" in (a.last_output_schema.get("properties") or {})
 
 
 @pytest.mark.asyncio

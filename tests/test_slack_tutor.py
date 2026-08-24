@@ -1,6 +1,6 @@
 """slack_tutor — 퀴즈 세션·문항 진행·재개·채점 발행 (FakeAdapter, Slack 없음)."""
 import asyncio
-import dataclasses
+
 
 import pytest
 
@@ -17,11 +17,10 @@ class Scripted(FakeAdapter):
         super().__init__(script=["ok"] * 50)
         self.queue = list(structured)
 
-    async def send(self, session_id, message):
-        out = await super().send(session_id, message)
-        if not self.queue:
-            return out
-        return dataclasses.replace(out, structured=self.queue.pop(0))
+    def _next_structured(self, session_id, n):
+        # `send`가 아니라 이 훅을 덮는다 — `send`를 덮으면 "스키마 없는 세션은 구조화
+        # 출력을 내지 않는다"는 실 어댑터 계약까지 함께 우회한다 (base.py 참조).
+        return self.queue.pop(0) if self.queue else super()._next_structured(session_id, n)
 
 
 class SaySpy:

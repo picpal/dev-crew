@@ -145,6 +145,12 @@ class Orchestrator:
         # 매 turn을 JSON으로 강제하면 자연어 인터뷰가 불가능하므로 output_schema 주입만
         # 생략한다. role prompt/tool policy/cwd 강제는 그대로 유지된다. 최종 brief는
         # 별도의 비대화(conversational=False) 세션이 스키마 강제로 산출한다.
+        #
+        # **이 플래그가 하는 일은 스키마 생략 하나뿐이다** — 세션이 turn을 넘어
+        # 유지되는지와는 무관하다(세션 지속은 adapter.start_session의 성질이다).
+        # "여러 turn을 이어 쓰니까 conversational이겠지"로 읽고 붙이면 그 세션은
+        # structured_output을 영영 못 받는다 (2026-08-24 C1: TUTOR_TA가 그렇게
+        # 실패했다 — 매 turn이 스키마 제출인 role은 이 플래그를 쓰면 안 된다).
         session_id = await adapter.start_session(
             inst, initial_message,
             system_prompt=system_prompt,

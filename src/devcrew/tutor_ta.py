@@ -128,8 +128,14 @@ async def _open(orch, cfg, *, exec_id: str, repo_path: str, context: str, first:
     inst = await orch.spawn(Role.TUTOR_TA, tier, execution_id=exec_id,
                             node_id="followup", task_scope="회차 후속 질문 답변",
                             worktree=repo_path)
-    sid = await orch.start_worker(inst, INTRO.format(context=context),
-                                  conversational=True)
+    # `conversational=True`를 쓰지 않는다. 그 스위치의 유일한 효과는 **output_schema
+    # 주입을 생략하는 것**이고(orchestrator.start_worker), 스키마 없이 뜬 세션은
+    # `structured_output`을 절대 내지 않는다 — 그러면 아래 `ask`의 `out.structured`가
+    # 항상 None이라 모든 질문이 "빈 답변"으로 실패한다 (2026-08-24 최종 리뷰 C1:
+    # 기능이 프로덕션에서 한 번도 동작하지 않았다). 세션이 turn을 넘어 유지되는 것은
+    # 이 스위치와 무관하다 — BRAIN 인터뷰가 스키마를 끄는 이유는 "자연어 대화가 매 turn
+    # JSON이 되면 안 되기 때문"인데, TUTOR_TA는 매 turn이 스키마 제출이라 반대다.
+    sid = await orch.start_worker(inst, INTRO.format(context=context))
     try:
         out = await orch.adapters[inst.provider].send(sid, first)
     except BaseException:
