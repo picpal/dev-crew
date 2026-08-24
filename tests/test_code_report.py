@@ -37,12 +37,17 @@ def test_page_is_self_contained_and_escapes_everything():
 
 
 def test_animation_runs_without_javascript():
-    """2초에 한 칸 — CSS keyframes로 선다. `<script>`가 없어야 한다."""
+    """2초에 한 칸 — **CSS keyframes로 선다.**
+
+    스크립트는 재생/일시정지·키보드를 얹는 progressive enhancement일 뿐이라, CSP에
+    막히거나 실패해도 자동 진행과 라인 클릭은 그대로 돌아야 한다. 그래서 애니메이션
+    규칙이 CSS 안에 온전히 있는지를 본다 (스크립트 유무가 아니라).
+    """
     from devcrew.report.code_report import STEP_SECONDS, render_code_report
 
     html = render_code_report(_trace(4), question="q")
-    assert "<script" not in html.lower()
-    assert "@keyframes" in html and f"{STEP_SECONDS}s" in html
+    assert "@keyframes win" in html and f"{STEP_SECONDS}s" in html
+    assert ".hl{animation:win var(--total) linear infinite" in html
     # 스텝 n은 n*2초에 켜진다
     assert "animation-delay" in html
 
@@ -171,3 +176,49 @@ def test_no_escaped_quotes_leak_into_attributes():
     assert not bad, f"태그 속성 자리에 이스케이프된 따옴표: {bad}"
     assert '<p class="rest">' in html
     assert "url=&quot;$(cfg" in html, "코드 원문의 따옴표까지 지우면 안 된다"
+
+
+def test_worker_csp_matches_the_script_hash():
+    """worker의 `script-src 'sha256-…'`와 실제 스크립트가 같아야 한다.
+
+    어긋나면 브라우저가 스크립트를 **조용히** 차단한다 — 페이지는 뜨고 CSS 재생도 도는데
+    재생/이전/다음 버튼만 아무 반응이 없다. 그 증상으로는 원인을 못 찾는다.
+    JS_SRC를 한 글자라도 고치면 이 테스트가 먼저 깨져서 worker도 같이 고치게 만든다.
+    """
+    from pathlib import Path
+
+    from devcrew.report.code_report import script_hash
+
+    worker = Path(__file__).resolve().parents[1] / "worker" / "src" / "index.js"
+    assert f'"{script_hash()}"' in worker.read_text(), (
+        f"worker의 CODE_SCRIPT_HASH를 {script_hash()} 로 고치고 재배포해야 한다")
+
+
+def test_page_script_is_exactly_the_hashed_source():
+    """페이지에 박히는 것도 그 원본 그대로여야 한다 — 공백 한 칸이면 해시가 달라진다."""
+    import base64
+    import hashlib
+    import re
+
+    from devcrew.report.code_report import render_code_report, script_hash
+
+    html = render_code_report(_trace(3), question="q")
+    m = re.search(r"<script>(.*?)</script>", html, re.S)
+    assert m, "스크립트가 없다"
+    got = "sha256-" + base64.b64encode(
+        hashlib.sha256(m.group(1).encode()).digest()).decode()
+    assert got == script_hash()
+
+
+def test_controls_degrade_without_javascript():
+    """스크립트가 막혀도 페이지는 완결이어야 한다.
+
+    JS 컨트롤은 `.jsonly`라 기본이 `display:none`이고, 스크립트가 `.js`를 달아야만
+    나타난다. 반대로 CSS 전용 '처음부터'는 `.nojs`라 JS가 붙으면 사라진다.
+    """
+    from devcrew.report.code_report import render_code_report
+
+    html = render_code_report(_trace(3), question="q")
+    assert ".jsonly{display:none}" in html and ".js .jsonly{display:inline-flex}" in html
+    assert 'class="replay nojs"' in html and ".js .nojs{display:none}" in html
+    assert 'data-act="play"' in html and 'data-act="next"' in html

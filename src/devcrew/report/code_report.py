@@ -121,6 +121,17 @@ h1{margin:.25em 0 .18em;font-size:1.38rem;line-height:1.32}
   border:1px solid var(--line);border-radius:7px;background:var(--surface);
   color:var(--ink-2);cursor:pointer}
 .bar .replay:hover{border-color:var(--line-strong);color:var(--ink-1)}
+/* JS가 붙으면 CSS 재생 대신 JS가 몬다 — 그래서 컨트롤도 서로 배타적으로 보인다.
+   스크립트가 CSP에 막히거나 실패해도 아래 `.nojs`가 그대로 남아 페이지는 완결이다. */
+.jsonly{display:none}
+.js .jsonly{display:inline-flex}
+.js .nojs{display:none}
+.bar button{font:inherit;font-size:.84rem}
+.bar .pos{font-variant-numeric:tabular-nums;color:var(--ink-2);min-width:3.6em;
+  text-align:center}
+.play .ico::before{content:"\25b6"}
+.js[data-play="1"] .play .ico::before{content:"\23f8"}
+.keys{color:var(--ink-3);font-size:.78rem}
 
 /* ── 무대 ────────────────────────────────────────────────────────────────── */
 .stage{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);gap:16px;
@@ -167,6 +178,58 @@ h1{margin:.25em 0 .18em;font-size:1.38rem;line-height:1.32}
 .novars{margin:0;font-size:.84rem;color:var(--ink-3)}
 .note{margin:12px 0 0;font-size:.83rem;color:var(--ink-3)}
 """
+
+
+# ── JS 제어 레이어 (progressive enhancement) ────────────────────────────────
+# **이 문자열은 고정이다.** worker CSP가 `script-src 'sha256-…'`로 이 내용의 해시만
+# 허용하므로, 리포트마다 달라지면 해시가 어긋나 스크립트가 통째로 차단된다. 리포트별
+# 값(스텝 간격)은 스크립트에 박지 않고 DOM(`data-step`)에서 읽는다.
+# `tests/test_code_report.py::test_worker_csp_matches_the_script_hash`가 worker의
+# 해시와 대조한다 — 어긋나면 조용히 죽지 않고 테스트가 먼저 깨진다.
+#
+# 없어도 페이지는 완결이다. CSS가 자동 재생·라인 클릭을 이미 하고, 이 스크립트는
+# 같은 라디오를 대신 켜서 재생/일시정지·이전/다음·키보드를 얹을 뿐이다.
+JS_SRC = """(function(){
+var d=document,r=[].slice.call(d.querySelectorAll('.rt'));
+if(!r.length||!d.body.classList)return;
+d.documentElement.className+=' js';
+var i=0,on=false,t=null,ms=(parseFloat(d.body.getAttribute('data-step'))||2)*1000;
+var pos=d.getElementById('pos');
+function sync(){if(pos)pos.textContent=(i+1)+' / '+r.length;}
+function go(k){i=(k%r.length+r.length)%r.length;r[i].checked=true;sync();}
+function stop(){on=false;d.documentElement.setAttribute('data-play','0');
+clearInterval(t);t=null;}
+function play(){on=true;d.documentElement.setAttribute('data-play','1');
+clearInterval(t);t=setInterval(function(){go(i+1);},ms);}
+d.addEventListener('click',function(e){
+var n=e.target,a=null;
+while(n&&n!==d){if(n.getAttribute&&n.getAttribute('data-act')){a=n;break;}n=n.parentNode;}
+if(!a)return;
+var k=a.getAttribute('data-act');
+if(k==='play'){on?stop():play();}
+else if(k==='next'){stop();go(i+1);}
+else if(k==='prev'){stop();go(i-1);}
+else if(k==='restart'){go(0);play();}
+});
+d.addEventListener('change',function(e){
+var x=r.indexOf(e.target);if(x<0)return;i=x;stop();sync();
+});
+d.addEventListener('keydown',function(e){
+if(e.metaKey||e.ctrlKey||e.altKey)return;
+if(e.key==='ArrowRight'){e.preventDefault();stop();go(i+1);}
+else if(e.key==='ArrowLeft'){e.preventDefault();stop();go(i-1);}
+else if(e.key===' '||e.key==='Spacebar'){e.preventDefault();on?stop():play();}
+});
+go(0);play();
+})();"""
+
+
+def script_hash() -> str:
+    """CSP `script-src`에 넣을 `sha256-<base64>`. worker와 대조하는 값이다."""
+    import base64
+    import hashlib
+    return "sha256-" + base64.b64encode(
+        hashlib.sha256(JS_SRC.encode()).digest()).decode()
 
 _AUTOPLAY = """
 .hl{animation:win var(--total) linear infinite;animation-delay:var(--at)}
@@ -248,7 +311,7 @@ def render_code_report(trace, *, question: str, repo: str | None = None) -> str:
 <meta name="color-scheme" content="light dark">
 <title>{_e(trace.title)}</title>
 <style>{_CSS}{_keyframes(n, rows, len(lines))}{_AUTOPLAY}{manual}
-.stage{{--total:{n * STEP_SECONDS}s}}</style></head><body>
+.stage{{--total:{n * STEP_SECONDS}s}}</style></head><body data-step="{STEP_SECONDS}">
 <main class="page">
 <p class="eyebrow">dev-crew · 코드 실행 리포트</p>
 <h1>{_e(trace.title)}</h1>
@@ -257,13 +320,21 @@ def render_code_report(trace, *, question: str, repo: str | None = None) -> str:
 {role}
 <input class="auto" type="radio" name="st" id="stAuto">
 {radios}
-<div class="bar"><label class="replay" for="stAuto">▶ 처음부터</label>
+<div class="bar">
+<label class="replay nojs" for="stAuto">▶ 처음부터</label>
+<button class="replay jsonly play" type="button" data-act="play"
+ aria-label="재생/일시정지"><span class="ico"></span></button>
+<button class="replay jsonly" type="button" data-act="prev">←</button>
+<span class="replay jsonly pos" id="pos"></span>
+<button class="replay jsonly" type="button" data-act="next">→</button>
+<button class="replay jsonly" type="button" data-act="restart">처음부터</button>
 <span>{STEP_SECONDS}초마다 한 칸씩 넘어갑니다 · 초록색 줄번호를 누르면 그 줄의 설명이
-뜹니다</span></div>
+뜹니다</span><span class="keys jsonly">← → 스텝 · space 재생/멈춤</span></div>
 <div class="stage">
   <div class="code"><div class="track">{hls}{"".join(code_rows)}</div></div>
   <div class="side">{"".join(panels)}</div>
 </div>
 {dropped}
 </main>
+<script>{JS_SRC}</script>
 </body></html>"""
