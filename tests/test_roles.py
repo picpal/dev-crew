@@ -102,3 +102,37 @@ def test_verifier_schema_reports_per_question_verdicts():
     v = load_bundle(Role.TUTOR_VERIFIER).schema["properties"]["verdicts"]["items"]
     assert v["properties"]["verdict"]["enum"] == ["PASS", "REJECT"]
     assert set(v["required"]) == {"index", "verdict", "reason"}
+
+
+def test_tutor_ta_bundle_loads_with_answer_and_citations():
+    """후속 질문 답변 role — 번들이 공통 골격을 지키고 답변 필드를 갖는다."""
+    from devcrew.roles import load_bundle
+    from devcrew.schema import Role
+
+    b = load_bundle(Role.TUTOR_TA)
+    props = b.schema["properties"]
+    assert "answer" in props and props["answer"]["type"] == "string"
+    cit = props["citations"]["items"]
+    assert cit["required"] == ["path", "start_line", "end_line", "quote"]
+    assert cit["additionalProperties"] is False
+    assert "근거" in b.prompt        # 근거 없는 답변 금지가 프롬프트에 있다
+
+
+def test_tutor_ta_is_read_only():
+    """학습 도구가 코드를 만질 이유가 없다 — TUTOR와 같은 격리."""
+    from devcrew.enforcement import ROLE_POLICY
+    from devcrew.schema import Role
+
+    p = ROLE_POLICY[Role.TUTOR_TA]
+    assert not p.scoped_write_tools
+    assert not any(t.startswith("Bash") for t in p.allowed_tools)
+
+
+def test_tutor_ta_has_tier_and_budget():
+    """roleDefaults·roleBudgets를 빠뜨리면 엔진이 뜨지 않는다 (lessons C10)."""
+    from devcrew.config import load
+    from devcrew.schema import Role
+
+    cfg = load()
+    assert cfg.role_defaults[Role.TUTOR_TA].tier == "DEFAULT"
+    assert cfg.loop_policy.role_budgets["TUTOR_TA"] > 0

@@ -42,6 +42,8 @@ ROLE_POLICY: dict[Role, RolePolicy] = {
     # 만질 이유가 없고, Bash도 주지 않는다 (근거는 파일 읽기로 충분하다).
     Role.TUTOR: RolePolicy(allowed_tools=list(_READ_TOOLS)),
     Role.TUTOR_VERIFIER: RolePolicy(allowed_tools=list(_READ_TOOLS), sandbox="read-only"),
+    # 후속 질문 답변 — 저장된 해설에 갇히지 않고 repo를 직접 읽는다. 읽기만 한다.
+    Role.TUTOR_TA: RolePolicy(allowed_tools=list(_READ_TOOLS)),
 }
 
 
