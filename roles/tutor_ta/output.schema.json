@@ -1,14 +1,13 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["status", "summary", "answer", "citations"],
+  "required": ["status", "summary", "citations", "answer"],
   "properties": {
     "status": {
       "type": "string",
       "enum": ["PASS", "NOT_PASS", "NEED_REPLAN", "BLOCKED", "INSUFFICIENT_CAPABILITY"]
     },
     "summary": { "type": "string" },
-    "answer": { "type": "string" },
     "citations": {
       "type": "array",
       "maxItems": 8,
@@ -23,6 +22,7 @@
           "quote": { "type": "string" }
         }
       }
-    }
+    },
+    "answer": { "type": "string" }
   }
 }

@@ -153,3 +153,51 @@ def test_every_bundle_dir_on_disk_is_in_orchestrator_bundled_roles():
     roles_with_bundles = {by_dir_name[name] for name in dirs_on_disk if name in by_dir_name}
     missing = roles_with_bundles - BUNDLED_ROLES
     assert not missing, f"roles/ 번들은 있는데 BUNDLED_ROLES에 없는 role: {missing}"
+
+
+def test_long_text_field_is_last_property():
+    """긴 자유 텍스트 property는 스키마의 **마지막**이어야 한다 (2026-08-24).
+
+    모델은 값이 대략 1,300자를 넘으면 그 property를 XML 파라미터 블록으로 방출하는데,
+    닫는 태그를 `</parameter>`가 아니라 `</answer>`처럼 **필드 이름으로 잘못 쓴다**.
+    파서는 거기서 값을 닫지 않고 뒤따르는 파라미터를 통째로 그 문자열 안으로 흡수한다.
+    그래서 뒤에 선언된 property가 객체에서 사라지고, `required`(불변조건 5)를 위반해
+    CLI가 재제출을 요구한다. 3회 실패하면 모델은 스키마만 통과할 최소 payload
+    (`answer: "test"`)를 낸다 — 하네스는 거절된 시도를 볼 수 없으므로 그 쓰레기를
+    정상 답변으로 받아 학습자에게 그대로 보여줬다.
+
+    긴 필드를 마지막에 두면 흡수될 뒤 필드가 없어 이 경로가 사라진다. 다른 role은
+    전부 우연히 그 배치였고 `tutor_ta`만 아니었다 — 그래서 여기서만 재현됐다.
+    """
+    from devcrew.roles import load_bundle
+    from devcrew.schema import Role
+
+    # role → 그 role에서 가장 길어지는 property
+    # 어느 필드가 길어지는지는 **실측으로** 정한다 (2026-08-24 trace):
+    # EXPLORER.findings 2008자 / DEVELOPER.tests 471자(changed_files는 14자라
+    # array라고 긴 것이 아니다) / TUTOR_TA.answer 1992자.
+    longest = {Role.TUTOR_TA: "answer", Role.EXPLORER: "findings",
+               Role.DEVELOPER: "tests", Role.REVIEWER: "findings",
+               Role.QA: "results", Role.TUTOR: "questions",
+               Role.TUTOR_VERIFIER: "verdicts", Role.ORCHESTRATOR: "report"}
+    for role, field in longest.items():
+        props = list(load_bundle(role).schema["properties"])
+        assert props[-1] == field, (
+            f"{role.value}: 긴 필드 {field!r}가 마지막이 아니다 — 뒤의 "
+            f"{props[props.index(field) + 1:]}가 흡수될 수 있다")
+
+
+def test_brain_scalars_precede_arrays():
+    """BRAIN은 긴 배열이 여러 개라 "긴 것을 마지막에"로 다 못 막는다 — 대신 짧은
+    스칼라를 배열 **앞**에 둔다. 특히 `target_repo`는 brief의 대상 repo를 정하는
+    값인데 긴 배열 셋 뒤에 있었다: 흡수되면 brief가 대상을 잃는다.
+    같은 결함의 배경은 [test_long_text_field_is_last_property]에 적혀 있다.
+    """
+    from devcrew.roles import load_bundle
+    from devcrew.schema import Role
+
+    props = load_bundle(Role.BRAIN).schema["properties"]
+    kinds = [(k, v.get("type")) for k, v in props.items()]
+    first_array = next(i for i, (_, t) in enumerate(kinds) if t == "array")
+    after = [k for k, t in kinds[first_array:] if t != "array"]
+    assert not after, f"배열 뒤에 스칼라가 있다: {after}"
