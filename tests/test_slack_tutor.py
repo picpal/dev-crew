@@ -931,3 +931,17 @@ async def test_the_busy_notice_still_fires_within_the_same_thread(tmp_path, repo
         h._ta_lock_for("100.1").release()
     await asyncio.wait_for(task, timeout=10)
     assert "후속 질문에 대한 답변" in say.messages[-1]["text"]   # 풀리면 이어서 답한다
+
+
+@pytest.mark.asyncio
+async def test_has_round_survives_a_restart(tmp_path, repo):
+    """라우팅(질문이냐 새 회차냐)을 메모리 세션만 보고 정하면, 재시작 뒤에는 채점이
+    끝난 스레드에서 새 회차가 열린다 — 회차의 진실은 trace다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    assert h.has_round("100.1") is True
+
+    h.sessions.clear()                                # 프로세스 재시작
+    assert h.has_round("100.1") is True
+    assert h.has_round("999.9") is False

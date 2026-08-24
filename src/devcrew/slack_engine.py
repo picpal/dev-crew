@@ -511,6 +511,37 @@ def make_tutor_question(tutor, client):
     return route
 
 
+def make_tutor_dispatch(tutor, client, question=None):
+    """`app_mention` 라우팅 결정 — 스레드 안의 회차에 대한 멘션이면 질문, 아니면 회차 시작.
+
+    **클로저 밖**에 둔다. 이 분기가 `_amain` 안에 있으면 세 줄을 통째로 지워도 테스트가
+    전부 초록이다 — 이 저장소가 배선을 두 번 조용히 잃은 그 자리다 (lessons.md C1).
+
+    회차 유무를 보는 이유: **모든** in-thread 멘션을 질문으로 보내면 스레드 안에서
+    `@tutor myrepo:` 로 새 회차를 시작하는 길이 사라진다. `on_question`은 회차가 없는
+    스레드에서 조용히 무시하므로(그게 옳다 — 봇과 무관한 대화에 끼어들지 않는다)
+    사용자에게는 무반응으로만 보인다. repo 접두사 검증은 `on_mention`이 이미 하므로
+    여기서 겹쳐 하지 않는다.
+
+    `question`은 `message` 핸들러가 쓰는 라우터와 **같은 인스턴스여야 한다.** 중복
+    차단 상태(`(channel, ts)` set)가 그 클로저 안에 있어서, 따로 만들면 스레드 안의
+    `@tutor 질문`이 app_mention과 message 두 이벤트로 각각 통과해 같은 질문에 답이
+    두 번 나간다. 넘기지 않으면 여기서 하나 만든다(단독 사용 편의).
+    """
+    question = question or make_tutor_question(tutor, client)
+
+    async def dispatch(body: dict) -> None:
+        ev = body.get("event") or {}
+        thread = ev.get("thread_ts")
+        if thread and thread != ev.get("ts") and tutor.has_round(thread):
+            await question(body)
+            return
+        say = make_tutor_say(client, ev.get("channel", ""), thread or ev.get("ts"))
+        await tutor.on_mention(body, say)
+
+    return dispatch
+
+
 def make_crew_dispatch(post_handoff, post_crew, handler, roots: dict | None = None,
                        trace=None):
     """brain → crew 핸드오프 디스패처 (bolt 클라이언트와 분리된 순수 로직).
@@ -783,18 +814,15 @@ async def _amain() -> None:
                              react=tutor_react, status=tutor_status)
         tutor_action = make_tutor_action(tutor, tutor_app.client)
         tutor_question = make_tutor_question(tutor, tutor_app.client)
+        # 같은 라우터 인스턴스를 넘긴다 — 중복 차단 상태를 공유해야 app_mention과
+        # message로 두 번 들어오는 같은 질문에 답이 두 번 나가지 않는다.
+        tutor_dispatch = make_tutor_dispatch(tutor, tutor_app.client, tutor_question)
 
         @tutor_app.event("app_mention")
         async def on_tutor_mention(body, say):
-            ev = body["event"]
-            # 스레드 **안**의 멘션은 새 회차 요청이 아니라 질문이다. 이걸 빠뜨리면
-            # "@tutor 이거 왜 이래?"가 아무 반응 없이 사라진다 (#19).
-            if ev.get("thread_ts") and ev["thread_ts"] != ev.get("ts"):
-                await tutor_question(body)
-                return
-            tsay = make_tutor_say(tutor_app.client, ev["channel"],
-                                  ev.get("thread_ts") or ev.get("ts"))
-            await tutor.on_mention(body, tsay)
+            # 분기(질문이냐 새 회차냐)는 `make_tutor_dispatch`가 한다 — 클로저 안에
+            # 두면 배선이 통째로 사라져도 테스트가 전부 초록이다 (lessons.md C1).
+            await tutor_dispatch(body)
 
         @tutor_app.event("message")
         async def on_tutor_message(body, say):

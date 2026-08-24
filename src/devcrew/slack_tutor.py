@@ -323,6 +323,22 @@ class TutorHandler:
             return
         await self._post_question(sess, nxt, say)
 
+    def has_round(self, thread_ts: str) -> bool:
+        """이 스레드에 회차가 있는가 — 메모리에 없으면 trace에 물어본다.
+
+        라우팅 결정(질문이냐 새 회차냐)에만 쓴다. 메모리만 보면 재시작 뒤에 채점이
+        끝난 스레드에서 새 회차가 열린다 — 회차의 진실은 trace다. TTL·채점 여부는
+        여기서 보지 않는다: 그 판정은 `on_question`이 세션을 복원한 뒤에 하고,
+        여기서 겹쳐 보면 만료된 회차의 스레드가 새 회차 시작 경로로 새어 나간다.
+        """
+        if thread_ts in self.sessions:
+            return True
+        try:
+            return any(e["event_type"] == ISSUED_EVENT
+                       for e in self.orch.trace.events(execution_id=round_id(thread_ts)))
+        except Exception:
+            return False
+
     async def on_question(self, *, thread_ts: str, text: str, user: str, say,
                           channel: str = "") -> None:
         """채점이 끝난 회차에 대한 후속 질문 (#19).

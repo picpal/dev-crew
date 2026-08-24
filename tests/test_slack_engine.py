@@ -971,3 +971,91 @@ async def test_mention_only_strips_leading_bot_handle_not_mentions_inside():
                    "thread_ts": "100.1", "ts": "100.9",
                    "channel": "C1", "user": "U-OWNER"}})
     assert h.calls[0]["text"] == "<@U999>가 왜 여기 나와?"
+
+
+# ── @tutor app_mention 라우팅 분기 (최종 리뷰 I5) ────────────────────────────
+class DispatchSpy:
+    """회차 유무를 스스로 아는 tutor 대역."""
+
+    def __init__(self, rounds=()):
+        self.rounds = set(rounds)
+        self.questions = []
+        self.mentions = []
+
+    def has_round(self, thread_ts):
+        return thread_ts in self.rounds
+
+    async def on_question(self, **kw):
+        self.questions.append(kw)
+
+    async def on_mention(self, body, say):
+        self.mentions.append(body)
+
+
+class DispatchClient:
+    async def chat_postMessage(self, **kw):
+        return {"ts": "1"}
+
+
+@pytest.mark.asyncio
+async def test_tutor_dispatch_routes_an_in_thread_mention_with_a_round_to_a_question():
+    """채점이 끝난 스레드의 `@tutor 이거 왜 이래?`는 새 회차가 아니라 질문이다.
+    이 결정이 `_amain`의 클로저 안에 있어 어떤 테스트도 닿지 못했다 (lessons C1 —
+    이 저장소가 배선을 두 번 조용히 잃은 자리)."""
+    from devcrew.slack_engine import make_tutor_dispatch
+
+    t = DispatchSpy(rounds={"100.1"})
+    await make_tutor_dispatch(t, DispatchClient())(
+        {"event": {"type": "app_mention", "text": "<@U0BRV19AMLL> 이거 왜 이래?",
+                   "thread_ts": "100.1", "ts": "100.9", "channel": "C1",
+                   "user": "U-OWNER"}})
+    assert t.mentions == []
+    assert t.questions[0]["thread_ts"] == "100.1"
+    assert t.questions[0]["text"] == "이거 왜 이래?"
+
+
+@pytest.mark.asyncio
+async def test_tutor_dispatch_starts_a_round_for_an_in_thread_mention_with_no_round():
+    """**모든** in-thread 멘션을 질문으로 보내면 스레드 안에서 `@tutor myrepo:` 로
+    회차를 시작하는 길이 사라진다 — `on_question`은 회차가 없으면 조용히 무시하므로
+    사용자에게는 무반응이 된다 (최종 리뷰 I5의 부수 회귀)."""
+    from devcrew.slack_engine import make_tutor_dispatch
+
+    t = DispatchSpy()
+    await make_tutor_dispatch(t, DispatchClient())(
+        {"event": {"type": "app_mention", "text": "<@U0BRV19AMLL> myrepo:",
+                   "thread_ts": "100.1", "ts": "100.9", "channel": "C1",
+                   "user": "U-OWNER"}})
+    assert t.questions == []
+    assert len(t.mentions) == 1
+
+
+@pytest.mark.asyncio
+async def test_tutor_dispatch_sends_a_top_level_mention_to_on_mention():
+    from devcrew.slack_engine import make_tutor_dispatch
+
+    t = DispatchSpy(rounds={"200.1"})
+    await make_tutor_dispatch(t, DispatchClient())(
+        {"event": {"type": "app_mention", "text": "<@U0BRV19AMLL> myrepo:",
+                   "ts": "200.1", "channel": "C1", "user": "U-OWNER"}})
+    assert t.questions == [] and len(t.mentions) == 1
+
+
+@pytest.mark.asyncio
+async def test_tutor_dispatch_shares_the_dedupe_state_with_the_message_router():
+    """스레드 안의 `@tutor 질문`은 app_mention과 message 두 이벤트로 온다. 분기를
+    꺼내면서 라우터를 따로 만들면 중복 차단 상태(`(channel, ts)`)가 갈라져 같은
+    질문에 답이 두 번 나간다."""
+    from devcrew.slack_engine import make_tutor_dispatch, make_tutor_question
+
+    t = DispatchSpy(rounds={"100.1"})
+    client = DispatchClient()
+    question = make_tutor_question(t, client)
+    dispatch = make_tutor_dispatch(t, client, question)
+
+    ev = {"text": "<@U0BRV19AMLL> 이거 왜 이래?", "thread_ts": "100.1",
+          "ts": "100.9", "channel": "C1", "user": "U-OWNER"}
+    await dispatch({"event_id": "Ev1", "event": {**ev, "type": "app_mention"}})
+    await question({"event_id": "Ev2", "event": {**ev, "type": "message"}})
+
+    assert len(t.questions) == 1
