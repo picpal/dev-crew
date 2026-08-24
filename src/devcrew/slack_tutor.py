@@ -208,6 +208,23 @@ def score_blocks(card: Scorecard, *, repo_name: str, url: str | None,
     return blocks
 
 
+def report_blocks(body: str, url: str, label: str) -> list[dict]:
+    """본문 + 리포트 **버튼**. 날 URL을 본문에 남기지 않는다 (사용자 2026-08-25).
+
+    스레드에 URL을 흘리면 채점 리포트(이미 버튼)와 모양이 어긋나고, 모바일에서는
+    눌러야 할 것인지도 덜 분명하다. `action_id`는 채점 리포트와 같은 `tutor_report`를
+    쓴다 — 열기 전용 버튼이라 핸들러가 ack만 하면 되고, 새 id는 ack 배선을 하나 더
+    만들 뿐이다(빠뜨리면 Slack에 "작업 실패"가 뜬다).
+    """
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": rich(body, 2900)}},
+        {"type": "actions", "elements": [
+            {"type": "button", "style": "primary", "action_id": "tutor_report",
+             "text": {"type": "plain_text", "text": plain(label, 70), "emoji": True},
+             "url": url}]},
+    ]
+
+
 def score_text(card: Scorecard, *, url: str | None, added: int, cleared: int) -> str:
     lines = [f"✅ 채점 완료 — *{card.correct} / {card.total}*",
              " · ".join(f"{a} {ok}/{n}" for a, (ok, n) in card.by_area.items())]
@@ -461,8 +478,13 @@ class TutorHandler:
             url = await self._code_report(thread_ts, question, res, sess)
             if url:
                 head = slack_head(res.text, dropped=res.dropped)
-                await say(text=f"{rich(head)}\n\n▶️ 실행 흐름 보기: {url}",
-                          thread_ts=thread_ts)
+                # `text`에도 URL을 남긴다 — blocks가 있으면 Slack은 이걸 **표시하지
+                # 않고** 알림 미리보기와 폴백으로만 쓴다. `_say_blocks`는 blocks를 못
+                # 받는 `say`에 대해 텍스트로 되돌아가므로, 빼면 그 경로에서 링크가
+                # 통째로 사라진다.
+                await self._say_blocks(
+                    say, thread_ts, f"{head}\n\n▶️ 실행 흐름 보기: {url}",
+                    report_blocks(head, url, "▶️ 실행 흐름 보기"))
                 return
         if len(res.text) <= SLACK_LIMIT:
             await say(text=rich(res.text), thread_ts=thread_ts)
@@ -486,7 +508,8 @@ class TutorHandler:
             await say(text=rich(res.text) + TRUNCATED_NOTE, thread_ts=thread_ts)
             return
         head = slack_head(res.text, dropped=res.dropped)
-        await say(text=f"{rich(head)}\n\n📄 전체 답변: {url}", thread_ts=thread_ts)
+        await self._say_blocks(say, thread_ts, f"{head}\n\n📄 전체 답변: {url}",
+                               report_blocks(head, url, "📄 전체 답변 열기"))
 
     async def _code_report(self, thread_ts: str, question: str, res, sess) -> str | None:
         """실행 추적 → 리포트 발행 → URL. 어디서 실패하든 None을 돌려주고 사유만 남긴다.

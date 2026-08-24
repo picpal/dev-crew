@@ -1105,7 +1105,8 @@ async def test_long_answer_goes_to_a_report_link(tmp_path, repo, monkeypatch):
 
     last = say.messages[-1]["text"]
     assert "여기가 요점이다" in last, "무엇에 대한 답인지 스레드에서 보여야 한다"
-    assert "reports.example" in last, "리포트 링크가 없다"
+    # URL은 본문이 아니라 **버튼**에 있다 (2026-08-25)
+    assert _button_of(say.messages[-1])["url"].startswith("https://reports.example")
     assert len(last) < 1000, f"머리말만 남아야 한다 ({len(last)}자)"
     assert any("ta-" in tid for tid, _ in pub), [tid for tid, _ in pub]
 
@@ -1204,7 +1205,8 @@ async def test_code_question_produces_an_execution_report(tmp_path, repo, monkey
                         user="U-OWNER", channel="C1")
 
     last = say.messages[-1]["text"]
-    assert "짧은 요약이다" in last and "reports.example" in last
+    assert "짧은 요약이다" in last
+    assert _button_of(say.messages[-1])["url"].startswith("https://reports.example")
     assert any(tid.startswith("code-") for tid, _ in pub), [tid for tid, _ in pub]
     html = next(html for tid, html in pub if tid.startswith("code-"))
     assert "@keyframes" in html and "첫 줄" in html
@@ -1237,3 +1239,100 @@ async def test_trace_failure_still_delivers_the_answer(tmp_path, repo, monkeypat
 
     joined = "\n".join(m["text"] or "" for m in say.messages)
     assert "그래도 이 답은 나가야 한다" in joined
+
+
+def _button_of(msg):
+    for b in msg.get("blocks") or []:
+        if b["type"] == "actions":
+            return b["elements"][0]
+    return None
+
+
+@pytest.mark.asyncio
+async def test_long_answer_report_link_is_a_button(tmp_path, repo, monkeypatch):
+    """리포트 링크는 **버튼**으로 나간다 (사용자 2026-08-25).
+
+    날 URL은 스레드에서 그냥 파란 글자라 다른 리포트(채점)와 모양이 어긋나고, 모바일에서
+    눌러야 할 것인지도 덜 분명하다. 채점 리포트가 이미 `tutor_report` 버튼을 쓴다.
+    `text`는 알림 미리보기로 읽히므로 URL이 아니라 사람이 읽을 문장을 남긴다.
+    """
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=_long_answer(), citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    await h.on_question(thread_ts="100.1", text="길게", say=say, user="U-OWNER",
+                        channel="C1")
+
+    btn = _button_of(say.messages[-1])
+    assert btn and btn["type"] == "button", say.messages[-1]
+    assert btn["url"].startswith("https://reports.example")
+    assert btn["action_id"] == "tutor_report"
+    # **화면에 보이는 것**(section)에는 날 URL이 없다. `text`는 blocks가 있으면
+    # Slack이 표시하지 않고 알림 미리보기·폴백으로만 쓰므로 링크를 남겨 둔다 —
+    # blocks를 못 받는 say로 되돌아갈 때 링크가 사라지지 않게.
+    section = say.messages[-1]["blocks"][0]["text"]["text"]
+    assert "여기가 요점이다" in section and "https://" not in section
+    assert "https://reports.example" in say.messages[-1]["text"], "폴백에 링크가 없다"
+
+
+@pytest.mark.asyncio
+async def test_code_report_link_is_a_button(tmp_path, repo, monkeypatch):
+    """실행 리포트도 같다 — 버튼 문구만 다르다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+    from devcrew.tutor_code import Line, Step, Trace
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text="짧은 요약이다.", citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1",
+                      code_focus={"path": "a.py", "symbol": "f"})
+
+    async def fake_trace(*a, **kw):
+        return Trace(title="t", role_of_code="r", path="a.py",
+                     lines=[Line(1, "x"), Line(2, "y")],
+                     steps=[Step(1, "첫 줄", []), Step(2, "둘째 줄", [])])
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    monkeypatch.setattr(st, "trace_code", fake_trace)
+    await h.on_question(thread_ts="100.1", text="이 코드 어떻게 돌아?", say=say,
+                        user="U-OWNER", channel="C1")
+
+    btn = _button_of(say.messages[-1])
+    assert btn and btn["type"] == "button", say.messages[-1]
+    assert "실행" in btn["text"]["text"]
+    assert "https://" not in say.messages[-1]["blocks"][0]["text"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_blocks_are_valid_and_within_slack_limits(tmp_path, repo, monkeypatch):
+    """버튼 라벨은 `plain_text`라 마크다운이 없고 길이 상한이 있다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=_long_answer(4000), citations=[], dropped=3,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    await h.on_question(thread_ts="100.1", text="길게", say=say, user="U-OWNER",
+                        channel="C1")
+    assert_block_kit_valid(say.messages[-1]["blocks"])
