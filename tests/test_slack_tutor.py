@@ -55,14 +55,16 @@ def repo(tmp_path):
     return d
 
 
-def make_handler(tmp_path, repo, *, n=12, published=None):
+def make_handler(tmp_path, repo, *, n=12, published=None, ta_answers=3):
     trace = TraceStore(tmp_path / "t.db")
-    # 두 번째 항목은 TUTOR_TA(후속 질문)용 — 이 role도 tier DEFAULT(CLAUDE_CODE)라
-    # 같은 author adapter를 쓴다. 출제가 첫 send()에서 첫 항목을 소비하므로, 후속
-    # 질문의 send()는 이 두 번째 항목을 받는다.
+    # 첫 항목 뒤로는 TUTOR_TA(후속 질문)용 — 이 role도 tier DEFAULT(CLAUDE_CODE)라 같은
+    # author adapter를 쓴다. 출제가 첫 send()에서 첫 항목을 소비하므로, 후속 질문의
+    # send()들은 이어지는 항목을 순서대로 받는다. `ta_answers`만큼 질문을 이어 물을 수
+    # 있다 — 세션 재사용(두 번째 질문부터 같은 세션)을 테스트하려면 2개 이상 필요하다.
     author = Scripted([{"status": "PASS", "summary": "s",
-                        "questions": [_q(i, start=i + 1) for i in range(n)]},
-                       {"answer": "후속 질문에 대한 답변입니다.", "citations": []}])
+                        "questions": [_q(i, start=i + 1) for i in range(n)]}] +
+                      [{"answer": f"후속 질문에 대한 답변 {i + 1}.", "citations": []}
+                       for i in range(ta_answers)])
     verifier = Scripted([{"status": "PASS", "summary": "v",
                           "verdicts": [{"index": i, "verdict": "PASS", "reason": "ok"}
                                        for i in range(n)]}])
@@ -464,13 +466,18 @@ async def test_question_during_an_open_round_is_refused_once(tmp_path, repo):
 
 @pytest.mark.asyncio
 async def test_question_after_grading_gets_an_answer(tmp_path, repo):
+    """채점 리포트가 아니라 실제 TA 답변이 새로 나가야 한다 — no-op으로도 통과하면
+    안 된다 (`_finish`가 이미 채점 리포트를 보낸 뒤라 메시지가 있다는 것만으로는
+    `on_question`이 뭔가 했다는 증거가 안 된다)."""
     h, _, _ = make_handler(tmp_path, repo)
     say = SaySpy()
     await h.on_mention(mention(), say)
     await answer_all(h, say)                     # 10문항을 다 풀어 채점까지
+    n = len(say.messages)
     await h.on_question(thread_ts="100.1", text="왜 그런가요?", user="U-OWNER", say=say)
+    assert len(say.messages) == n + 1
     assert say.messages[-1]["thread_ts"] == "100.1"
-    assert say.messages[-1]["text"]
+    assert "후속 질문에 대한 답변" in say.messages[-1]["text"]
 
 
 @pytest.mark.asyncio
@@ -543,3 +550,76 @@ async def test_question_and_answer_are_recorded_in_trace(tmp_path, repo):
 
     kinds = [e["event_type"] for e in trace.events(execution_id="QUIZ-100.1")]
     assert QUESTION_EVENT in kinds and TA_ANSWER_EVENT in kinds
+
+
+@pytest.mark.asyncio
+async def test_second_question_reuses_the_same_ta_session(tmp_path, repo):
+    """이 기능의 목적 — 대화가 이어져야 앞 질문의 맥락 위에서 답한다. 매번 새 세션을
+    열면 회차 맥락을 다시 준다 해도 방금 나눈 대화 자체는 잊는다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    author = h.orch.adapters[Provider.CLAUDE_CODE]
+    sessions_before = len(author.turns)      # 출제 때 이미 세션 하나를 씀
+
+    await h.on_question(thread_ts="100.1", text="첫 번째 질문", user="U-OWNER", say=say)
+    sid1, provider1 = h.sessions["100.1"].ta_session_id, h.sessions["100.1"].ta_provider
+    sessions_after_first = len(author.turns)
+    assert sessions_after_first == sessions_before + 1     # 새 세션 하나만 열렸다
+
+    await h.on_question(thread_ts="100.1", text="두 번째 질문", user="U-OWNER", say=say)
+    sid2, provider2 = h.sessions["100.1"].ta_session_id, h.sessions["100.1"].ta_provider
+
+    assert sid1 is not None and sid1 == sid2
+    assert provider1 == provider2
+    assert len(author.turns) == sessions_after_first        # 두 번째는 세션을 새로 안 연다
+    assert say.messages[-2]["text"] != say.messages[-1]["text"]   # 서로 다른 답변
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_confuse_another_rounds_grading_as_done(tmp_path, repo):
+    """GRADED_EVENT(오답 노트)는 사용자·repo 단위 네임스페이스라 어느 회차의 채점인지
+    특정하지 못한다. 이 회차를 방치한 채 같은 사용자가 같은 repo로 다른 회차를 채점해도,
+    그 이벤트로 이 회차를 '끝난 것'으로 보면 아직 풀지 않은 문항의 정답·해설이 새는
+    정답 유출이다 (리뷰 2026-08-24 재현). done은 이 회차 자신의 execution_id에 남는
+    ROUND_GRADED_EVENT로만 판정해야 한다."""
+    from devcrew.quiz import GRADED_EVENT, note_id
+
+    h, trace, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)             # 회차 A(100.1) — 방치, 채점 안 됨
+
+    # "다른 회차"가 채점됐다고 가정한다 — GRADED_EVENT는 회차를 구분하지 않는
+    # note_id(사용자·repo) 네임스페이스에 쌓이므로, 이 회차의 것과 구분할 수 없다.
+    trace.append(GRADED_EVENT, task_id="OTHER-ROUND",
+                execution_id=note_id("U-OWNER", "myrepo"),
+                payload={"missed": [], "cleared": []})
+
+    h.sessions.clear()                             # 프로세스 재시작
+    n = len(say.messages)
+    await h.on_question(thread_ts="100.1", text="3번 답이 뭐야?", user="U-OWNER", say=say)
+
+    assert h.sessions["100.1"].done is False
+    assert len(say.messages) == n + 1
+    assert "채점" in say.messages[-1]["text"]        # 여전히 NEED_GRADED — 유출 없음
+
+
+@pytest.mark.asyncio
+async def test_resume_restores_done_for_the_same_graded_round(tmp_path, repo):
+    """방치된 다른 회차와 달리, 실제로 채점을 마친 이 회차는 재시작 뒤에도 후속
+    질문을 받아야 한다 — fail-closed가 항상 거절로 이어지면 그것도 결함이다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)                        # 채점까지 완료
+    assert h.sessions["100.1"].done is True
+
+    h.sessions.clear()                              # 프로세스 재시작
+    n = len(say.messages)
+    await h.on_question(thread_ts="100.1", text="왜 그런가요?", user="U-OWNER", say=say)
+
+    assert h.sessions["100.1"].done is True
+    assert len(say.messages) == n + 1
+    assert "채점" not in say.messages[-1]["text"]    # 거절이 아니라 실제 답변

@@ -252,6 +252,10 @@ ISSUED_EVENT = "QuizIssuedEvent"
 ANSWER_EVENT = "QuizAnswerEvent"
 QUESTION_EVENT = "QuizQuestionEvent"     # 후속 질문 (#19)
 TA_ANSWER_EVENT = "QuizTAAnswerEvent"    # 그 답변
+# GRADED_EVENT는 note_id(사용자·repo) 네임스페이스에 쌓여 여러 회차가 공유한다 — 그래서
+# "어느 회차가" 채점됐는지 특정하지 못한다. 회차 자신의 execution_id(QUIZ-*)에 남기는
+# 이 이벤트만이 "이 회차가 채점됐다"를 안전하게 뜻한다 (#19, 리뷰 2026-08-24).
+ROUND_GRADED_EVENT = "QuizRoundGradedEvent"
 
 
 def note_id(user: str, repo: str) -> str:

@@ -16,7 +16,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from .quiz import (ANSWER_EVENT, GRADED_EVENT, ISSUED_EVENT, QUESTION_EVENT,
+from .quiz import (ANSWER_EVENT, ISSUED_EVENT, QUESTION_EVENT, ROUND_GRADED_EVENT,
                    TA_ANSWER_EVENT, NoteUnavailable, Question, Scorecard,
                    from_raw, grade, note_id, open_misses, record_scorecard, to_raw)
 from .report.quiz_report import render_quiz_report
@@ -361,8 +361,11 @@ class TutorHandler:
             await say(text=TA_FAIL.format(reason=e), thread_ts=thread_ts)
             return
         sess.ta_session_id, sess.ta_provider = res.session_id, res.provider
-        # **기록이 먼저다.** 기록에 실패했는데 답이 나가면, 사용자는 답을 봤는데 우리는
-        # 무엇을 답했는지 모르는 상태가 된다 (lessons C7).
+        # **기록이 먼저다.** 기록에 실패했는데 답을 보이면, 사용자는 답을 봤는데 우리는
+        # 무엇을 답했는지 모르는 상태가 된다 (lessons C7) — 그래서 기록이 실패하면
+        # `on_answer`와 같은 원칙으로 답을 보이지 않고 실패를 알린다. 세션(ta_session_id)은
+        # 이미 실제로 열렸으므로 되돌리지 않는다 — 같은 질문을 다시 물으면 그 세션을
+        # 이어서 쓴다.
         try:
             self.orch.trace.append(QUESTION_EVENT, task_id=round_id(thread_ts),
                                    execution_id=round_id(thread_ts),
@@ -373,8 +376,10 @@ class TutorHandler:
                 payload={"answer": res.text, "dropped": res.dropped,
                          "citations": [{"path": c.path, "start_line": c.start_line,
                                         "end_line": c.end_line} for c in res.citations]})
-        except Exception:
-            pass          # 기록 실패가 답변을 막지는 않는다 — 답은 이미 만들어졌다
+        except Exception as e:
+            await say(text=f"💥 답변 기록에 실패했습니다: {type(e).__name__}. "
+                           "같은 질문을 다시 물어봐 주세요.", thread_ts=thread_ts)
+            return
         await say(text=res.text, thread_ts=thread_ts)
 
     # ── 회차 ────────────────────────────────────────────────────────────────
@@ -472,6 +477,16 @@ class TutorHandler:
                 regrade_blocks())
             return
         sess.done = True
+        # 회차 자신의 execution_id에도 채점 완료를 남긴다 — `_resume`이 "이 회차가"
+        # 채점됐는지 판정할 유일하게 안전한 근거다(위 GRADED_EVENT는 note_id 네임스페이스
+        # 라 회차를 특정 못 한다). 기록이 실패해도 채점 자체(record_scorecard)는 이미
+        # 끝났으니 여기서 되돌리지 않는다 — 다만 이 마커가 없으면 다음 재시작 때
+        # fail-closed로 done=False가 되어 다시 완주해야 한다(안전한 실패 방향).
+        try:
+            self.orch.trace.append(ROUND_GRADED_EVENT, task_id=round_id(sess.thread_ts),
+                                   execution_id=round_id(sess.thread_ts), payload={})
+        except Exception:
+            pass
         url = None
         try:
             html = render_quiz_report(card, repo=sess.repo_name, added=added,
@@ -524,20 +539,21 @@ class TutorHandler:
                            repo_name=payload.get("repo_name", ""),
                            questions=questions, answers=answers,
                            started_at=last["ts"])
-        # 채점 이벤트가 있으면 끝난 회차다. 이걸 복원하지 않으면 재시작 뒤에는
+        # ROUND_GRADED_EVENT가 있으면 끝난 회차다. 이걸 복원하지 않으면 재시작 뒤에는
         # 채점이 끝난 스레드가 "진행 중"으로 보여 후속 질문이 거절된다.
-        # GRADED_EVENT는 이 회차의 execution_id(QUIZ-*)가 아니라 오답 노트의
-        # execution_id(note_id: 사용자·repo 단위)에 쌓인다 — record_scorecard가
-        # 거기에 적기 때문이다. id는 이벤트 테이블 전체에서 단조 증가하므로,
-        # 네임스페이스가 달라도 "이 회차가 출제된 뒤에 채점 이벤트가 있었는가"는
-        # id 비교로 그대로 판정할 수 있다.
-        try:
-            graded = self.orch.trace.events(
-                execution_id=note_id(sess.owner, sess.repo_name))
-        except Exception:
-            graded = []
-        sess.done = any(e["id"] > last["id"] and e["event_type"] == GRADED_EVENT
-                        for e in graded)
+        #
+        # GRADED_EVENT(오답 노트)로 판정하면 안 된다 — 그건 note_id(사용자·repo)
+        # 네임스페이스라 여러 회차가 공유한다. "이 회차를 방치하고 같은 repo로 새
+        # 회차를 채점"하면 그 GRADED_EVENT가 방치한 회차까지 끝난 것으로 보이게
+        # 만들어, 아직 풀지 않은 문항의 정답·해설이 새는 정답 유출이 된다 (실제
+        # 재현됨: 리뷰 2026-08-24). evs는 이미 이 회차의 execution_id(QUIZ-*)로
+        # 스코프돼 있으므로 여기서 찾는 ROUND_GRADED_EVENT는 이 회차만 가리킨다.
+        #
+        # 이 변경 이전에 채점된 회차는 ROUND_GRADED_EVENT가 없어 done=False로
+        # 복원된다 — fail-closed다. 다시 완주해야 후속 질문을 받을 수 있지만,
+        # 그게 안전한 실패 방향이다.
+        sess.done = any(e["id"] > last["id"] and e["event_type"] == ROUND_GRADED_EVENT
+                        for e in evs)
         self.sessions[thread_ts] = sess
         return sess
 
