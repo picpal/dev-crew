@@ -9,9 +9,12 @@
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 from .quiz import Evidence, Question, verify_evidence
+from .schema import Role
+from .untrusted import NOTE, fence
 
 ANSWER_LIMIT = 2000       # Slack 본문 상한보다 넉넉히 아래. 프롬프트에도 같은 값을 적었다
 LETTERS = "ABCDEFGH"
@@ -82,3 +85,75 @@ def clean_answer(text: str, citations: list[Evidence],
     if dropped:
         body += DROPPED_NOTE.format(n=len(dropped))
     return body, kept, len(dropped)
+
+
+# 세션 **하나의 전체 예산**이다 — 첫 turn(repo 읽기)과 답변 turn을 합쳐 이 시간을
+# 넘기면 실패로 접는다. 출제(600s)보다 짧게 잡는다: 대화는 리듬이 중요하고, 여기서
+# 오래 매달리면 스레드 lock을 쥔 채 다음 질문까지 막는다.
+TURN_TIMEOUT = 300.0
+
+INTRO = ("아래는 학습자가 방금 푼 회차다. " + NOTE + "\n{context}\n"
+         "이제 이 학습자의 후속 질문에 답한다. 회차의 해설을 되풀이하지 말고, "
+         "필요하면 repo를 직접 읽어 막힌 지점을 풀어라.\n")
+ASK = ("학습자의 질문이다. " + NOTE + "\n{question}\n"
+       "스키마대로 답을 제출해라.\n")
+
+
+class TutorTAError(Exception):
+    """답변을 만들지 못했다. 사유는 메시지에 있고, 그대로 스레드에 표시된다."""
+
+
+@dataclass
+class Answer:
+    session_id: str
+    text: str
+    citations: list[Evidence]
+    dropped: int = 0
+    provider: object | None = None
+
+
+async def _open(orch, cfg, *, exec_id: str, repo_path: str, context: str, first: str):
+    """세션을 열고 첫 질문까지 한 코루틴에서 끝낸다 — 상한이 전 구간을 덮게 한다."""
+    tier = cfg.role_defaults[Role.TUTOR_TA].tier
+    inst = await orch.spawn(Role.TUTOR_TA, tier, execution_id=exec_id,
+                            node_id="followup", task_scope="회차 후속 질문 답변",
+                            worktree=repo_path)
+    sid = await orch.start_worker(inst, INTRO.format(context=context),
+                                  conversational=True)
+    out = await orch.adapters[inst.provider].send(sid, first)
+    return sid, inst.provider, out
+
+
+async def ask(orch, cfg, *, exec_id: str, repo_path: str, question: str,
+              session_id: str | None, context: str | None,
+              provider=None) -> Answer:
+    """질문 하나에 답한다. 세션이 없으면 열고, 있으면 그 세션의 다음 turn으로 보낸다.
+
+    `context`는 세션을 새로 열 때만 쓴다 — 이미 열린 세션은 회차를 이미 알고 있다.
+
+    상한은 `spawn` 이후 **전 구간**을 감싼다. 실제 작업(repo 읽기)은 `start_worker` 안의
+    첫 turn에서 일어나므로 `send`에만 걸면 정작 매달리는 쪽이 무방비다 (lessons C14).
+    """
+    fenced = ASK.format(question=fence("question", question))
+
+    async def _turn():
+        if session_id:
+            return session_id, provider, await orch.adapters[provider].send(session_id, fenced)
+        return await _open(orch, cfg, exec_id=exec_id, repo_path=repo_path,
+                           context=context or "", first=fenced)
+
+    try:
+        sid, prov, out = await asyncio.wait_for(_turn(), timeout=TURN_TIMEOUT)
+    except asyncio.TimeoutError as e:
+        raise TutorTAError("TimeoutError") from e
+    except Exception as e:
+        raise TutorTAError(f"{type(e).__name__}: {e}") from e
+
+    raw = out.structured if isinstance(out.structured, dict) else {}
+    body = (raw.get("answer") or "").strip()
+    if not body:
+        raise TutorTAError("빈 답변")
+    text, kept, dropped = clean_answer(body, parse_citations(raw.get("citations")),
+                                       repo_path)
+    return Answer(session_id=sid, text=text, citations=kept, dropped=dropped,
+                  provider=prov)
