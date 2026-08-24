@@ -13,6 +13,7 @@ JS 제어(스크럽·배속)는 나중에 얹는 progressive enhancement이고, 
 from __future__ import annotations
 
 import html as _html
+import re
 
 from .quiz_report import TOKENS
 
@@ -23,6 +24,39 @@ LEAD_ROWS = 8              # 활성 줄을 창의 이 위치쯤에 둔다
 
 def _e(v) -> str:
     return _html.escape(str(v), quote=True)
+
+
+_CODE_RE = re.compile(r"`([^`\n]+)`")
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
+# 모델이 별 하나로 쓰는 경우도 받는다. `**이중**`은 앞뒤 lookaround로 건드리지 않는다.
+_SINGLE_BOLD_RE = re.compile(r"(?<![*\w])\*([^*\n]+)\*(?![*\w])")
+_SENT_RE = re.compile(r"(?<=[.!?다])\s+")
+
+
+def _md(v) -> str:
+    """모델이 쓴 인라인 마크다운만 살린다 — **escape가 먼저다.**
+
+    순서가 뒤집히면 모델 출력이 태그가 되는 주입 경로가 열린다. 여기서 여는 태그는
+    우리가 쓴 두 종류(code·strong)뿐이다. 안 바꾸면 `**굵게**`와 백틱이 날문자로 찍힌다
+    (사용자 2026-08-25).
+    """
+    out = _CODE_RE.sub(r"<code>\1</code>", _e(v))
+    out = _BOLD_RE.sub(r"<strong>\1</strong>", out)
+    return _SINGLE_BOLD_RE.sub(r"<strong>\1</strong>", out)
+
+
+def _lead(text: str, limit: int = 140) -> tuple[str, str]:
+    """(첫 문장, 나머지). 상단 설명이 벽이면 아무도 안 읽는다 — 첫 문장만 펴 둔다."""
+    body = (text or "").strip()
+    if len(body) <= limit:
+        return body, ""
+    head = _SENT_RE.split(body, maxsplit=1)
+    if len(head) == 2 and len(head[0]) <= limit * 2:
+        return head[0], head[1]
+    # 쓸 만한 문장 경계가 없으면 **접힌 쪽에 전문을 둔다**(앞부분이 겹친다). 글자 수로
+    # 자르면 `**굵게**`나 백틱 한가운데가 잘려 두 조각 모두 마크다운이 깨진다 —
+    # 조금 겹치는 편이 깨지는 것보다 낫다.
+    return body[:limit].rstrip() + "…", body
 
 
 def _scroll_row(row: int, total: int) -> int:
@@ -56,68 +90,91 @@ _CSS = TOKENS + """
 body{margin:0;background:var(--plane);color:var(--ink-1);
   font:15px/1.6 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",Pretendard,
   "Segoe UI",Roboto,sans-serif}
-.page{max-width:1180px;margin:0 auto;padding:28px 20px 56px}
-.masthead{margin:0 0 18px}
-.eyebrow{margin:0;font-size:.76rem;letter-spacing:.08em;text-transform:uppercase;
+.page{max-width:1240px;margin:0 auto;padding:26px 20px 56px}
+.eyebrow{margin:0;font-size:.74rem;letter-spacing:.08em;text-transform:uppercase;
   color:var(--ink-3)}
-h1{margin:.25em 0 .2em;font-size:1.5rem;line-height:1.3}
-.where{margin:0;color:var(--ink-3);font-size:.88rem}
-.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;
-  padding:16px 18px;margin:0 0 16px;box-shadow:var(--shadow)}
-.role p{margin:0}
-.q{margin:0;color:var(--ink-2);font-size:.92rem}
-.note{margin:10px 0 0;font-size:.84rem;color:var(--ink-3)}
+h1{margin:.25em 0 .18em;font-size:1.38rem;line-height:1.32}
+.where{margin:0 0 14px;color:var(--ink-3);font-size:.82rem;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
+.q{margin:0 0 14px;padding:9px 13px;border-left:3px solid var(--line-strong);
+  background:var(--surface);border-radius:0 8px 8px 0;font-size:.9rem;color:var(--ink-2)}
+.q b{color:var(--ink-3);font-weight:600;font-size:.78rem;letter-spacing:.04em}
 
-/* ── 재생 제어 (라디오는 :checked ~ 를 쓰려고 .stage 앞에 둔다) ───────────── */
-.rt{position:absolute;opacity:0;pointer-events:none;width:0;height:0}
-.bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 14px}
-.bar .hint{font-size:.82rem;color:var(--ink-3);margin-right:6px}
-.dot{display:inline-flex;align-items:center;justify-content:center;min-width:26px;
-  height:26px;padding:0 7px;border:1px solid var(--line);border-radius:7px;
-  background:var(--surface);color:var(--ink-2);font-size:.78rem;cursor:pointer;
-  font-variant-numeric:tabular-nums}
-.dot:hover{border-color:var(--line-strong)}
+/* 상단 역할 설명 — 첫 문장만 펴 두고 나머지는 접는다 (벽이면 아무도 안 읽는다) */
+.role{margin:0 0 14px;background:var(--surface);border:1px solid var(--line);
+  border-radius:10px;padding:12px 15px;font-size:.92rem;line-height:1.7}
+.role>summary{cursor:pointer;list-style:none;color:var(--ink-1)}
+.role>summary::-webkit-details-marker{display:none}
+.role>summary::after{content:" 더 보기";color:var(--ink-3);font-size:.8rem;
+  white-space:nowrap}
+.role[open]>summary::after{content:" 접기"}
+.role .rest{margin:.55em 0 0;color:var(--ink-2)}
+.role.is-short>summary::after{content:""}
+.role code,.st-why code,.q code{font:.86em ui-monospace,SFMono-Regular,Menlo,monospace;
+  background:var(--code);padding:.1em .35em;border-radius:4px}
+
+/* ── 안내 + 재생 (라디오는 :checked ~ 를 쓰려고 .stage 앞에 둔다) ─────────── */
+.rt,.auto{position:absolute;opacity:0;pointer-events:none;width:0;height:0}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 12px;
+  font-size:.84rem;color:var(--ink-3)}
+.bar .replay{display:inline-flex;align-items:center;gap:5px;padding:5px 11px;
+  border:1px solid var(--line);border-radius:7px;background:var(--surface);
+  color:var(--ink-2);cursor:pointer}
+.bar .replay:hover{border-color:var(--line-strong);color:var(--ink-1)}
 
 /* ── 무대 ────────────────────────────────────────────────────────────────── */
-.stage{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:16px;
+.stage{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);gap:16px;
   align-items:start}
-@media (max-width:860px){.stage{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:900px){.stage{grid-template-columns:minmax(0,1fr)}}
 
-.code{--lh:1.55rem;position:relative;overflow:hidden;background:var(--surface);
+.code{--lh:1.55rem;position:relative;overflow:auto;background:var(--surface);
   border:1px solid var(--line);border-radius:12px;padding:14px 0;
   max-height:calc(24*var(--lh) + 28px)}
-.track{position:relative;animation:none}
-.row{display:grid;grid-template-columns:3.6rem 1fr;height:var(--lh);align-items:center;
+.track{position:relative;min-width:max-content;transition:transform .22s ease}
+.row{display:grid;grid-template-columns:3.4rem 1fr;height:var(--lh);align-items:center;
   font:.82rem/var(--lh) ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  white-space:pre;position:relative;z-index:1}
+  white-space:pre;position:relative;z-index:1;margin:0}
 .no{color:var(--ink-3);text-align:right;padding-right:.9rem;user-select:none;
   font-variant-numeric:tabular-nums}
-.src{padding-right:1rem;overflow-x:auto;color:var(--ink-1)}
+.src{padding-right:1.4rem;color:var(--ink-1)}
+/* 스텝이 있는 줄만 누를 수 있다 — 눌러도 아무 일 없는 것을 눌러 보이게 하지 않는다 */
+.is-step{cursor:pointer}
+.is-step .no{color:var(--good);font-weight:600}
+.is-step:hover{background:color-mix(in srgb,var(--good) 8%,transparent)}
 .hl{position:absolute;left:0;right:0;height:var(--lh);z-index:0;opacity:0;
   background:color-mix(in srgb,var(--good) 16%,transparent);
   border-left:3px solid var(--good)}
 
-.side{display:grid}
+.side{display:grid;position:sticky;top:16px}
 .step{grid-area:1/1;opacity:0;background:var(--surface);border:1px solid var(--line);
   border-radius:12px;padding:16px 18px;box-shadow:var(--shadow)}
 .st-head{display:flex;gap:10px;align-items:baseline;margin:0 0 10px}
 .st-n{font-size:.78rem;color:var(--ink-3);font-variant-numeric:tabular-nums}
 .st-line{margin-left:auto;font:.78rem ui-monospace,Menlo,monospace;color:var(--ink-3)}
-.st-why{margin:0 0 14px;font-size:.98rem;line-height:1.65}
+.st-why{margin:0 0 14px;font-size:.97rem;line-height:1.7}
+.visits{margin:0 0 12px;font-size:.79rem;color:var(--ink-3);display:flex;
+  flex-wrap:wrap;gap:6px;align-items:center}
+.visits label{cursor:pointer;padding:1px 7px;border:1px solid var(--line);
+  border-radius:5px;color:var(--ink-2)}
+.visits label:hover{border-color:var(--line-strong)}
+.visits .now{border-color:var(--good);color:var(--good)}
 .vars{display:grid;grid-template-columns:auto minmax(0,1fr);gap:4px 12px;margin:0;
   font:.83rem/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .vk{color:var(--ink-3)}
 .vv{color:var(--ink-1);overflow-wrap:anywhere}
 .is-changed .vk,.is-changed .vv{color:var(--good);font-weight:600}
-.is-changed .vv::after{content:" ←";opacity:.7}
+.is-changed .vv::after{content:" \2190";opacity:.7}
 .novars{margin:0;font-size:.84rem;color:var(--ink-3)}
+.note{margin:12px 0 0;font-size:.83rem;color:var(--ink-3)}
 """
 
 _AUTOPLAY = """
 .hl{animation:win var(--total) linear infinite;animation-delay:var(--at)}
 .step{animation:win var(--total) linear infinite;animation-delay:var(--at)}
 .track{animation:scroll var(--total) linear infinite}
-/* 손으로 한 칸이라도 누르면 자동 재생을 멈춘다 — 읽는 중에 화면이 넘어가면 안 된다 */
+/* 줄을 하나라도 누르면 자동 재생을 멈춘다 — 읽는 중에 화면이 넘어가면 안 된다.
+   '처음부터' 라디오는 `.rt`가 아니라서 여기 걸리지 않고, 같은 name 그룹이라 누르는
+   순간 스텝 선택이 풀려 애니메이션이 처음부터 다시 돈다. */
 body:has(.rt:checked) .hl,body:has(.rt:checked) .step,
 body:has(.rt:checked) .track{animation:none}
 """
@@ -130,41 +187,57 @@ def render_code_report(trace, *, question: str, repo: str | None = None) -> str:
     lines = list(trace.lines)
     first = lines[0].number if lines else 1
     rows = [s.line - first for s in steps]
-    total = f"{n * STEP_SECONDS}s"
+    # 같은 줄을 여러 번 지나는 경우(루프)를 미리 모은다 — 라벨 하나로는 한 회차밖에
+    # 못 가리키므로, 패널에서 다른 회차로 건너뛸 수 있게 해야 한다.
+    visits: dict[int, list[int]] = {}
+    for i, st in enumerate(steps):
+        visits.setdefault(st.line, []).append(i)
 
-    code_rows = "".join(
-        f'<div class="row"><span class="no">{ln.number}</span>'
-        f'<span class="src">{_e(ln.text) or "&nbsp;"}</span></div>' for ln in lines)
+    code_rows = []
+    for ln in lines:
+        src = f'<span class="no">{ln.number}</span><span class="src">{_e(ln.text) or "&nbsp;"}</span>'
+        idxs = visits.get(ln.number)
+        if idxs:
+            code_rows.append(f'<label class="row is-step" for="st{idxs[0]}">{src}</label>')
+        else:
+            code_rows.append(f'<div class="row">{src}</div>')
     hls = "".join(
         f'<div class="hl hl{i}" style="--at:{i * STEP_SECONDS}s;'
         f'top:calc({r}*var(--lh))"></div>' for i, r in enumerate(rows))
 
     panels = []
-    for i, s in enumerate(steps):
-        if s.vars:
+    for i, st in enumerate(steps):
+        if st.vars:
             body = '<dl class="vars">' + "".join(
-                f'<div class="v{" is-changed" if v.changed else ""}" '
-                f'style="display:contents">'
+                f'<div class="v{" is-changed" if v.changed else ""}" style="display:contents">'
                 f'<dt class="vk">{_e(v.name)}</dt><dd class="vv">{_e(v.value)}</dd></div>'
-                for v in s.vars) + "</dl>"
+                for v in st.vars) + "</dl>"
         else:
             body = '<p class="novars">이 스텝에서는 상태가 바뀌지 않습니다.</p>'
+        same = visits.get(st.line, [])
+        jump = ""
+        if len(same) > 1:
+            chips = "".join(
+                f'<label class="{"now" if j == i else ""}" for="st{j}">{k + 1}회차</label>'
+                for k, j in enumerate(same))
+            jump = (f'<p class="visits">이 줄은 {len(same)}번 지나갑니다{chips}</p>')
         panels.append(
             f'<section class="step st{i}" style="--at:{i * STEP_SECONDS}s">'
             f'<div class="st-head"><span class="st-n">step {i + 1} / {n}</span>'
-            f'<span class="st-line">L{s.line}</span></div>'
-            f'<p class="st-why">{_e(s.reason)}</p>{body}</section>')
+            f'<span class="st-line">L{st.line}</span></div>'
+            f'<p class="st-why">{_md(st.reason)}</p>{jump}{body}</section>')
 
     radios = "".join(f'<input class="rt" type="radio" name="st" id="st{i}">'
                      for i in range(n))
-    dots = "".join(f'<label class="dot" for="st{i}">{i + 1}</label>' for i in range(n))
-    # 수동 선택 시 그 스텝만 켜고 코드도 그 줄로 옮긴다 (자동 재생은 위에서 꺼진다).
-    # 짚는 자리는 **명시 클래스**로 한다 — `nth-of-type`은 태그 기준이라 같은 태그가
-    # 섞이는 순간 엉뚱한 것을 가리킨다.
     manual = "".join(
         f'#st{i}:checked~.stage .st{i},#st{i}:checked~.stage .hl{i}{{opacity:1}}'
         f'#st{i}:checked~.stage .track{{transform:translateY(calc(-1*'
         f'{_scroll_row(rows[i], len(lines))}*var(--lh)))}}' for i in range(n))
+
+    lead, rest = _lead(trace.role_of_code)
+    more = f'<p class="rest">{_md(rest)}</p>' if rest else ""
+    role = (f'<details class="role{"" if rest else " is-short"}">'
+            f'<summary>{_md(lead)}</summary>{more}</details>')
     dropped = (f'<p class="note">스텝 {trace.dropped}건은 표시 범위 밖을 가리켜 '
                f'제외했습니다.</p>' if trace.dropped else "")
     where = " · ".join(x for x in (_e(repo) if repo else "", _e(trace.path)) if x)
@@ -175,22 +248,20 @@ def render_code_report(trace, *, question: str, repo: str | None = None) -> str:
 <meta name="color-scheme" content="light dark">
 <title>{_e(trace.title)}</title>
 <style>{_CSS}{_keyframes(n, rows, len(lines))}{_AUTOPLAY}{manual}
-.stage{{--total:{total}}}</style></head><body>
+.stage{{--total:{n * STEP_SECONDS}s}}</style></head><body>
 <main class="page">
-<header class="masthead">
-  <p class="eyebrow">dev-crew · 코드 실행 리포트</p>
-  <h1>{_e(trace.title)}</h1>
-  <p class="where">{where}</p>
-</header>
-<section class="card role">
-  <p>{_e(trace.role_of_code)}</p>
-  <p class="note">질문: {_e(question)}</p>
-</section>
+<p class="eyebrow">dev-crew · 코드 실행 리포트</p>
+<h1>{_e(trace.title)}</h1>
+<p class="where">{where}</p>
+<p class="q"><b>질문</b><br>{_md(question)}</p>
+{role}
+<input class="auto" type="radio" name="st" id="stAuto">
 {radios}
-<div class="bar"><span class="hint">{STEP_SECONDS}초마다 한 칸 · 번호를 누르면 멈추고
-그 스텝으로 (다시 재생하려면 새로고침)</span>{dots}</div>
+<div class="bar"><label class="replay" for="stAuto">▶ 처음부터</label>
+<span>{STEP_SECONDS}초마다 한 칸씩 넘어갑니다 · 초록색 줄번호를 누르면 그 줄의 설명이
+뜹니다</span></div>
 <div class="stage">
-  <div class="code"><div class="track">{hls}{code_rows}</div></div>
+  <div class="code"><div class="track">{hls}{"".join(code_rows)}</div></div>
   <div class="side">{"".join(panels)}</div>
 </div>
 {dropped}
