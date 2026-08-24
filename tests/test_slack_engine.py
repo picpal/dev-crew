@@ -771,10 +771,14 @@ def test_plain_checkout_has_a_single_candidate(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_tutor_say_broadcasts_to_the_channel():
-    """스레드 답글은 어느 클라이언트에서도 채널 피드에 뜨지 않는다. 데스크톱은 멘션
-    직후 스레드 패널이 열려 있어 보였을 뿐이고, 모바일에는 그 패널이 없어 회차 전체가
-    보이지 않았다 (2026-08-24). 회차 키는 여전히 thread_ts다 — 게시 위치만 넓힌다."""
+async def test_tutor_say_keeps_everything_inside_the_thread():
+    """회차는 **스레드 안에서만** 돈다 — 채널 피드로 새어 나가지 않는다.
+
+    한때 `reply_broadcast`로 채널에도 함께 게시했다. 모바일에서 회차가 안 보인다는 진단
+    때문이었는데, 실제로는 스레드 답글은 PC·모바일 모두 스레드 안에서 정상적으로 보인다 —
+    broadcast가 바꾸는 것은 "스레드를 열지 않아도 보이느냐" 하나뿐이었다. 그 한 탭의
+    대가로 **정답과 해설이 채널 전체에 게시**됐다 (2026-08-24 최종 리뷰 I7). 회차를 아직
+    풀지 않은 사람에게는 스포일러다."""
     from devcrew.slack_engine import make_tutor_say
 
     class Client:
@@ -791,7 +795,7 @@ async def test_tutor_say_broadcasts_to_the_channel():
     await say(text="문항", blocks=[{"x": 1}])
     kw = client.calls[0]
     assert kw["channel"] == "C1" and kw["thread_ts"] == "100.1"
-    assert kw["reply_broadcast"] is True, "채널에도 게시하지 않으면 모바일에서 안 보인다"
+    assert not kw.get("reply_broadcast"), "채널 피드로 새면 정답·해설이 회차 밖으로 나간다"
     assert kw["blocks"] == [{"x": 1}]
 
     # 호출자가 스레드를 명시하면 그쪽을 따른다 (기본 thread는 폴백이다)
@@ -800,8 +804,8 @@ async def test_tutor_say_broadcasts_to_the_channel():
 
 
 @pytest.mark.asyncio
-async def test_tutor_say_never_broadcasts_without_a_thread():
-    """`reply_broadcast`는 스레드 답글에만 유효하다 — thread 없이 켜면 API가 거부한다."""
+async def test_tutor_say_never_broadcasts_at_all():
+    """스레드가 없을 때도 마찬가지다 — broadcast는 어느 경로에서도 켜지지 않는다."""
     from devcrew.slack_engine import make_tutor_say
 
     class Client:
@@ -814,7 +818,7 @@ async def test_tutor_say_never_broadcasts_without_a_thread():
 
     client = Client()
     await make_tutor_say(client, "C1", None)(text="스레드 없음")
-    assert client.calls[0]["reply_broadcast"] is False
+    assert not client.calls[0].get("reply_broadcast")
 
 
 @pytest.mark.asyncio

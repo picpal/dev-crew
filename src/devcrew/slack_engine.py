@@ -416,20 +416,20 @@ def slack_posters(brain_client, crew_client):
 
 
 def make_tutor_say(client, channel: str, thread):
-    """@tutor 응답 poster — 스레드에 달되 **채널에도 함께 게시한다**.
+    """@tutor 응답 poster — 회차는 **스레드 안에서만** 돈다.
 
-    스레드 답글은 어느 클라이언트에서도 채널 피드에 뜨지 않는다. 데스크톱은 멘션 직후
-    스레드 패널이 열린 채라 보였을 뿐이고, 모바일에는 그 패널이 없어 회차 전체가 통째로
-    보이지 않았다 (2026-08-24). 회차 상태의 키는 여전히 `thread_ts`이므로 이어 풀기·재개는
-    그대로다 — 게시 위치만 넓힌다.
+    한때 `reply_broadcast=True`로 채널에도 함께 게시했다. "모바일에서 회차가 안 보인다"는
+    진단 때문이었는데 그 진단이 반쪽이었다 — 스레드 답글은 PC든 모바일이든 스레드 안에서
+    정상적으로 보인다. broadcast가 바꾸는 것은 *스레드를 열지 않아도 보이느냐* 하나뿐이고,
+    그 한 탭의 대가로 **정답과 해설이 채널 전체에 게시**됐다. 후속 질문 답변에는 회차의
+    답안지가 그대로 들어 있으므로, 같은 채널에서 아직 그 repo를 풀지 않은 사람에게는
+    스포일러다 (2026-08-24 최종 리뷰 I7 → 사용자 결정으로 broadcast 철회).
 
-    `reply_broadcast`는 스레드 답글에만 유효하다. 스레드가 없으면 켜지 않는다.
+    모바일에서는 부모 메시지의 "N개의 답글"을 탭하거나 스레드 탭에서 본다.
     """
     async def say(*, text, thread_ts=None, blocks=None):
-        ts = thread_ts or thread
         return await client.chat_postMessage(
-            channel=channel, text=text, thread_ts=ts, blocks=blocks,
-            reply_broadcast=bool(ts))
+            channel=channel, text=text, thread_ts=thread_ts or thread, blocks=blocks)
     return say
 
 
@@ -471,9 +471,9 @@ _TUTOR_MENTION_PREFIX_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*")
 def make_tutor_question(tutor, client):
     """스레드 후속 질문 라우터 (#19). `message`와 `app_mention` 둘 다 여기로 모은다.
 
-    **봇 메시지와 subtype 붙은 메시지는 진입 전에 버린다.** tutor 응답은 채널에
-    `reply_broadcast`로 게시되고 그건 다시 `message` 이벤트로 돌아온다 — 거르지 않으면
-    봇이 자기 답변에 답하는 무한 루프가 된다.
+    **봇 메시지와 subtype 붙은 메시지는 진입 전에 버린다.** `message.channels` 구독은
+    스레드 답글도 배달하므로, 봇이 스레드에 단 답변이 그대로 `message` 이벤트로 되돌아온다
+    (broadcast를 껐어도 마찬가지다) — 거르지 않으면 봇이 자기 답변에 답하는 무한 루프가 된다.
 
     스레드 밖(최상위) 메시지도 버린다. 회차는 스레드 단위이므로 스레드가 없으면
     후속 질문일 수 없다.
