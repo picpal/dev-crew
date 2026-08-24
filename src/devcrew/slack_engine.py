@@ -749,6 +749,13 @@ async def _amain() -> None:
             await ack()
             await tutor_action(body)
 
+        @tutor_app.action("tutor_report")
+        async def on_tutor_report(ack):
+            # 리포트 버튼은 `url` 버튼이라 여는 일은 클라이언트가 한다. 그래도 Slack은
+            # interaction을 보내고, 3초 안에 응답이 없으면 사용자에게 경고를 띄운다 —
+            # 여기서 하는 일은 ack뿐이지만 없으면 성공 경로가 실패처럼 보인다.
+            await ack()
+
         tasks.append(AsyncSocketModeHandler(tutor_app, tutor_app_token).start_async())
         print("devcrew: @tutor 학습 앱 활성화")
 
