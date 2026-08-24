@@ -415,6 +415,24 @@ def slack_posters(brain_client, crew_client):
     return post_handoff, post_crew
 
 
+def make_tutor_say(client, channel: str, thread):
+    """@tutor 응답 poster — 스레드에 달되 **채널에도 함께 게시한다**.
+
+    스레드 답글은 어느 클라이언트에서도 채널 피드에 뜨지 않는다. 데스크톱은 멘션 직후
+    스레드 패널이 열린 채라 보였을 뿐이고, 모바일에는 그 패널이 없어 회차 전체가 통째로
+    보이지 않았다 (2026-08-24). 회차 상태의 키는 여전히 `thread_ts`이므로 이어 풀기·재개는
+    그대로다 — 게시 위치만 넓힌다.
+
+    `reply_broadcast`는 스레드 답글에만 유효하다. 스레드가 없으면 켜지 않는다.
+    """
+    async def say(*, text, thread_ts=None, blocks=None):
+        ts = thread_ts or thread
+        return await client.chat_postMessage(
+            channel=channel, text=text, thread_ts=ts, blocks=blocks,
+            reply_broadcast=bool(ts))
+    return say
+
+
 def make_tutor_action(tutor, client):
     """@tutor 버튼 클릭 핸들러. **클로저 밖**에 둔다 — `_amain` 안에 두면 배선이
     통째로 사라져도 테스트가 전부 초록이다 (lessons.md C1).
@@ -427,9 +445,7 @@ def make_tutor_action(tutor, client):
         thread = msg.get("thread_ts") or msg.get("ts")
         value = body["actions"][0]["value"]
 
-        async def say(*, text, thread_ts=None, blocks=None):
-            return await client.chat_postMessage(
-                channel=ch, text=text, thread_ts=thread_ts or thread, blocks=blocks)
+        say = make_tutor_say(client, ch, thread)
 
         async def strip():
             if ":" in value:
@@ -719,10 +735,9 @@ async def _amain() -> None:
 
         @tutor_app.event("app_mention")
         async def on_tutor_mention(body, say):
-            async def tsay(*, text, thread_ts=None, blocks=None):
-                return await tutor_app.client.chat_postMessage(
-                    channel=body["event"]["channel"], text=text,
-                    thread_ts=thread_ts, blocks=blocks)
+            ev = body["event"]
+            tsay = make_tutor_say(tutor_app.client, ev["channel"],
+                                  ev.get("thread_ts") or ev.get("ts"))
             await tutor.on_mention(body, tsay)
 
         @tutor_app.event("message")

@@ -768,3 +768,50 @@ def test_plain_checkout_has_a_single_candidate(tmp_path):
     from devcrew.slack_engine import env_candidates
     (tmp_path / ".git").mkdir()
     assert env_candidates(tmp_path) == [tmp_path / ".env"]
+
+
+@pytest.mark.asyncio
+async def test_tutor_say_broadcasts_to_the_channel():
+    """스레드 답글은 어느 클라이언트에서도 채널 피드에 뜨지 않는다. 데스크톱은 멘션
+    직후 스레드 패널이 열려 있어 보였을 뿐이고, 모바일에는 그 패널이 없어 회차 전체가
+    보이지 않았다 (2026-08-24). 회차 키는 여전히 thread_ts다 — 게시 위치만 넓힌다."""
+    from devcrew.slack_engine import make_tutor_say
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        async def chat_postMessage(self, **kw):
+            self.calls.append(kw)
+            return {"ts": "600.1"}
+
+    client = Client()
+    say = make_tutor_say(client, "C1", "100.1")
+
+    await say(text="문항", blocks=[{"x": 1}])
+    kw = client.calls[0]
+    assert kw["channel"] == "C1" and kw["thread_ts"] == "100.1"
+    assert kw["reply_broadcast"] is True, "채널에도 게시하지 않으면 모바일에서 안 보인다"
+    assert kw["blocks"] == [{"x": 1}]
+
+    # 호출자가 스레드를 명시하면 그쪽을 따른다 (기본 thread는 폴백이다)
+    await say(text="다른 스레드", thread_ts="200.2")
+    assert client.calls[1]["thread_ts"] == "200.2"
+
+
+@pytest.mark.asyncio
+async def test_tutor_say_never_broadcasts_without_a_thread():
+    """`reply_broadcast`는 스레드 답글에만 유효하다 — thread 없이 켜면 API가 거부한다."""
+    from devcrew.slack_engine import make_tutor_say
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        async def chat_postMessage(self, **kw):
+            self.calls.append(kw)
+            return {"ts": "600.1"}
+
+    client = Client()
+    await make_tutor_say(client, "C1", None)(text="스레드 없음")
+    assert client.calls[0]["reply_broadcast"] is False
