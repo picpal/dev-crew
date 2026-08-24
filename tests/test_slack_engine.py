@@ -914,3 +914,60 @@ async def test_mention_strips_the_bot_handle_from_the_question():
                    "thread_ts": "100.1", "ts": "100.9",
                    "channel": "C1", "user": "U-OWNER"}})
     assert h.calls[0]["text"] == "이거 왜 이래?"
+
+
+@pytest.mark.asyncio
+async def test_tutor_question_router_dedupes_same_message_across_event_types():
+    """Slack은 스레드 안 "@tutor 질문"을 app_mention과 message 두 이벤트로, 서로 다른
+    event_id로 보낸다. event_id로는 걸러지지 않으므로 메시지 자신의 (channel, ts)로
+    막아야 한다 — 안 그러면 같은 질문에 답이 두 번 나간다."""
+    from devcrew.slack_engine import make_tutor_question
+
+    class H:
+        def __init__(self):
+            self.calls = []
+
+        async def on_question(self, **kw):
+            self.calls.append(kw)
+
+    class Client:
+        async def chat_postMessage(self, **kw):
+            return {"ts": "1"}
+
+    h = H()
+    route = make_tutor_question(h, Client())
+
+    await route({"event_id": "Ev1", "event": {"type": "app_mention",
+                 "text": "<@U0BRV19AMLL> 이거 왜 이래?", "thread_ts": "100.1",
+                 "ts": "100.9", "channel": "C1", "user": "U-OWNER"}})
+    await route({"event_id": "Ev2", "event": {"type": "message",
+                 "text": "<@U0BRV19AMLL> 이거 왜 이래?", "thread_ts": "100.1",
+                 "ts": "100.9", "channel": "C1", "user": "U-OWNER"}})
+
+    assert len(h.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_mention_only_strips_leading_bot_handle_not_mentions_inside():
+    """`@tutor <@U999>가 왜 여기 나와?`처럼 질문 본문 안에 다른 사람 멘션이 있으면
+    그건 질문의 주어다 — 지워버리면 문장이 깨져 복구할 수 없다."""
+    from devcrew.slack_engine import make_tutor_question
+
+    class H:
+        def __init__(self):
+            self.calls = []
+
+        async def on_question(self, **kw):
+            self.calls.append(kw)
+
+    class Client:
+        async def chat_postMessage(self, **kw):
+            return {"ts": "1"}
+
+    h = H()
+    await make_tutor_question(h, Client())(
+        {"event": {"type": "app_mention",
+                   "text": "<@U0BRV19AMLL> <@U999>가 왜 여기 나와?",
+                   "thread_ts": "100.1", "ts": "100.9",
+                   "channel": "C1", "user": "U-OWNER"}})
+    assert h.calls[0]["text"] == "<@U999>가 왜 여기 나와?"

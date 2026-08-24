@@ -461,7 +461,11 @@ def make_tutor_action(tutor, client):
     return on_action
 
 
-_TUTOR_MENTION_RE = re.compile(r"<@[A-Z0-9]+>")
+# 문두의 "@tutor" 주소 지정 토큰 딱 하나만 지운다. `+`로 "한 개 이상"을 허용하면
+# "<@U0BRV19AMLL> <@U999>가 왜 여기 나와?"처럼 질문 본문이 멘션으로 시작할 때 그
+# 본문 멘션까지 선두로 취급해 같이 삼켜버린다 — `^`로 문자열 시작에 고정하되 토큰은
+# 정확히 하나만 매치해서 본문 중간(혹은 바로 뒤)의 다른 사람 멘션은 건드리지 않는다.
+_TUTOR_MENTION_PREFIX_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*")
 
 
 def make_tutor_question(tutor, client):
@@ -473,7 +477,17 @@ def make_tutor_question(tutor, client):
 
     스레드 밖(최상위) 메시지도 버린다. 회차는 스레드 단위이므로 스레드가 없으면
     후속 질문일 수 없다.
+
+    **스레드 안에서 `@tutor 질문`을 하면 Slack이 `app_mention`과 `message` 두 이벤트를
+    서로 다른 `event_id`로 각각 보낸다.** `TutorHandler._dedupe`는 `event_id`로 걸러
+    이 경우를 못 잡는다(애초에 이 라우터는 그걸 호출하지도 않는다) — 그래서 메시지
+    자신의 정체성인 `(channel, ts)`로 직접 막는다. `app_mention` 분기를 없애서 풀 수도
+    있어 보이지만, `docs/tutor-setup.md`가 현재 `app_mention` 구독만 안내하고 있어서
+    그 설정의 워크스페이스에는 그게 유일한 경로다 — 지우면 기능이 통째로 사라진다.
     """
+    seen: set[tuple[str, str]] = set()
+    max_seen = 1000
+
     async def route(body: dict) -> None:
         ev = body.get("event") or {}
         if ev.get("bot_id") or ev.get("subtype"):
@@ -481,7 +495,13 @@ def make_tutor_question(tutor, client):
         thread = ev.get("thread_ts")
         if not thread or thread == ev.get("ts"):
             return
-        text = _TUTOR_MENTION_RE.sub("", ev.get("text") or "").strip()
+        key = (ev.get("channel", ""), ev.get("ts", ""))
+        if key in seen:
+            return
+        if len(seen) >= max_seen:
+            seen.clear()
+        seen.add(key)
+        text = _TUTOR_MENTION_PREFIX_RE.sub("", ev.get("text") or "").strip()
         if not text:
             return
         ch = ev.get("channel", "")
