@@ -945,3 +945,65 @@ async def test_has_round_survives_a_restart(tmp_path, repo):
     h.sessions.clear()                                # 프로세스 재시작
     assert h.has_round("100.1") is True
     assert h.has_round("999.9") is False
+
+
+# --- Fix round 2 (2026-08-24): 축출 코드가 들여온 결함 두 건 ---
+
+
+def _plain_round(h, thread_ts):
+    """TA 세션이 없는 회차 — 진행 중이거나 아무도 질문하지 않은 스레드."""
+    from devcrew.slack_tutor import QuizSession
+    h.sessions[thread_ts] = QuizSession(channel="C1", thread_ts=thread_ts,
+                                        owner="U-X", repo_name="myrepo", questions=[])
+
+
+@pytest.mark.asyncio
+async def test_the_cap_counts_live_ta_sessions_not_every_round(tmp_path, repo):
+    """상한의 대상은 **살아 있는 워커**다. 분모를 `self.sessions`로 두면 TA 세션이
+    없는 회차(진행 중·아무도 안 물어본 스레드)까지 세는데 그 dict는 `_drop` 말고는
+    줄지 않는다 — 엔진이 회차 50개를 넘겨 본 뒤로는 조건이 영구히 참이 되어 매 답변마다
+    `live`가 바닥까지 비워지고, 후보가 방금 답한 회차뿐이면 그 회차가 죽는다.
+    누수는 아니지만 대화 연속성이 사라진다 — 이 기능의 존재 이유가 그것이다."""
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    for i in range(60):                       # TA 세션이 없는 회차 60개
+        _plain_round(h, f"8{i:02d}.1")
+    assert len(h.sessions) > st.MAX_TA_SESSIONS
+
+    await ask_once(h, say)
+    sid = h.sessions["100.1"].ta_session_id if "100.1" in h.sessions else None
+    assert sid, "방금 답한 회차가 자기 답변 뒤에 축출됐다"
+
+    await ask_once(h, say, text="그럼 그건?")
+    assert h.sessions["100.1"].ta_session_id == sid      # 같은 세션을 이어 쓴다
+    assert h.orch.adapters[Provider.CLAUDE_CODE].archived == []
+
+
+@pytest.mark.asyncio
+async def test_an_answer_survives_being_evicted_mid_turn(tmp_path, repo):
+    """`ta_busy`는 lock을 잡은 **뒤**에 세워진다. 게이트 통과부터 그 줄까지 사이에는
+    `_set_status`(운영에선 실제 네트워크 호출)와 lock 대기가 있고, 그동안 이 회차는
+    `live`에 남아 있다. 다른 스레드의 답변이 끝나며 `_evict_ta`를 돌리면 이 회차가
+    `_drop`될 수 있고, 그러면 답변은 `self.sessions`에 없는 객체 위에서 끝나 새로 연
+    세션의 손잡이가 아무 데도 남지 않는다 — C3가 없애려던 바로 그 상태다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    sess = h.sessions["100.1"]
+
+    async def evict_during_status(channel, thread_ts, text):
+        # 게이트와 ta_busy 사이의 창 — 다른 스레드의 답변이 끝나며 축출이 돈다
+        await h._drop(sess)
+
+    h.status = evict_during_status
+    await ask_once(h, say)
+
+    assert "100.1" in h.sessions, "답변이 끝난 회차가 sessions에 없다 — 손잡이 소실"
+    assert h.sessions["100.1"].ta_session_id
+    assert h.sessions["100.1"].ta_session_id == sess.ta_session_id

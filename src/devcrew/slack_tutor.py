@@ -408,6 +408,13 @@ class TutorHandler:
         sess.ta_session_id, sess.ta_provider = res.session_id, res.provider
         sess.ta_instance_id = res.instance_id
         sess.ta_touched = time.monotonic()
+        # `ta_busy`는 lock을 잡은 뒤에야 서므로, 게이트 통과부터 그 줄까지(`_set_status`
+        # 네트워크 호출 + lock 대기) 이 회차는 축출 후보로 남아 있다. 그 창에서 다른
+        # 스레드의 답변이 `_evict_ta`를 돌려 이 회차를 `_drop`했다면 지금 `sess`는
+        # sessions에서 떨어져 나온 객체다 — 그대로 두면 방금 연 세션의 손잡이가 아무
+        # 데도 남지 않는다. 다시 등록해 그 창을 닫는다. (그 사이 같은 스레드에 새
+        # 세션이 생겼다면 그쪽이 정본이므로 setdefault로 덮지 않는다.)
+        self.sessions.setdefault(thread_ts, sess)
         await self._evict_ta()
         # **기록이 먼저다.** 기록에 실패했는데 답을 보이면, 사용자는 답을 봤는데 우리는
         # 무엇을 답했는지 모르는 상태가 된다 (lessons C7) — 그래서 기록이 실패하면
@@ -609,7 +616,13 @@ class TutorHandler:
                 break                    # ta_touched 오름차순 — 뒤는 더 최근이다
             await self._drop(sess)
             live.remove(sess)
-        while len(self.sessions) > MAX_TA_SESSIONS and live:
+        # 분모는 `self.sessions`가 아니라 `live`다. 상한이 묶으려는 것은 살아 있는
+        # 워커이고, `self.sessions`에는 TA 세션이 없는 회차(진행 중·아무도 안 물어본
+        # 스레드)까지 들어 있는데 그 dict는 `_drop` 말고는 줄지 않는다 — 회차 50개를
+        # 넘겨 본 엔진에서는 조건이 영구히 참이 되어 매 답변마다 live가 바닥까지
+        # 비워지고, 후보가 방금 답한 회차뿐이면 그 회차가 죽는다. slack_brain에서
+        # 같은 코드가 옳은 이유는 거기 sessions에는 인터뷰 세션만 들어 있기 때문이다.
+        while len(live) > MAX_TA_SESSIONS:
             await self._drop(live.pop(0))
 
     async def _expire(self, thread_ts: str, say, sess: QuizSession | None = None) -> None:
