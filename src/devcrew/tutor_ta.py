@@ -22,7 +22,10 @@ TRUNCATED_NOTE = "\n\n_… 답변이 길어 잘렸습니다_"
 def _one(q: Question, idx: int, choice: int | None) -> str:
     ev = "\n".join(f"    - {e.path}:{e.start_line}-{e.end_line} — {e.quote}"
                    for e in q.evidence)
-    picked = "미응답" if choice is None else LETTERS[choice]
+    # 범위 밖 선택은 미응답으로 처리한다 — 보기 개수를 벗어나거나 음수면 실제 선택이
+    # 뭐든 렌더링할 수 없다. 범위로 조정하면 선택지 거짓말이 되므로 선택 불명만 표시한다.
+    valid_choice = choice is not None and 0 <= choice < len(q.options)
+    picked = "미응답" if not valid_choice else LETTERS[choice]
     mark = "오답" if choice != q.answer_index else "정답"
     opts = "\n".join(f"    {LETTERS[i]}) {o}" for i, o in enumerate(q.options))
     return (f"[{idx + 1}] ({mark}) 영역: {q.area}\n"

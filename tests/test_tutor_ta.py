@@ -82,3 +82,37 @@ def test_clean_answer_truncates_and_says_so(tmp_path):
     text, _, _ = clean_answer("가" * (ANSWER_LIMIT + 500), [], str(tmp_path))
     assert len(text) < ANSWER_LIMIT + 200
     assert "잘렸습니다" in text
+
+
+def test_round_context_treats_out_of_range_choice_as_unanswered():
+    """범위 밖 선택은 미응답으로 처리한다 — 거짓말 선택지를 렌더링하지 않는다."""
+    from devcrew.tutor_ta import round_context
+
+    # 보기는 0-3 (A-D)인데 99를 받으면
+    ctx = round_context([_q(0)], {0: 99}, repo_name="r")
+    assert "미응답" in ctx
+    # 존재하지 않는 선택지를 렌더링하지 않는다
+    assert "학습자 선택: " in ctx and "학습자 선택: E" not in ctx
+
+    # 음수도 마찬가지
+    ctx = round_context([_q(0)], {0: -1}, repo_name="r")
+    assert "미응답" in ctx
+
+
+def test_clean_answer_shows_disclosure_even_when_truncated(tmp_path):
+    """긴 본문 + 버린 인용이 함께 있을 때도 공개를 숨기지 않는다 (회귀 테스트).
+
+    잘림 처리 후 인용 공개를 붙여야 순서 흔들려도 메시지가 손실되지 않는다.
+    """
+    from devcrew.tutor_ta import ANSWER_LIMIT, clean_answer
+
+    (tmp_path / "a.py").write_text("line1\n")
+    real = Evidence(path="a.py", start_line=1, end_line=1, quote="line1")
+    fake = Evidence(path="a.py", start_line=1, end_line=1, quote="지어낸")
+
+    text, _, dropped = clean_answer("X" * (ANSWER_LIMIT + 100), [real, fake], str(tmp_path))
+
+    # 본문이 잘렸고
+    assert "잘렸습니다" in text
+    # 인용 공개도 있어야 한다 (dropped > 0이므로)
+    assert dropped == 1 and "대조에 실패" in text
