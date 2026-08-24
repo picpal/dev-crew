@@ -136,3 +136,20 @@ def test_tutor_ta_has_tier_and_budget():
     cfg = load()
     assert cfg.role_defaults[Role.TUTOR_TA].tier == "DEFAULT"
     assert cfg.loop_policy.role_budgets["TUTOR_TA"] > 0
+
+
+def test_every_bundle_dir_on_disk_is_in_orchestrator_bundled_roles():
+    """roles/<name>/ 디렉토리를 만들고 BUNDLED_ROLES에 등록하는 걸 잊으면
+    spawn()이 role_bundle_version을 안 찍고, start_worker()가 버전 불일치로
+    RoleBundleError를 던진다 (orchestrator.py spawn/start_worker) — role을
+    하나 추가할 때마다 이 테이블도 손으로 갱신해야 하므로, 하드코딩된 role
+    목록이 아니라 실제 디스크의 bundle 디렉토리를 기준으로 검사한다."""
+    from devcrew.orchestrator import BUNDLED_ROLES
+    from devcrew.roles import ROLES_DIR
+    from devcrew.schema import Role
+
+    by_dir_name = {r.value.lower(): r for r in Role}
+    dirs_on_disk = {p.name for p in ROLES_DIR.iterdir() if p.is_dir()}
+    roles_with_bundles = {by_dir_name[name] for name in dirs_on_disk if name in by_dir_name}
+    missing = roles_with_bundles - BUNDLED_ROLES
+    assert not missing, f"roles/ 번들은 있는데 BUNDLED_ROLES에 없는 role: {missing}"
