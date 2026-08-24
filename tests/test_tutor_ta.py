@@ -265,7 +265,6 @@ class HangingSend(Scripted):
 
     def __init__(self, outs):
         super().__init__(outs)
-        self.archived: list[str] = []
         self.started_sid: str | None = None
 
     async def start_session(self, inst, initial_message, **kw):
@@ -274,10 +273,6 @@ class HangingSend(Scripted):
 
     async def send(self, session_id, message):
         await asyncio.sleep(3600)
-
-    async def archive(self, session_id):
-        self.archived.append(session_id)
-        return await super().archive(session_id)
 
 
 @pytest.mark.asyncio
@@ -344,3 +339,71 @@ async def test_unknown_session_without_context_raises_a_clear_error(tmp_path):
     # ("다시 시작") 확인해야 raw KeyError 노출과 구분된다.
     assert "다시 시작" in str(ei.value)
     assert a.starts == 0
+
+
+# --- 최종 리뷰 fix (2026-08-24): _open 성공 이후의 실패도 세션을 회수한다 (C2) ---
+
+
+class EmptyAnswer(Scripted):
+    """세션은 정상적으로 열리는데 모델이 빈 `answer`를 낸다 — `_open`의 가드 **밖**이다."""
+
+    def __init__(self):
+        super().__init__([{"status": "PASS", "summary": "s", "answer": "",
+                           "citations": []}])
+
+
+@pytest.mark.asyncio
+async def test_failure_after_the_session_opened_still_reclaims_it(tmp_path):
+    """`_open`이 성공한 뒤에 raise하면 sid는 `ask`의 지역 변수로만 존재한다 — 호출자는
+    손잡이를 못 받고, 그 워커를 가리키는 것이 프로그램 어디에도 남지 않는다.
+    질문 1건 = 고아 워커 1개가 기본 동작이 됐던 자리다 (최종 리뷰 C2)."""
+    from devcrew.tutor_ta import TutorTAError, ask
+
+    a = EmptyAnswer()
+    orch = _orch(tmp_path, a)
+    with pytest.raises(TutorTAError, match="빈 답변"):
+        await ask(orch, load_config(), exec_id="QUIZ-1", repo_path=str(tmp_path),
+                  question="왜?", session_id=None, context="회차 맥락")
+
+    assert a.archived == list(a.turns)          # 열린 세션이 그대로 반납됐다
+    assert orch.registry.active() == []         # registry 행도 남지 않는다
+
+
+@pytest.mark.asyncio
+async def test_reuse_path_failure_keeps_the_callers_session(tmp_path):
+    """재사용 경로의 실패는 회수하지 않는다 — 그 세션의 손잡이는 이미 호출자가 들고
+    있어 고아가 아니다. 여기서 archive하면 학습자가 다음 질문에 쓸 세션을 말없이
+    죽이는 것이 된다."""
+    from devcrew.tutor_ta import TutorTAError, ask
+
+    a = Scripted([_out("첫 답"), {"status": "PASS", "summary": "s", "answer": "",
+                                  "citations": []}])
+    orch, cfg = _orch(tmp_path, a), load_config()
+    first = await ask(orch, cfg, exec_id="QUIZ-1", repo_path=str(tmp_path),
+                      question="왜?", session_id=None, context="회차 맥락")
+    a.archived.clear()
+    with pytest.raises(TutorTAError, match="빈 답변"):
+        await ask(orch, cfg, exec_id="QUIZ-1", repo_path=str(tmp_path),
+                  question="그럼?", session_id=first.session_id, context=None,
+                  provider=first.provider, instance_id=first.instance_id)
+    assert a.archived == []
+
+
+@pytest.mark.asyncio
+async def test_answer_carries_the_instance_handle_for_reclamation(tmp_path):
+    """`registry.finish`는 instance_id로만 할 수 있다 — session_id·provider만으로는
+    회차가 끝난 뒤 그 행을 지울 방법이 없다."""
+    from devcrew.tutor_ta import ask
+
+    a = Scripted([_out("답"), _out("둘째 답")])
+    orch, cfg = _orch(tmp_path, a), load_config()
+    first = await ask(orch, cfg, exec_id="QUIZ-1", repo_path=str(tmp_path),
+                      question="왜?", session_id=None, context="회차 맥락")
+    assert first.instance_id
+    assert any(r["instance_id"] == first.instance_id for r in orch.registry.active())
+
+    # 재사용 경로는 새 instance를 만들지 않으므로 받은 손잡이를 그대로 돌려준다
+    second = await ask(orch, cfg, exec_id="QUIZ-1", repo_path=str(tmp_path),
+                       question="그럼?", session_id=first.session_id, context=None,
+                       provider=first.provider, instance_id=first.instance_id)
+    assert second.instance_id == first.instance_id

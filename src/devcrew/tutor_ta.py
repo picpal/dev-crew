@@ -110,6 +110,24 @@ class Answer:
     citations: list[Evidence]
     dropped: int = 0
     provider: object | None = None
+    # 반납 손잡이. `archive`는 session_id로 하지만 `registry.finish`는 instance_id로만
+    # 할 수 있어서, 호출자가 회차를 닫을 때 둘 다 필요하다.
+    instance_id: str | None = None
+
+
+async def _reclaim(orch, inst, sid: str) -> None:
+    """세션 하나를 반납한다 — 워커 프로세스(`archive`)와 registry 행(`finish`) 둘 다.
+
+    best-effort다. 정리하다 난 실패가 원래 예외를 가려서는 안 된다.
+    """
+    try:
+        await orch.adapters[inst.provider].archive(sid)
+    except Exception:
+        pass
+    try:
+        orch.registry.finish(inst.instance_id)
+    except Exception:
+        pass
 
 
 async def _open(orch, cfg, *, exec_id: str, repo_path: str, context: str, first: str):
@@ -139,21 +157,14 @@ async def _open(orch, cfg, *, exec_id: str, repo_path: str, context: str, first:
     try:
         out = await orch.adapters[inst.provider].send(sid, first)
     except BaseException:
-        try:
-            await orch.adapters[inst.provider].archive(sid)
-        except Exception:
-            pass
-        try:
-            orch.registry.finish(inst.instance_id)
-        except Exception:
-            pass
+        await _reclaim(orch, inst, sid)
         raise
-    return sid, inst.provider, out
+    return sid, inst, out
 
 
 async def ask(orch, cfg, *, exec_id: str, repo_path: str, question: str,
               session_id: str | None, context: str | None,
-              provider=None) -> Answer:
+              provider=None, instance_id: str | None = None) -> Answer:
     """질문 하나에 답한다. 세션이 없으면 열고, 있으면 그 세션의 다음 turn으로 보낸다.
 
     `context`는 세션을 새로 열 때만 쓴다 — 이미 열린 세션은 회차를 이미 알고 있다.
@@ -165,6 +176,8 @@ async def ask(orch, cfg, *, exec_id: str, repo_path: str, question: str,
     `session_id`와 `provider`는 항상 짝이다 — 두 번째 질문부터는 이전 `Answer`의
     `provider`를 그대로 넘겨야 한다. 짝 없이 `session_id`만 오면 `orch.adapters[None]`이
     raw `KeyError`를 내고 그게 그대로 학습자 화면에 노출되므로 여기서 미리 막는다.
+    `instance_id`도 같이 넘기면 그대로 돌려준다 — 재사용 경로는 새 instance를 만들지
+    않으므로, 넘기지 않으면 호출자가 반납 손잡이를 잃는다.
 
     이 adapter 인스턴스가 `session_id`를 모르면(예: cross-process 재시작으로 세션이
     유실) — `context`가 있으면 새 세션으로 자연 복구한다. `context`가 없으면 복구할
@@ -179,9 +192,11 @@ async def ask(orch, cfg, *, exec_id: str, repo_path: str, question: str,
     fenced = ASK.format(question=fence("question", question))
 
     async def _turn():
+        # 세 번째 값이 `inst`인 이유: 재사용 경로(None)와 새로 연 경로를 이 자리에서
+        # 구분해야 아래 회수 가드가 "이번에 내가 연 세션"만 반납할 수 있다.
         if session_id:
             try:
-                return session_id, provider, await orch.adapters[provider].send(
+                return session_id, None, await orch.adapters[provider].send(
                     session_id, fenced)
             except KeyError as e:
                 # 이 프로세스의 이 adapter 인스턴스가 session_id를 모른다는 신호다
@@ -198,7 +213,7 @@ async def ask(orch, cfg, *, exec_id: str, repo_path: str, question: str,
                            context=context or "", first=fenced)
 
     try:
-        sid, prov, out = await asyncio.wait_for(_turn(), timeout=TURN_TIMEOUT)
+        sid, inst, out = await asyncio.wait_for(_turn(), timeout=TURN_TIMEOUT)
     except asyncio.TimeoutError as e:
         raise TutorTAError("TimeoutError") from e
     except TutorTAError:
@@ -206,11 +221,23 @@ async def ask(orch, cfg, *, exec_id: str, repo_path: str, question: str,
     except Exception as e:
         raise TutorTAError(f"{type(e).__name__}: {e}") from e
 
-    raw = out.structured if isinstance(out.structured, dict) else {}
-    body = (raw.get("answer") or "").strip()
-    if not body:
-        raise TutorTAError("빈 답변")
-    text, kept, dropped = clean_answer(body, parse_citations(raw.get("citations")),
-                                       repo_path)
+    # **여기부터 반환까지도 회수 구간이다.** `_open`은 자기 `send`만 감싸지만, 이
+    # 아래에서 raise하면(예: `빈 답변`) sid는 아직 이 함수의 지역 변수뿐이라 호출자는
+    # 손잡이를 받지 못한다 — `_open`의 실패와 결과가 정확히 같다: 프로그램 어디에도
+    # 그 워커를 가리키는 것이 남지 않는다 (2026-08-24 최종 리뷰 C2).
+    # 재사용 경로(`inst is None`)는 반납하지 않는다 — 그 세션의 손잡이는 이미 호출자가
+    # 들고 있어 고아가 아니고, 여기서 죽이면 다음 질문에 쓸 세션을 말없이 없애는 것이다.
+    try:
+        raw = out.structured if isinstance(out.structured, dict) else {}
+        body = (raw.get("answer") or "").strip()
+        if not body:
+            raise TutorTAError("빈 답변")
+        text, kept, dropped = clean_answer(body, parse_citations(raw.get("citations")),
+                                           repo_path)
+    except BaseException:
+        if inst is not None:
+            await _reclaim(orch, inst, sid)
+        raise
     return Answer(session_id=sid, text=text, citations=kept, dropped=dropped,
-                  provider=prov)
+                  provider=inst.provider if inst is not None else provider,
+                  instance_id=inst.instance_id if inst is not None else instance_id)

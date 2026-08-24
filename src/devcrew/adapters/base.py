@@ -65,6 +65,8 @@ class FakeAdapter:
         self.sent: list[tuple[str, str]] = []
         # context_usage()가 돌려줄 값 (None이면 미지원 어댑터처럼 동작)
         self.context: dict | None = None
+        # archive된 session_id — 세션 반납을 unit이 확인하는 자리
+        self.archived: list[str] = []
 
     async def start_session(self, inst: AgentInstance, initial_message: str, *,
                              system_prompt: str | None = None,
@@ -113,6 +115,7 @@ class FakeAdapter:
         return "CANCELLED"
 
     async def archive(self, session_id: str) -> str:
+        self.archived.append(session_id)
         return "ARCHIVED"
 
     async def get_usage(self, session_id: str) -> Usage:
