@@ -395,8 +395,11 @@ def test_round_context_carries_answer_evidence_and_choice():
 
     ctx = round_context([_q(0, answer_index=2)], {0: 1}, repo_name="myrepo")
     assert "myrepo" in ctx
-    assert "해설 0" in ctx and "a.py" in ctx
-    assert "C" in ctx and "B" in ctx        # 정답 C, 학습자 선택 B
+    assert "해설 0" in ctx and "a.py:1-1" in ctx
+    # 보기 목록에 이미 A) B) C) D)가 있으므로 낱글자 존재는 아무것도 증명하지 않는다.
+    # 라벨이 붙은 줄 자체를 본다.
+    assert "정답: C" in ctx and "학습자 선택: B" in ctx
+    assert "(오답)" in ctx
 
 
 def test_round_context_marks_unanswered():
