@@ -437,6 +437,18 @@ class EngineRunner:
             # 다시 파싱해 registry 갱신이 실제로 됐는지 확인한다 — 조용히 통과시키면
             # 방금 만든 repo를 또 "미등록"이라 하게 된다 (self.repos는 기동 시 1회 로드).
             repo_name, req_branch, task = split_repo_target(task, self.repos)
+        # 접두 없는 후속 요청은 **스레드의 대상 repo를 유지한다.** 이월 판단
+        # (`st["repo_name"] != repo_name`)보다 먼저 해야 한다 — 아래 락이 이 이름으로
+        # 잡히고, 같은 repo의 직렬화가 여기에 달려 있다.
+        #
+        # 이게 없으면 접두를 뺀 순간 repo_name=None이라 이월이 끊기고, repo_name이
+        # 없으니 **휘발성 toy repo**가 열린다. 워커는 "그 폴더에 손이 닿지 않는다"고
+        # 정확히 보고하지만 사용자에게는 권한 문제로 보인다 (2026-08-25 SLACK-13/15/17).
+        # 대상을 바꾸려면 접두를 명시하거나 `/clear`를 쓴다.
+        carried = self._threads.get(thread_key) if thread_key else None
+        if repo_name is None and carried is not None:
+            repo_name = carried["repo_name"]
+
         # 같은 repo는 직렬(worktree 브랜치 경합·리뷰 혼선 방지), 다른 repo·toy는 병렬
         async with self._lock_for(repo_name or "_toy"):
             n = next(self._seq)

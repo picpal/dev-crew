@@ -1317,3 +1317,105 @@ async def test_preflight_leader_session_is_reclaimed(tmp_path, monkeypatch):
         await runner.run("todo-web: 만들어줘")
     assert archived == ["sess-1"]
     assert finished == ["ORCH-1"]
+
+
+# ── 접두 없는 후속 요청은 스레드의 repo를 유지한다 ───────────────────────────
+def _real_repo(ws, name):
+    import subprocess
+    d = ws / name
+    d.mkdir()
+    (d / "f.txt").write_text("x")
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=d, check=True)
+    subprocess.run(["git", "add", "."], cwd=d, check=True)
+    subprocess.run(["git", "-c", "user.email=a@b", "-c", "user.name=a",
+                    "commit", "-qm", "i"], cwd=d, check=True)
+    return d
+
+
+@pytest.mark.asyncio
+async def test_followup_without_a_prefix_keeps_the_thread_repo(tmp_path, monkeypatch):
+    """접두를 빼면 toy repo로 조용히 옮겨가던 결함 (2026-08-25 SLACK-13/15/17).
+
+    이월 판단은 `st["repo_name"] != repo_name`인데, 접두가 없으면 repo_name=None이라
+    항상 불일치가 되어 이월이 끊기고 `repo_name`이 없으니 휘발성 toy repo가 열렸다.
+    워커는 "그 폴더에 손이 닿지 않는다"고 정확히 보고했지만 사용자는 권한 문제로 읽었다.
+    """
+    import devcrew.engine as engine_mod
+    from devcrew.slack_engine import EngineRunner
+
+    ws = _repo_env(tmp_path, monkeypatch)
+    _real_repo(ws, "alpha")
+    seen: list[dict] = []
+
+    class RecordingEngine:
+        def __init__(self, orch, cfg, **kw):
+            pass
+
+        async def run(self, *, execution_id, task, worktree=None, carry=None):
+            seen.append({"task": task, "worktree": worktree})
+            return engine_mod.ExecutionResult("COMPLETED", [], 0, 0)
+
+    monkeypatch.setattr(engine_mod, "WorkflowEngine", RecordingEngine)
+    runner = EngineRunner(runtime_dir=tmp_path / "rt")
+
+    await runner.run("alpha: 첫 요청", thread_key="T1")
+    await runner.run("이어서 지워줘", thread_key="T1")          # 접두 없음
+
+    assert str(ws / "alpha") in seen[0]["worktree"]
+    assert seen[1]["worktree"] == seen[0]["worktree"]        # 같은 작업 공간
+    assert "slack-devcrew-" not in seen[1]["worktree"]       # toy repo로 안 샌다
+
+
+@pytest.mark.asyncio
+async def test_naming_a_different_repo_still_breaks_the_carry(tmp_path, monkeypatch):
+    """명시적으로 다른 repo를 지목하면 이월은 끊겨야 한다 — 그건 진짜 대상 변경이다."""
+    import devcrew.engine as engine_mod
+    from devcrew.slack_engine import EngineRunner
+
+    ws = _repo_env(tmp_path, monkeypatch)
+    _real_repo(ws, "alpha")
+    _real_repo(ws, "beta")
+    seen: list[str] = []
+
+    class RecordingEngine:
+        def __init__(self, orch, cfg, **kw):
+            pass
+
+        async def run(self, *, execution_id, task, worktree=None, carry=None):
+            seen.append(worktree)
+            return engine_mod.ExecutionResult("COMPLETED", [], 0, 0)
+
+    monkeypatch.setattr(engine_mod, "WorkflowEngine", RecordingEngine)
+    runner = EngineRunner(runtime_dir=tmp_path / "rt")
+
+    await runner.run("alpha: 첫 요청", thread_key="T1")
+    await runner.run("beta: 다른 repo", thread_key="T1")
+    assert str(ws / "alpha") in seen[0]
+    assert str(ws / "beta") in seen[1]
+
+
+@pytest.mark.asyncio
+async def test_a_thread_that_started_on_toy_stays_on_toy(tmp_path, monkeypatch):
+    """접두 없이 시작한 스레드는 그대로 toy repo를 이어 쓴다 (종전 동작 유지)."""
+    import devcrew.engine as engine_mod
+    from devcrew.slack_engine import EngineRunner
+
+    _repo_env(tmp_path, monkeypatch)
+    repo = tmp_path / "toy"
+    repo.mkdir()
+    monkeypatch.setenv("DEVCREW_TARGET_REPO", str(repo))
+    seen: list[str] = []
+
+    class RecordingEngine:
+        def __init__(self, orch, cfg, **kw):
+            pass
+
+        async def run(self, *, execution_id, task, worktree=None, carry=None):
+            seen.append(worktree)
+            return engine_mod.ExecutionResult("COMPLETED", [], 0, 0)
+
+    monkeypatch.setattr(engine_mod, "WorkflowEngine", RecordingEngine)
+    runner = EngineRunner(runtime_dir=tmp_path / "rt")
+    await runner.run("첫 요청", thread_key="T1")
+    await runner.run("이어서", thread_key="T1")
+    assert seen[0] == seen[1] == str(repo)

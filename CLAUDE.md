@@ -127,8 +127,11 @@ resolve_unknown_repo`)이 처리한다. `이름:` 접두가 registry에 없을 �
   같은 데이터), Codex는 turn마다 오는 `modelContextWindow`. 토큰 합산 추정은 세션이 이
   프로세스 밖일 때의 **폴백**이다. 답변 상단 `[context usage : NN%]`는 40%부터 표기.
 - **세션 이월(carry)**: 같은 Slack 스레드의 후속 요청은 작업 공간과 노드/leader 세션을
-  이어받는다. repo나 base 브랜치가 바뀌면 끊는다. 프로세스 재시작 시 `SessionCarryLost`로
-  새 세션 폴백.
+  이어받는다. **접두를 생략하면 그 스레드의 repo를 유지한다** — 대상을 바꾸려면 접두를
+  명시하거나 `/clear`를 쓴다. 이월을 끊는 건 **명시적으로 다른 repo·base 브랜치를
+  지목했을 때뿐**이다. (접두 생략을 "대상 변경"으로 읽으면 repo가 없는 상태가 되어
+  휘발성 toy repo가 열리고, 사용자는 작업 대상이 바뀐 줄 모른다 — 2026-08-25
+  SLACK-13/15/17.) 프로세스 재시작 시 `SessionCarryLost`로 새 세션 폴백.
 - **유휴 TA 세션은 10분마다 쓸어담는다** (`slack_tutor.sweep_loop`). 축출을 답변
   경로에만 걸면 "마지막 질문 뒤 아무도 안 묻는" 흔한 경우에 `TA_IDLE_TTL`(6h)이
   무의미해진다 — 17시간 산 워커를 실제로 발견했다(2026-08-25). 답변 중인 회차
@@ -184,7 +187,7 @@ uv run python -u -m devcrew.slack_engine   # 브리지 (env 필요)
 | `@crew <repo>: <작업>` | `config/repos.yaml`의 repo (`workspace_roots` 하위는 자동 등록), 그 repo의 base 브랜치에서 worktree 생성 |
 | `@crew <repo>@<브랜치>: <작업>` | 이번 요청에 한해 base 브랜치 덮어쓰기 |
 | `@crew <없는이름>: <작업>` | leader가 판단 — 새 프로젝트면 workspace에 repo를 만들고 실행, 오타로 보이면 생성 버튼을 띄워 사람에게 확인 |
-| 같은 스레드에 후속 멘션 | 세션 이월 (재탐색 없음) |
+| 같은 스레드에 후속 멘션 | 세션 이월 (재탐색 없음). **접두를 빼도 그 스레드의 repo를 그대로 쓴다** — 바꾸려면 접두를 명시한다 |
 | `@crew /clear` | 그 스레드 컨텍스트 초기화 |
 | `@brain <주제>` | 인터뷰 시작 (`repo:` 접두 가능) |
 | 스레드 답글 / 버튼 | 인터뷰 진행 |
