@@ -2,6 +2,8 @@
 import asyncio
 
 
+import time
+
 import pytest
 
 from devcrew.adapters.base import FakeAdapter
@@ -764,12 +766,16 @@ async def test_evict_drops_the_oldest_over_the_cap(tmp_path, repo):
     assert old in h.orch.adapters[Provider.CLAUDE_CODE].archived
 
 
-def _idle_ta_session(h, thread_ts, *, touched):
-    """TA 세션이 열려 있는 다른 스레드의 회차를 하나 심는다 → 그 session_id."""
+def _idle_ta_session(h, thread_ts, *, touched, sid="fake-other"):
+    """TA 세션이 열려 있는 다른 스레드의 회차를 하나 심는다 → 그 session_id.
+
+    `sid`는 **세션마다 달라야** 어느 쪽이 반납됐는지 구분할 수 있다 — 기본값을 그대로
+    둔 채 두 개를 심으면 두 세션이 같은 id를 갖고 단언이 통과할 수 없다.
+    """
     from devcrew.slack_tutor import QuizSession
     sess = QuizSession(channel="C1", thread_ts=thread_ts, owner="U-OTHER",
                        repo_name="myrepo", questions=[], done=True)
-    sess.ta_session_id = "fake-other"
+    sess.ta_session_id = sid
     sess.ta_provider = Provider.CLAUDE_CODE
     sess.ta_instance_id = "tut-other"
     sess.ta_touched = touched
@@ -1437,3 +1443,87 @@ async def test_code_report_carries_its_diagram(tmp_path, repo, monkeypatch):
 
     html = next(h for tid, h in pub if tid.startswith("code-"))
     assert "<svg viewBox=" in html and "루프" in html
+
+
+@pytest.mark.asyncio
+async def test_sweep_idle_reclaims_sessions_past_the_ttl(tmp_path, repo):
+    """TTL이 지난 TA 세션은 아무도 다시 묻지 않아도 반납된다 (사용자 2026-08-25).
+
+    축출은 지금까지 **답변 직후에만** 돌았다 — 그래서 마지막 질문 뒤 아무도 안 물으면
+    TTL이 지나도 세션이 남았다. 실제로 17시간 산 워커를 정리 중에 발견했다.
+    """
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    stale = _idle_ta_session(h, "900.1", touched=time.monotonic() - st.TA_IDLE_TTL - 60,
+                             sid="stale-1")
+    fresh = _idle_ta_session(h, "900.2", touched=time.monotonic(), sid="fresh-2")
+
+    await h.sweep_idle()
+
+    archived = h.orch.adapters[Provider.CLAUDE_CODE].archived
+    assert stale in archived, "TTL이 지난 세션을 반납하지 않았다"
+    assert fresh not in archived, "아직 살아 있는 세션까지 죽였다"
+    assert "900.1" not in h.sessions and "900.2" in h.sessions
+
+
+@pytest.mark.asyncio
+async def test_sweep_never_touches_a_session_mid_answer(tmp_path, repo):
+    """답변 중인 회차를 말없이 죽이면 학습자에겐 답이 끊긴 스레드만 남는다."""
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    sid = _idle_ta_session(h, "900.3", touched=time.monotonic() - st.TA_IDLE_TTL - 60)
+    h.sessions["900.3"].ta_busy = True
+
+    await h.sweep_idle()
+    assert sid not in h.orch.adapters[Provider.CLAUDE_CODE].archived
+    assert "900.3" in h.sessions
+
+
+@pytest.mark.asyncio
+async def test_sweep_loop_actually_calls_the_sweep(tmp_path, repo):
+    """**배선 테스트.** 루프가 실제로 sweep을 부르는지 본다 — 순수 함수 테스트는
+    배선을 증명하지 않는다 (lessons C1). 이 저장소는 같은 이유로 배선을 세 번 잃었다."""
+    import asyncio
+
+    from devcrew.slack_tutor import sweep_loop
+
+    h, _, _ = make_handler(tmp_path, repo)
+    calls = []
+    h.sweep_idle = lambda: calls.append(1) or asyncio.sleep(0)
+
+    task = asyncio.create_task(sweep_loop(h, interval=0.01))
+    await asyncio.sleep(0.06)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert len(calls) >= 2, f"루프가 sweep을 부르지 않았다 ({len(calls)}회)"
+
+
+@pytest.mark.asyncio
+async def test_sweep_loop_survives_a_failing_sweep(tmp_path, repo):
+    """쓸어담기 하나가 실패해도 루프가 죽으면 안 된다 — 그러면 이후 전부 안 돈다."""
+    import asyncio
+
+    from devcrew.slack_tutor import sweep_loop
+
+    h, _, _ = make_handler(tmp_path, repo)
+    calls = []
+
+    async def boom():
+        calls.append(1)
+        raise RuntimeError("registry 접근 실패")
+
+    h.sweep_idle = boom
+    task = asyncio.create_task(sweep_loop(h, interval=0.01))
+    await asyncio.sleep(0.06)
+    alive = not task.done()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert alive and len(calls) >= 2, f"루프가 죽었다 ({len(calls)}회 호출)"

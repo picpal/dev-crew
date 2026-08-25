@@ -39,6 +39,10 @@ ROUND_TTL = 24 * 3600.0     # 미완 회차의 수명 — 하루가 지나면 �
 # 반납은 선택이 아니다 — slack_brain(같은 모양의 스레드당 대화형 세션)과 같은 값을 쓴다.
 TA_IDLE_TTL = 6 * 3600.0    # 마지막 질문 뒤 이만큼 방치되면 세션을 반납한다
 MAX_TA_SESSIONS = 50        # 초과 시 가장 오래 방치된 회차부터 축출
+# 유휴 세션을 쓸어담는 주기. 축출이 **답변 직후에만** 돌던 시절에는 마지막 질문 뒤
+# 아무도 안 물으면 TTL이 지나도 세션이 남았다 — 17시간 산 워커를 실제로 발견했다
+# (2026-08-25). TTL(6h)에 비해 촘촘하지만, 하는 일이 dict 훑기라 비용이 없다.
+SWEEP_INTERVAL = 600.0
 ANSWER_RE = re.compile(r"^(\d+):([0-3])$")
 REGRADE_VALUE = "__REGRADE__"   # 채점 실패 후 다시 채점하는 버튼의 sentinel
 LETTERS = "ABCDEFGH"
@@ -775,6 +779,14 @@ class TutorHandler:
         while len(live) > MAX_TA_SESSIONS:
             await self._drop(live.pop(0))
 
+    async def sweep_idle(self) -> None:
+        """유휴 TA 세션 반납 — **주기적으로** 불린다 (`sweep_loop`).
+
+        `_evict_ta`와 같은 일을 하지만 부르는 자리가 다르다. 답변 경로에서만 돌면
+        "마지막 질문 뒤 아무도 안 묻는" 흔한 경우에 TTL이 무의미해진다.
+        """
+        await self._evict_ta()
+
     async def _expire(self, thread_ts: str, say, sess: QuizSession | None = None) -> None:
         """만료된 회차를 닫는다 — 세션을 반납하고, 안내는 **회차당 한 번만**.
 
@@ -868,3 +880,23 @@ class TutorHandler:
                 await self.status(channel, thread_ts, text)
             except Exception:
                 pass
+
+
+async def sweep_loop(handler, *, interval: float = SWEEP_INTERVAL) -> None:
+    """유휴 TA 세션을 주기적으로 반납한다. 취소될 때까지 돈다.
+
+    **모듈 레벨에 둔다** — bolt 핸들러 클로저 안에 두면 배선이 통째로 사라져도 테스트가
+    전부 초록이다 (lessons C1). 엔진은 이걸 task로 띄우기만 한다.
+
+    한 번의 실패가 루프를 죽이면 이후 전부 안 돈다 — 그건 고치기 전보다 나쁘다.
+    그래서 삼키되, 여기서 삼키는 것은 **곁다리 청소의 실패**이지 사용자에게 보일
+    결과가 아니다.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await handler.sweep_idle()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass

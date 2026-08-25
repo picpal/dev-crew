@@ -1063,3 +1063,22 @@ async def test_tutor_dispatch_shares_the_dedupe_state_with_the_message_router():
     await question({"event_id": "Ev2", "event": {**ev, "type": "message"}})
 
     assert len(t.questions) == 1
+
+
+def test_engine_starts_the_tutor_sweep_loop():
+    """엔진이 `sweep_loop`를 task로 띄우는지 **소스에서** 확인한다.
+
+    이 배선은 네트워크·Slack 토큰이 있어야 도는 자리에 있어 함수로 부를 seam이 없다.
+    그래서 약한 테스트다 — 루프가 실제로 도는 것은 `test_slack_tutor.py`가 따로 잡고,
+    여기서 잡는 것은 **그 줄이 사라지는 것** 하나다. 그것만으로 충분한 이유는, 이
+    저장소가 배선을 잃은 세 번이 전부 "코드는 멀쩡한데 부르는 자리가 없어진" 경우였기
+    때문이다 (lessons C1).
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src" / "devcrew" / "slack_engine.py"
+    body = src.read_text()
+    assert "sweep_loop" in body, "sweep_loop 배선이 사라졌다"
+    assert re.search(r"tasks\.append\(\s*sweep_loop\(", body), \
+        "sweep_loop가 실행 task로 등록되지 않았다 — import만 남으면 돌지 않는다"

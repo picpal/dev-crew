@@ -798,7 +798,7 @@ async def _amain() -> None:
     tutor_bot = _real_token(os.environ.get("TUTOR_BOT_TOKEN"), "xoxb-")
     tutor_app_token = _real_token(os.environ.get("TUTOR_APP_TOKEN"), "xapp-")
     if tutor_bot and tutor_app_token:
-        from .slack_tutor import TutorHandler
+        from .slack_tutor import TutorHandler, sweep_loop
 
         tutor_app = AsyncApp(token=tutor_bot)
 
@@ -843,6 +843,9 @@ async def _amain() -> None:
             await ack()
 
         tasks.append(AsyncSocketModeHandler(tutor_app, tutor_app_token).start_async())
+        # 유휴 TA 세션 청소. 축출이 답변 직후에만 돌면 "마지막 질문 뒤 아무도 안 묻는"
+        # 흔한 경우에 TTL이 무의미해진다 — 실제로 17시간 산 워커가 있었다 (2026-08-25).
+        tasks.append(sweep_loop(tutor))
         print("devcrew: @tutor 학습 앱 활성화")
 
     print("devcrew slack engine: Socket Mode 연결 중… (@mention으로 작업을 요청하세요)")
