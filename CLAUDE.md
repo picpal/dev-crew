@@ -170,6 +170,7 @@ uv run python -u -m devcrew.slack_engine   # 브리지 (env 필요)
 | `@brain <주제>` | 인터뷰 시작 (`repo:` 접두 가능) |
 | 스레드 답글 / 버튼 | 인터뷰 진행 |
 | `전달` | brief 산출 → crew 인계 (재인계는 delta만) |
+| *🛠 crew에 전달* 버튼 | brain이 "남은 결정 없음"을 선언한 turn에만 뜬다. 타이핑 `전달`과 같은 경로 |
 | `@brain /clear` | 인터뷰 세션 정리 |
 | `@tutor <repo>:` | 그 repo에 대한 10문항 학습 회차 시작 (버튼으로 응답) |
 | `@tutor` 스레드에 답글·멘션 | 채점 후 후속 질문. `TUTOR_TA`가 repo를 읽고 근거를 달아 답한다 |
