@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from devcrew.repos import (RepoRegistryError, format_repo_names, load_repo_bases, load_repos,
-                           split_repo_prefix)
+                           split_repo_prefix, split_repo_target)
 
 
 def _git_repo(tmp_path, name):
@@ -208,3 +208,69 @@ def test_format_repo_names_short_list_has_no_tail():
 
 def test_format_repo_names_empty():
     assert format_repo_names({}, limit=5) == "(없음)"
+
+
+# ── 미등록 repo → leader 판단으로 생성 ────────────────────────────────────────
+def test_unknown_repo_error_carries_the_name(tmp_path):
+    """문자열 예외로는 어느 이름이었는지 못 꺼낸다 — leader에게 물어보려면 필요하다."""
+    from devcrew.repos import UnknownRepoError
+    with pytest.raises(UnknownRepoError) as ei:
+        split_repo_target("todo-web: 만들어줘", {"alpha": tmp_path})
+    assert ei.value.name == "todo-web"
+    assert ei.value.available == ["alpha"]
+    assert isinstance(ei.value, RepoRegistryError)      # 기존 처리 경로 유지
+
+
+def test_create_repo_makes_a_committed_repo(tmp_path):
+    """`worktree add ... HEAD`는 커밋이 0개면 실패한다 — 초기 커밋까지 만들어야 한다."""
+    from devcrew.repos import create_repo
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    path = create_repo("todo-web", [ws])
+    assert path == (ws / "todo-web").resolve()
+    assert (path / ".git").exists()
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path,
+                          capture_output=True, text=True)
+    assert head.returncode == 0, "커밋이 없으면 worktree를 딸 수 없다"
+    branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path,
+                            capture_output=True, text=True).stdout.strip()
+    assert branch == "main"
+
+
+def test_created_repo_is_immediately_discoverable(tmp_path):
+    """생성해 놓고 registry에 안 잡히면 방금 만든 repo를 또 '미등록'이라 한다."""
+    from devcrew.repos import create_repo
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    y = tmp_path / "repos.yaml"
+    y.write_text(f"workspace_roots:\n  - {ws}\n")
+    assert load_repos(y) == {}
+    create_repo("todo-web", [ws])
+    assert set(load_repos(y)) == {"todo-web"}
+
+
+def test_create_repo_refuses_to_escape_the_workspace(tmp_path):
+    """이름은 Slack 사용자가 주는 값이다 — 경로 조작이 통하면 안 된다."""
+    from devcrew.repos import create_repo
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    for bad in ("../escape", "/etc/passwd", "a/b", ".hidden", "-rf", ""):
+        with pytest.raises(RepoRegistryError):
+            create_repo(bad, [ws])
+    assert list(ws.iterdir()) == []
+
+
+def test_create_repo_refuses_an_existing_path(tmp_path):
+    from devcrew.repos import create_repo
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "taken").mkdir()
+    with pytest.raises(RepoRegistryError, match="이미"):
+        create_repo("taken", [ws])
+
+
+def test_create_repo_needs_a_workspace_root(tmp_path):
+    """루트가 없으면 어디에 만들지 모른다 — 조용히 cwd에 만들면 안 된다."""
+    from devcrew.repos import create_repo
+    with pytest.raises(RepoRegistryError, match="workspace_root"):
+        create_repo("todo-web", [])

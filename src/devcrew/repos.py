@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -34,9 +35,29 @@ import yaml
 
 DEFAULT_PATH = Path(__file__).resolve().parents[2] / "config" / "repos.yaml"
 
+# 새 repo의 기본 브랜치와, 사용자 git identity가 없을 때의 폴백 커밋 작성자.
+DEFAULT_BRANCH = "main"
+_FALLBACK_NAME = "dev-crew"
+_FALLBACK_EMAIL = "dev-crew@localhost"
+
 
 class RepoRegistryError(Exception):
     pass
+
+
+class UnknownRepoError(RepoRegistryError):
+    """`이름:` 접두가 registry에 없다. 오타일 수도, 아직 없는 새 repo일 수도 있다.
+
+    어느 쪽인지는 요청 본문을 봐야 안다("todo 웹앱 만들어줘" vs `dev-crw:`) — 그래서
+    이름과 후보 목록을 예외에 실어 leader가 판단할 수 있게 한다. 문자열 메시지만으로는
+    호출자가 이름을 다시 꺼낼 방법이 없다.
+    """
+
+    def __init__(self, name: str, available):
+        self.name = name
+        self.available = sorted(available)
+        super().__init__(f"등록되지 않은 repo {name!r} — "
+                         f"사용 가능: {format_repo_names(self.available)}")
 
 
 def _entry(name: str, loc) -> tuple[Path, str]:
@@ -157,8 +178,7 @@ def split_repo_target(task: str, repos: dict[str, Path]) -> tuple[str | None, st
             validate_ref(name, branch)      # git 인자 인젝션 차단 (선행 '-' 등)
         return name, branch, rest.strip()
     if _REPO_HEAD_RE.fullmatch(head):
-        raise RepoRegistryError(
-            f"등록되지 않은 repo {name!r} — 사용 가능: {format_repo_names(repos)}")
+        raise UnknownRepoError(name, repos)
     return None, None, task
 
 
@@ -166,3 +186,64 @@ def split_repo_prefix(task: str, repos: dict[str, Path]) -> tuple[str | None, st
     """`split_repo_target`의 2-tuple 호환 래퍼 (브랜치 지정은 버린다)."""
     name, _branch, rest = split_repo_target(task, repos)
     return name, rest
+
+
+def workspace_roots(path: str | Path | None = None) -> list[Path]:
+    """설정의 workspace_roots — 새 repo를 만들 수 있는 유일한 자리."""
+    p = Path(path) if path else DEFAULT_PATH
+    if not p.exists():
+        return []
+    raw = yaml.safe_load(p.read_text()) or {}
+    return [Path(str(r)).expanduser() for r in (raw.get("workspace_roots") or [])]
+
+
+def create_repo(name: str, roots) -> Path:
+    """`roots[0]` 바로 아래에 새 git repo를 만든다. 경로를 반환한다.
+
+    **초기 커밋까지 만든다.** 커밋이 0개면 HEAD가 해석되지 않아
+    `git worktree add ... HEAD`가 실패하고, 실행이 repo를 만들자마자 죽는다.
+
+    `name`은 Slack 사용자가 준 값이다 — 자동 등록 이름 규칙(`_AUTO_NAME_RE`)으로
+    제한해 경로 조작(`../`, 절대경로, 숨김 디렉토리)을 막고, 만든 뒤 결과 경로가
+    루트 **바로 아래**인지 다시 확인한다.
+    """
+    roots = [Path(r).expanduser() for r in (roots or [])]
+    if not roots:
+        raise RepoRegistryError(
+            "workspace_root가 없어 새 repo를 만들 자리가 없다 — config/repos.yaml 참조")
+    if not _AUTO_NAME_RE.fullmatch(name or ""):
+        raise RepoRegistryError(
+            f"repo 이름으로 쓸 수 없는 값 {name!r} (영숫자로 시작, 영숫자/._- 만 허용)")
+
+    root = roots[0]
+    if not root.is_dir():
+        raise RepoRegistryError(f"workspace_root 경로 없음 — {root}")
+    target = (root / name).resolve()
+    if target.parent != root.resolve():        # 이름 규칙을 통과해도 한 번 더 본다
+        raise RepoRegistryError(f"repo {name!r}: workspace 밖을 가리킨다 — {target}")
+    if target.exists():
+        raise RepoRegistryError(f"repo {name!r}: 이미 있다 — {target}")
+
+    def git(*args: str, **kw) -> None:
+        r = subprocess.run(["git", *args], cwd=kw.get("cwd", target),
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RepoRegistryError(
+                f"repo {name!r} 생성 실패: git {' '.join(args)} — {r.stderr.strip()}")
+
+    target.mkdir(parents=True)
+    try:
+        git("init", "-b", DEFAULT_BRANCH)
+        (target / "README.md").write_text(f"# {name}\n", encoding="utf-8")
+        git("add", "README.md")
+        # 사용자 전역 git identity가 없으면 commit이 실패한다. 있으면 그걸 쓰고,
+        # 없을 때만 하네스 이름으로 채운다 — 사용자 설정을 덮어쓰지 않는다.
+        ident = subprocess.run(["git", "config", "user.email"], cwd=target,
+                               capture_output=True, text=True).stdout.strip()
+        pre = [] if ident else ["-c", f"user.name={_FALLBACK_NAME}",
+                                "-c", f"user.email={_FALLBACK_EMAIL}"]
+        git(*pre, "commit", "-m", f"init: {name}")
+    except BaseException:
+        shutil.rmtree(target, ignore_errors=True)   # 반쯤 만들어진 repo를 남기지 않는다
+        raise
+    return target

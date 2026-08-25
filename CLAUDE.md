@@ -36,6 +36,12 @@ LLM(leader)은 정책이 답을 못 정하는 **5개 트리거에서만** 호출
 | BLOCKED | RETRY_NODE, ESCALATE_MODEL, ASK_USER, ABORT |
 | INSUFFICIENT_CAPABILITY | ESCALATE_MODEL, ASK_USER, ABORT |
 | LOOP_GUARD_EXCEEDED | REPLAN, ESCALATE_MODEL, ASK_USER, ABORT |
+| UNKNOWN_REPO † | CREATE_REPO, ASK_USER, ABORT |
+
+† 유일하게 **실행 이전**에 걸리는 트리거 — 엔진이 아니라 Slack 계층(`EngineRunner.
+resolve_unknown_repo`)이 처리한다. `이름:` 접두가 registry에 없을 때 오타인지 새
+프로젝트인지 leader가 판단하고, **생성은 엔진이 한다** — leader에게 쓰기 도구를
+주지 않는다는 불변 조건 2는 그대로다. 확신이 없으면 ASK_USER → 사용자에게 생성 버튼.
 
 엔진은 leader의 결정을 이 목록과 **대조 검증**한다(`decision.validate_decision`).
 목록 밖이면 1회 재시도, 그래도 안 되면 ASK_USER로 강등한다 — fail-closed.
@@ -169,6 +175,7 @@ uv run python -u -m devcrew.slack_engine   # 브리지 (env 필요)
 | `@crew <작업>` | 휘발성 toy repo에서 실행 |
 | `@crew <repo>: <작업>` | `config/repos.yaml`의 repo (`workspace_roots` 하위는 자동 등록), 그 repo의 base 브랜치에서 worktree 생성 |
 | `@crew <repo>@<브랜치>: <작업>` | 이번 요청에 한해 base 브랜치 덮어쓰기 |
+| `@crew <없는이름>: <작업>` | leader가 판단 — 새 프로젝트면 workspace에 repo를 만들고 실행, 오타로 보이면 생성 버튼을 띄워 사람에게 확인 |
 | 같은 스레드에 후속 멘션 | 세션 이월 (재탐색 없음) |
 | `@crew /clear` | 그 스레드 컨텍스트 초기화 |
 | `@brain <주제>` | 인터뷰 시작 (`repo:` 접두 가능) |

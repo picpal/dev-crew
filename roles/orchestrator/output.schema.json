@@ -26,7 +26,8 @@
             "SKIP_NODE",
             "REPLAN",
             "ASK_USER",
-            "ABORT"
+            "ABORT",
+            "CREATE_REPO"
           ]
         },
         "target_node": {

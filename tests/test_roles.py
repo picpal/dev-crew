@@ -29,8 +29,12 @@ def test_orchestrator_bundle_loads():
     b = load_bundle(Role.ORCHESTRATOR)
     props = b.schema["properties"]
     d = props["decision"]["properties"]
-    assert d["action"]["enum"] == ["PROCEED", "RETRY_NODE", "ESCALATE_MODEL",
-                                  "SKIP_NODE", "REPLAN", "ASK_USER", "ABORT"]
+    # 스키마와 workflow.DECISION_ACTIONS는 같은 목록이어야 한다 — 한쪽만 늘리면
+    # 엔진이 허용하는 action을 모델이 낼 수 없거나(스키마 거절), 그 반대가 된다.
+    from devcrew.workflow import ALLOWED_BY_TRIGGER, DECISION_ACTIONS
+    assert d["action"]["enum"] == DECISION_ACTIONS
+    for trigger, actions in ALLOWED_BY_TRIGGER.items():
+        assert set(actions) <= set(DECISION_ACTIONS), trigger
     assert d["target_node"]["type"] == ["string", "null"]
     _assert_strict(b.schema)
 

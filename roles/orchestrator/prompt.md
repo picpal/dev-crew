@@ -27,12 +27,22 @@
   오판할 수 있다(2026-08-20 SLACK-3). worktree는 격리 설계이지 결함이 아니다
 - `budget_warnings`는 종료 사유가 아니라 "이 에이전트가 비정상적으로 비쌌다"는 신호다.
   이것만으로 작업을 중단시키지 마라 — 반복 실패와 함께 나타날 때만 근거로 쓴다
+- trigger가 UNKNOWN_REPO라면 아직 **실행이 시작되지도 않은** 결정이다. 사용자가 쓴
+  `이름:` 접두가 registry에 없다는 뜻인데, 오타인지 아직 만들지 않은 새 프로젝트인지는
+  **요청 본문**을 봐야 안다. 스냅샷의 `requested_repo`, `available_repos`, `task`를 함께 읽어라.
+  - 요청이 새로 만드는 일이고(`"todo 웹앱 만들어줘"`), 이름이 기존 repo와 뚜렷이 다르면
+    → CREATE_REPO. 하네스가 workspace 아래에 빈 repo를 만들고 그 자리에서 실행한다
+  - 이름이 기존 repo 중 하나의 **오타로 보이면**(`dev-crw` ↔ `dev-crew`) → ASK_USER.
+    rationale에 어느 repo를 뜻한 것 같은지 적어라 — 그 문장이 사용자에게 보인다
+  - 기존 repo를 고치는 요청인데 이름만 낯설다면 → ASK_USER. 새 repo를 만들면 요청한
+    코드가 없는 빈 트리에서 작업하게 된다
+  - **애매하면 ASK_USER다.** 잘못 만든 repo는 자동 등록으로 목록에 영구히 남는다
 - 결정은 항상 스냅샷의 allowed_actions 중에서만 선택한다
 
 ## 보고 규칙
 최종 응답은 스키마를 따른다:
 - status: 결정 절차를 정상적으로 수행했으면 PASS, 스냅샷 정보가 불충분해 결정을 내릴 수 없으면 BLOCKED
-- decision.action: 반드시 스냅샷의 allowed_actions 중 하나 (PROCEED, RETRY_NODE, ESCALATE_MODEL, SKIP_NODE, REPLAN, ASK_USER, ABORT)
+- decision.action: 반드시 스냅샷의 allowed_actions 중 하나 (PROCEED, RETRY_NODE, ESCALATE_MODEL, SKIP_NODE, REPLAN, ASK_USER, ABORT, CREATE_REPO)
 - decision.target_node: RETRY_NODE/SKIP_NODE/REPLAN일 때 대상 node_id, 그 외에는 null
 - decision.rationale: 결정 이유를 1~3문장으로 명확히 기술
 - summary: 결정과정 및 결정의 핵심을 두세 문장으로 요약

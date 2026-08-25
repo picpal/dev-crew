@@ -1082,3 +1082,238 @@ def test_engine_starts_the_tutor_sweep_loop():
     assert "sweep_loop" in body, "sweep_loop 배선이 사라졌다"
     assert re.search(r"tasks\.append\(\s*sweep_loop\(", body), \
         "sweep_loop가 실행 task로 등록되지 않았다 — import만 남으면 돌지 않는다"
+
+
+# ── 미등록 repo → leader 판단 → 생성 ─────────────────────────────────────────
+def _repo_env(tmp_path, monkeypatch):
+    """workspace_roots와 registry 로더를 임시 디렉토리로 돌린다 (실제 ~/Desktop 금지)."""
+    import functools
+
+    import devcrew.repos as repos_mod
+    import devcrew.slack_engine as se
+
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    y = tmp_path / "repos.yaml"
+    y.write_text(f"workspace_roots:\n  - {ws}\n")
+    monkeypatch.setattr(se, "workspace_roots", lambda: [ws])
+    monkeypatch.setattr(se, "load_repos", functools.partial(repos_mod.load_repos, y))
+    monkeypatch.setattr(se, "load_repo_bases", functools.partial(repos_mod.load_repo_bases, y))
+    return ws
+
+
+def _leader(action, rationale="이유"):
+    """make_llm_decide 대역 — 지정한 action을 내는 decide를 돌려준다."""
+    opened = []
+
+    def factory(orch, cfg, *, mcp_servers=None, leader_state=None, **kw):
+        async def decide(trigger, snapshot):
+            opened.append({"trigger": trigger, "snapshot": snapshot,
+                           "leader_state": leader_state})
+            if leader_state is not None:            # 세션이 열린 것처럼 흉내낸다
+                leader_state.update({"inst": None, "sid": None})
+            return {"action": action, "target_node": None, "rationale": rationale}, "ORCH-1", 7
+        return decide
+
+    factory.opened = opened
+    return factory
+
+
+@pytest.mark.asyncio
+async def test_create_repo_decision_makes_the_repo_and_runs(tmp_path, monkeypatch):
+    """leader가 CREATE_REPO를 내면 엔진이 만들고, 그 자리에서 실행이 이어져야 한다."""
+    import devcrew.decision as decision_mod
+    import devcrew.engine as engine_mod
+    from devcrew.slack_engine import EngineRunner
+
+    ws = _repo_env(tmp_path, monkeypatch)
+    seen: list[dict] = []
+
+    class RecordingEngine:
+        def __init__(self, orch, cfg, **kw):
+            pass
+
+        async def run(self, *, execution_id, task, worktree=None, carry=None):
+            seen.append({"task": task, "worktree": worktree})
+            return engine_mod.ExecutionResult("COMPLETED", [], 0, 0)
+
+    monkeypatch.setattr(engine_mod, "WorkflowEngine", RecordingEngine)
+    leader = _leader("CREATE_REPO")
+    monkeypatch.setattr(decision_mod, "make_llm_decide", leader)
+
+    runner = EngineRunner(runtime_dir=tmp_path / "rt")
+    _eid, _res, repo = await runner.run("todo-web: 할 일 앱 만들어줘")
+
+    assert (ws / "todo-web" / ".git").exists()
+    assert repo.startswith("todo-web · wt/slack-")
+    # 접두는 떨어지고 본문만 워커에게 간다
+    assert seen[0]["task"] == "할 일 앱 만들어줘"
+    # worktree가 새 repo 안에서 잡혔다 — 커밋이 없었으면 여기서 실패한다
+    assert str(ws / "todo-web") in seen[0]["worktree"]
+    # leader에게 판단 근거가 실제로 갔는가
+    snap = leader.opened[0]["snapshot"]
+    assert leader.opened[0]["trigger"] == "UNKNOWN_REPO"
+    assert snap["requested_repo"] == "todo-web"
+    assert snap["task"] == "todo-web: 할 일 앱 만들어줘"
+    assert snap["allowed_actions"] == ["CREATE_REPO", "ASK_USER", "ABORT"]
+
+
+@pytest.mark.asyncio
+async def test_ask_user_decision_raises_with_the_rationale(tmp_path, monkeypatch):
+    """확신 없으면 만들지 않는다 — 사람이 버튼으로 정하게 rationale을 실어 올린다."""
+    import devcrew.decision as decision_mod
+    from devcrew.slack_engine import EngineRunner, RepoAskUser
+
+    ws = _repo_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(decision_mod, "make_llm_decide",
+                        _leader("ASK_USER", "dev-crew 오타로 보입니다"))
+
+    runner = EngineRunner(runtime_dir=tmp_path / "rt")
+    with pytest.raises(RepoAskUser) as ei:
+        await runner.run("dev-crw: 로그 고쳐")
+    assert ei.value.name == "dev-crw"
+    assert "오타" in ei.value.rationale
+    assert list(ws.iterdir()) == []            # 아무것도 만들지 않았다
+
+
+@pytest.mark.asyncio
+async def test_abort_decision_creates_nothing(tmp_path, monkeypatch):
+    import devcrew.decision as decision_mod
+    from devcrew.repos import RepoRegistryError
+    from devcrew.slack_engine import EngineRunner, RepoAskUser
+
+    ws = _repo_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(decision_mod, "make_llm_decide", _leader("ABORT", "요청이 불명확"))
+
+    runner = EngineRunner(runtime_dir=tmp_path / "rt")
+    with pytest.raises(RepoRegistryError) as ei:
+        await runner.run("nope: 뭔가 해줘")
+    assert not isinstance(ei.value, RepoAskUser)   # 버튼을 띄우지 않는다
+    assert list(ws.iterdir()) == []
+
+
+# ── 생성 버튼 클릭 ───────────────────────────────────────────────────────────
+class _ClickRunner:
+    """handle_create_repo_click이 러너에게 기대하는 표면만 가진 대역."""
+
+    def __init__(self, *, fail: Exception | None = None):
+        self.pending: dict[str, dict] = {}
+        self.created: list[str] = []
+        self.ran: list[str] = []
+        self.fail = fail
+
+    def pending_repo(self, key):
+        return self.pending.get(key)
+
+    def pop_pending_repo(self, key):
+        return self.pending.pop(key, None)
+
+    def create_repo_now(self, name):
+        if self.fail:
+            raise self.fail
+        self.created.append(name)
+        return f"/ws/{name}"
+
+    async def run(self, task, **kw):
+        self.ran.append(task)
+        return "SLACK-9", FakeResult(), "todo-web · wt/slack-9"
+
+
+@pytest.mark.asyncio
+async def test_click_creates_and_reruns_the_original_task():
+    from devcrew.slack_engine import handle_create_repo_click
+
+    r = _ClickRunner()
+    r.pending["K"] = {"name": "todo-web", "task": "todo-web: 만들어줘", "user": "U1"}
+    posted: list[str] = []
+
+    status = await handle_create_repo_click(
+        r, key="K", user="U1", post=lambda t: _collect(posted, t))
+    assert r.created == ["todo-web"]
+    assert r.ran == ["todo-web: 만들어줘"]      # 접두 포함 원문 — 이제 registry에 있다
+    assert "생성됨" in status
+    assert "K" not in r.pending                  # 중복 클릭 방지
+
+
+@pytest.mark.asyncio
+async def test_click_by_a_stranger_creates_nothing_and_keeps_the_button():
+    from devcrew.slack_engine import handle_create_repo_click
+
+    r = _ClickRunner()
+    r.pending["K"] = {"name": "todo-web", "task": "t", "user": "U1"}
+    posted: list[str] = []
+
+    status = await handle_create_repo_click(
+        r, key="K", user="U2", post=lambda t: _collect(posted, t))
+    assert r.created == [] and r.ran == []
+    assert status == ""                          # 빈 문자열 = 버튼을 걷지 않는다
+    assert "K" in r.pending                      # 주인이 아직 누를 수 있다
+    assert any("요청을 보낸 사용자만" in p for p in posted)
+
+
+@pytest.mark.asyncio
+async def test_click_on_an_expired_key_says_so():
+    from devcrew.slack_engine import handle_create_repo_click
+
+    r = _ClickRunner()
+    status = await handle_create_repo_click(r, key="GONE", user="U1",
+                                            post=lambda t: _collect([], t))
+    assert "만료" in status and r.created == []
+
+
+@pytest.mark.asyncio
+async def test_click_reports_creation_failure_without_running():
+    from devcrew.repos import RepoRegistryError
+    from devcrew.slack_engine import handle_create_repo_click
+
+    r = _ClickRunner(fail=RepoRegistryError("이미 있다"))
+    r.pending["K"] = {"name": "todo-web", "task": "t", "user": "U1"}
+    posted: list[str] = []
+
+    status = await handle_create_repo_click(
+        r, key="K", user="U1", post=lambda t: _collect(posted, t))
+    assert r.ran == []                           # 만들지 못했으면 실행하지 않는다
+    assert "실패" in status
+    assert any("이미 있다" in p for p in posted)
+
+
+async def _collect(sink: list, text: str) -> None:
+    sink.append(text)
+
+
+@pytest.mark.asyncio
+async def test_preflight_leader_session_is_reclaimed(tmp_path, monkeypatch):
+    """일회성 leader 세션을 안 걷으면 미등록 repo 요청 하나마다 워커가 하나씩 남는다.
+
+    tutor에서 17시간 산 워커를 실제로 발견한 그 실수다 (lessons C13).
+    """
+    import devcrew.decision as decision_mod
+    from devcrew.schema import Provider
+    from devcrew.slack_engine import EngineRunner, RepoAskUser
+
+    _repo_env(tmp_path, monkeypatch)
+    fake_inst = type("I", (), {"provider": Provider.CLAUDE_CODE, "instance_id": "ORCH-1"})()
+
+    def factory(orch, cfg, *, mcp_servers=None, leader_state=None, **kw):
+        async def decide(trigger, snapshot):
+            leader_state.update({"inst": fake_inst, "sid": "sess-1"})
+            return {"action": "ASK_USER", "target_node": None, "rationale": "애매"}, "ORCH-1", 1
+        return decide
+
+    monkeypatch.setattr(decision_mod, "make_llm_decide", factory)
+
+    runner = EngineRunner(runtime_dir=tmp_path / "rt")
+    archived: list[str] = []
+    finished: list[str] = []
+
+    class FakeAdapter:
+        async def archive(self, sid):
+            archived.append(sid)
+
+    runner.orch.adapters[Provider.CLAUDE_CODE] = FakeAdapter()
+    monkeypatch.setattr(runner.orch.registry, "finish", lambda iid: finished.append(iid))
+
+    with pytest.raises(RepoAskUser):
+        await runner.run("todo-web: 만들어줘")
+    assert archived == ["sess-1"]
+    assert finished == ["ORCH-1"]

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from .schema import Role
 
 DECISION_ACTIONS = ["PROCEED", "RETRY_NODE", "ESCALATE_MODEL", "SKIP_NODE",
-                    "REPLAN", "ASK_USER", "ABORT"]
+                    "REPLAN", "ASK_USER", "ABORT", "CREATE_REPO"]
 
 # 트리거별 허용 action — 엔진이 LLM 결정을 이 목록과 대조 검증한다 (spec 결정 3)
 ALLOWED_BY_TRIGGER: dict[str, list[str]] = {
@@ -19,6 +19,11 @@ ALLOWED_BY_TRIGGER: dict[str, list[str]] = {
     "BLOCKED": ["RETRY_NODE", "ESCALATE_MODEL", "ASK_USER", "ABORT"],
     "INSUFFICIENT_CAPABILITY": ["ESCALATE_MODEL", "ASK_USER", "ABORT"],
     "LOOP_GUARD_EXCEEDED": ["REPLAN", "ESCALATE_MODEL", "ASK_USER", "ABORT"],
+    # 실행 **이전** 결정 — 워크플로 노드가 아니라 Slack 계층에서 발생한다.
+    # `이름:` 접두가 registry에 없을 때, 오타인지 아직 없는 새 프로젝트인지는
+    # 요청 본문을 봐야 안다. leader가 판단하고 **엔진이** 만든다 — leader에게
+    # 쓰기 도구를 주지 않는다는 불변 조건은 그대로다.
+    "UNKNOWN_REPO": ["CREATE_REPO", "ASK_USER", "ABORT"],
 }
 
 

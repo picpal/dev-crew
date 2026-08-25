@@ -29,7 +29,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .repos import RepoRegistryError, load_repo_bases, load_repos, split_repo_target
+from .repos import (RepoRegistryError, UnknownRepoError, create_repo,
+                    format_repo_names, load_repo_bases, load_repos,
+                    split_repo_target, workspace_roots)
 from .usage import context_badge, measure
 from .worktree import WorktreeManager
 
@@ -113,6 +115,43 @@ def stop_blocks(execution_id: str, warning: str) -> list[dict]:
             "type": "button", "style": "danger",
             "text": {"type": "plain_text", "text": "🛑 실행 중지", "emoji": True},
             "action_id": STOP_ACTION, "value": execution_id}]},
+    ]
+
+
+# 미등록 repo를 새로 만들지 묻는 버튼. leader가 확신하지 못했을 때만 뜬다.
+CREATE_REPO_ACTION = "engine_create_repo"
+
+
+class RepoAskUser(RepoRegistryError):
+    """leader가 새 repo 생성을 확신하지 못했다 — 사람에게 버튼으로 묻는다.
+
+    `RepoRegistryError` 하위라, 버튼을 못 그리는 호출자도 종전대로 메시지만 보낸다.
+    """
+
+    def __init__(self, name: str, rationale: str, available):
+        self.name = name
+        self.rationale = rationale or ""
+        self.available = sorted(available)
+        super().__init__(
+            f"등록되지 않은 repo {name!r}"
+            + (f" — {self.rationale}" if self.rationale else "")
+            + f"\n사용 가능: {format_repo_names(self.available)}")
+
+
+def create_repo_blocks(name: str, key: str, rationale: str, available) -> list[dict]:
+    """새 repo 생성 확인 버튼. 오타 한 번이 workspace에 영구 등록되는 걸 막는 관문이다
+    (자동 등록이라 한번 만들어지면 목록에서 사라지지 않는다)."""
+    lines = [f"🤔 등록되지 않은 repo *{name}*"]
+    if rationale:
+        lines.append(rationale)
+    lines.append(f"_사용 가능: {format_repo_names(available)}_")
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}},
+        {"type": "actions", "elements": [{
+            "type": "button", "style": "primary",
+            "text": {"type": "plain_text", "text": f"🌱 {name} 새로 만들기"[:75],
+                     "emoji": True},
+            "action_id": CREATE_REPO_ACTION, "value": key}]},
     ]
 
 
@@ -232,6 +271,9 @@ class EngineRunner:
         self._threads: dict[str, dict] = {}
         # 사용자가 중지를 요청한 execution_id — 엔진이 노드 경계에서 확인한다
         self._stop_requests: set[str] = set()
+        # leader가 ASK_USER한 repo 생성 요청 — 버튼 클릭까지 원문을 들고 있는다.
+        # Slack 버튼 value는 2,000자 제한이라 task를 직접 실을 수 없다.
+        self._pending_repo: dict[str, dict] = {}
 
     def _next_seq_start(self) -> int:
         top = 0
@@ -243,6 +285,87 @@ class EngineRunner:
 
     def request_stop(self, execution_id: str) -> None:
         self._stop_requests.add(execution_id)
+
+    # ── 미등록 repo: leader가 판단하고 엔진이 만든다 ─────────────────────────
+    async def _close_leader(self, state: dict) -> None:
+        """일회성 leader 세션 회수. 안 하면 요청 하나마다 워커가 하나씩 남는다."""
+        inst, sid = state.get("inst"), state.get("sid")
+        if inst is None:
+            return
+        if sid:
+            try:
+                await self.orch.adapters[inst.provider].archive(sid)
+            except Exception:
+                pass
+        try:
+            self.orch.registry.finish(inst.instance_id)
+        except Exception:
+            pass
+
+    async def resolve_unknown_repo(self, err: UnknownRepoError, task: str) -> None:
+        """CREATE_REPO면 만들고 registry를 갱신한다. 아니면 RepoRegistryError를 던진다.
+
+        leader에게는 쓰기 도구를 주지 않는다 (불변 조건 2) — 판단만 받고 실제 생성은
+        여기서 한다. 결정이 허용 목록 밖이면 `validate_decision`이 ASK_USER로 강등하므로
+        최악의 경우에도 사람에게 묻는 쪽으로 닫힌다.
+        """
+        from .decision import make_llm_decide
+        from .workflow import ALLOWED_BY_TRIGGER
+
+        roots = workspace_roots()
+        execution_id = f"SLACK-{next(self._seq)}"
+        snapshot = {
+            "trigger": "UNKNOWN_REPO",
+            "execution_id": execution_id,
+            "task": task,
+            "requested_repo": err.name,
+            "available_repos": err.available,
+            "workspace_root": str(roots[0]) if roots else None,
+            "allowed_actions": ALLOWED_BY_TRIGGER["UNKNOWN_REPO"],
+        }
+        leader: dict = {}
+        try:
+            decide = make_llm_decide(self.orch, self.cfg, mcp_servers=self.mcp,
+                                     leader_state=leader)
+            decision, _iid, _tokens = await decide("UNKNOWN_REPO", snapshot)
+        finally:
+            await self._close_leader(leader)
+
+        action = decision.get("action")
+        why = str(decision.get("rationale") or "")
+        self.trace.append("UnknownRepoDecisionEvent", task_id=execution_id,
+                          execution_id=execution_id,
+                          payload={"repo": err.name, "action": action, "rationale": why})
+        if action == "CREATE_REPO":
+            self.create_repo_now(err.name)
+            return
+        if action == "ABORT":
+            raise RepoRegistryError(f"repo {err.name!r} 요청을 중단했습니다 — {why}")
+        raise RepoAskUser(err.name, why, err.available)
+
+    def create_repo_now(self, name: str):
+        """workspace에 새 repo를 만들고 **registry를 즉시 갱신한다**.
+
+        `self.repos`는 기동 시 1회만 로드된다 — 갱신하지 않으면 방금 만든 repo가
+        다음 파싱에서도 미등록이라 무한히 같은 질문을 하게 된다.
+        """
+        path = create_repo(name, workspace_roots())
+        self.repos = load_repos()
+        self.repo_bases = load_repo_bases()
+        if name not in self.repos:                  # 만들었는데 안 잡히면 조용히 넘기지 않는다
+            raise RepoRegistryError(
+                f"repo {name!r}를 {path}에 만들었지만 registry에 잡히지 않았다 "
+                "— workspace_roots 설정을 확인하라")
+        return path
+
+    def remember_pending_repo(self, key: str, *, name: str, task: str, user: str) -> None:
+        self._pending_repo[key] = {"name": name, "task": task, "user": user}
+
+    def pending_repo(self, key: str) -> dict | None:
+        return self._pending_repo.get(key)
+
+    def pop_pending_repo(self, key: str) -> dict | None:
+        return self._pending_repo.pop(key, None)
 
     def busy_for(self, thread_key: str) -> bool:
         """이 스레드가 쓰는 repo에서 실행이 도는 중인가 (초기화 거부 판단용)."""
@@ -305,7 +428,15 @@ class EngineRunner:
 
         # 오타·잘못된 브랜치는 여기서 fail-fast. `repo@브랜치:`의 브랜치는 이번
         # 요청에 한해 repos.yaml의 고정 base를 덮어쓴다.
-        repo_name, req_branch, task = split_repo_target(task, self.repos)
+        try:
+            repo_name, req_branch, task = split_repo_target(task, self.repos)
+        except UnknownRepoError as e:
+            # 오타인지 아직 없는 새 프로젝트인지는 요청 본문을 봐야 안다 — leader에게
+            # 묻고, CREATE_REPO면 **엔진이** 만든다 (leader에겐 쓰기 도구가 없다).
+            await self.resolve_unknown_repo(e, task)
+            # 다시 파싱해 registry 갱신이 실제로 됐는지 확인한다 — 조용히 통과시키면
+            # 방금 만든 repo를 또 "미등록"이라 하게 된다 (self.repos는 기동 시 1회 로드).
+            repo_name, req_branch, task = split_repo_target(task, self.repos)
         # 같은 repo는 직렬(worktree 브랜치 경합·리뷰 혼선 방지), 다른 repo·toy는 병렬
         async with self._lock_for(repo_name or "_toy"):
             n = next(self._seq)
@@ -683,6 +814,13 @@ class MentionHandler:
             execution_id, result, repo = await self.runner.run(
                 task, on_progress=_status, on_warning=_warn, thread_key=thread_ts)
             await say(text=format_result(execution_id, result, repo), thread_ts=thread_ts)
+        except RepoAskUser as e:
+            # leader가 확신하지 못했다 — 사람이 버튼으로 정한다. 원문은 러너가 들고 있는다.
+            key = f"{channel}:{thread_ts}"
+            self.runner.remember_pending_repo(
+                key, name=e.name, task=task, user=(event.get("user") or ""))
+            await say(text=f"⚠️ {e}", thread_ts=thread_ts,
+                      blocks=create_repo_blocks(e.name, key, e.rationale, e.available))
         except RepoRegistryError as e:
             await say(text=f"⚠️ {e}", thread_ts=thread_ts)
         except asyncio.TimeoutError:
@@ -690,6 +828,35 @@ class MentionHandler:
                       thread_ts=thread_ts)
         except Exception as e:                          # 엔진 예외는 스레드로 회신
             await say(text=f"💥 실행 실패: {type(e).__name__}: {e}", thread_ts=thread_ts)
+
+
+async def handle_create_repo_click(runner, *, key: str, user: str, post) -> str:
+    """생성 버튼 클릭 처리. 상태 문자열을 반환한다 (원본 메시지를 대체할 텍스트).
+
+    bolt 클로저가 아니라 여기 두는 이유는 테스트가 닿아야 하기 때문이다 (CLAUDE.md §6).
+    `post`는 `async (text, blocks=None)` — 스레드에 후속 메시지를 남긴다.
+    """
+    pend = runner.pending_repo(key)
+    if pend is None:
+        return "⚠️ 만료된 요청입니다. 다시 멘션해 주세요."
+    if user and pend["user"] and user != pend["user"]:
+        # 남의 요청으로 repo를 만들게 두지 않는다 (brain의 주인 권한과 같은 규칙).
+        await post("⚠️ 이 요청을 보낸 사용자만 repo를 만들 수 있습니다.")
+        return ""                     # 원본 버튼은 그대로 둔다 — 주인이 아직 눌러야 한다
+    runner.pop_pending_repo(key)
+    name, task = pend["name"], pend["task"]
+    try:
+        path = runner.create_repo_now(name)
+    except RepoRegistryError as e:
+        await post(f"⚠️ {e}")
+        return f"⚠️ `{name}` 생성 실패"
+    await post(f"🌱 `{name}` 생성 완료 — `{path}`\n요청을 이어서 실행합니다.")
+    try:
+        execution_id, result, repo = await runner.run(task)
+        await post(format_result(execution_id, result, repo))
+    except Exception as e:
+        await post(f"💥 실행 실패: {type(e).__name__}: {e}")
+    return f"🌱 `{name}` 생성됨"
 
 
 async def _amain() -> None:
@@ -727,6 +894,22 @@ async def _amain() -> None:
         # 버튼을 걷어내 중복 클릭을 막고, 중지 요청 상태를 그 자리에 남긴다
         await respond(replace_original=True, text=f"🛑 {execution_id} 중지 요청됨",
                       blocks=stopped_blocks(execution_id))
+
+    @app.action(CREATE_REPO_ACTION)
+    async def on_create_repo(ack, body, respond):
+        await ack()
+        key = ((body.get("actions") or [{}])[0]).get("value") or ""
+        ch = (body.get("channel") or {}).get("id")
+        msg = body.get("message") or {}
+        thread = msg.get("thread_ts") or msg.get("ts")
+
+        async def post(text: str) -> None:
+            await app.client.chat_postMessage(channel=ch, thread_ts=thread, text=text)
+
+        status = await handle_create_repo_click(
+            runner, key=key, user=(body.get("user") or {}).get("id", ""), post=post)
+        if status:                        # 빈 문자열이면 버튼을 그대로 둔다
+            await respond(replace_original=True, text=status, blocks=[])
 
     @app.event("message")
     async def on_message(body, logger):                # crew는 mention만 받는다
