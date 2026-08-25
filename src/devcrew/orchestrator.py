@@ -22,9 +22,12 @@ _EFFORT_BY_STR = {"low": EffortLevel.LOW, "medium": EffortLevel.MEDIUM,
                   "max": EffortLevel.MAX}
 
 WORKER_ROLES = {Role.EXPLORER, Role.DEVELOPER, Role.REVIEWER, Role.QA}
-# role 번들이 존재해 spawn 시 로드해야 하는 role 전체 (워크플로 worker + 결정/대화 role)
+# role 번들이 존재해 spawn 시 로드해야 하는 role 전체 (워크플로 worker + 결정/대화 role).
+# 여기 빠지면 spawn()이 role_bundle_version을 안 찍고, start_worker()가 재로드한
+# 번들과 버전이 달라(None != 실제 버전) RoleBundleError로 죽는다.
 BUNDLED_ROLES = WORKER_ROLES | {Role.ORCHESTRATOR, Role.BRAIN,
-                                Role.TUTOR, Role.TUTOR_VERIFIER}
+                                Role.TUTOR, Role.TUTOR_VERIFIER, Role.TUTOR_TA,
+                                Role.TUTOR_CODE, Role.TUTOR_VIS}
 
 
 class ReviewQueue:
@@ -143,6 +146,12 @@ class Orchestrator:
         # 매 turn을 JSON으로 강제하면 자연어 인터뷰가 불가능하므로 output_schema 주입만
         # 생략한다. role prompt/tool policy/cwd 강제는 그대로 유지된다. 최종 brief는
         # 별도의 비대화(conversational=False) 세션이 스키마 강제로 산출한다.
+        #
+        # **이 플래그가 하는 일은 스키마 생략 하나뿐이다** — 세션이 turn을 넘어
+        # 유지되는지와는 무관하다(세션 지속은 adapter.start_session의 성질이다).
+        # "여러 turn을 이어 쓰니까 conversational이겠지"로 읽고 붙이면 그 세션은
+        # structured_output을 영영 못 받는다 (2026-08-24 C1: TUTOR_TA가 그렇게
+        # 실패했다 — 매 turn이 스키마 제출인 role은 이 플래그를 쓰면 안 된다).
         session_id = await adapter.start_session(
             inst, initial_message,
             system_prompt=system_prompt,

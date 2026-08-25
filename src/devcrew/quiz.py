@@ -173,6 +173,25 @@ def _check_evidence(ev: Evidence, root: Path) -> str | None:
     return None
 
 
+def verify_evidence(evs: list[Evidence],
+                    root: str | Path) -> tuple[list[Evidence], list[tuple[Evidence, str]]]:
+    """근거를 파일에 대조해 실재하는 것만 남긴다 (LLM 없음, 결정적).
+
+    반환: `(통과, [(버린 evidence, 사유)])`.
+
+    **처분은 호출자가 정한다.** 출제는 하나라도 가짜면 문항을 버리지만(장식 근거가
+    정답의 근거인 척할 수 있다), 후속 질문 답변은 틀린 인용만 떼고 본문은 낸다.
+    검사 자체는 하나여야 하므로 여기로 꺼냈다.
+    """
+    root = Path(root).resolve()
+    kept: list[Evidence] = []
+    dropped: list[tuple[Evidence, str]] = []
+    for e in evs:
+        reason = _check_evidence(e, root)
+        (dropped.append((e, reason)) if reason else kept.append(e))
+    return kept, dropped
+
+
 def verify_citations(questions: list[Question],
                      root: str | Path) -> tuple[list[Question], list[tuple[Question, str]]]:
     """근거를 실제 파일에 대조해 지어낸 문항을 버린다 (LLM 없음, 결정적).
@@ -189,8 +208,8 @@ def verify_citations(questions: list[Question],
         if not q.evidence:
             dropped.append((q, "no-evidence"))
             continue
-        reason = next((r for e in q.evidence if (r := _check_evidence(e, root))), None)
-        (dropped.append((q, reason)) if reason else passed.append(q))
+        _kept, drops = verify_evidence(q.evidence, root)
+        (dropped.append((q, drops[0][1])) if drops else passed.append(q))
     return passed, dropped
 
 
@@ -231,6 +250,18 @@ def grade(questions: list[Question], answers: dict[int, int]) -> Scorecard:
 GRADED_EVENT = "QuizGradedEvent"   # 회차 채점 결과 — 오답·해소를 한 이벤트에 담는다
 ISSUED_EVENT = "QuizIssuedEvent"
 ANSWER_EVENT = "QuizAnswerEvent"
+QUESTION_EVENT = "QuizQuestionEvent"     # 후속 질문 (#19)
+TA_ANSWER_EVENT = "QuizTAAnswerEvent"    # 그 답변
+# GRADED_EVENT는 note_id(사용자·repo) 네임스페이스에 쌓여 여러 회차가 공유한다 — 그래서
+# "어느 회차가" 채점됐는지 특정하지 못한다. 회차 자신의 execution_id(QUIZ-*)에 남기는
+# 이 이벤트만이 "이 회차가 채점됐다"를 안전하게 뜻한다 (#19, 리뷰 2026-08-24).
+ROUND_GRADED_EVENT = "QuizRoundGradedEvent"
+# 출제·검증 세션이 실패한 **사유**. `notes`는 메모리라 회차가 끝나면 사라지고,
+# 사용자에게는 "문항을 만들지 못했습니다"만 남는다 — 그러면 원인을 영영 못 본다
+# (2026-08-24 15:52 출제자가 6분 반을 쓰고 0문항을 냈는데 이유가 어디에도 없었다).
+AUTHOR_FAILED_EVENT = "QuizAuthorFailedEvent"
+# 리포트 발행이 실패한 사유. 같은 이유로 남긴다 (2026-08-24 16:29 실제 실패).
+REPORT_FAILED_EVENT = "QuizReportFailedEvent"
 
 
 def note_id(user: str, repo: str) -> str:

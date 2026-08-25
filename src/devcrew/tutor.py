@@ -18,7 +18,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 
-from .quiz import Question, parse_questions, verify_citations
+from .quiz import (AUTHOR_FAILED_EVENT, Question, parse_questions, verify_citations)
 from .schema import Role
 from .untrusted import NOTE, fence
 
@@ -111,6 +111,10 @@ async def _ask(orch, cfg, role: Role, *, exec_id: str, node_id: str, scope: str,
     enforcement 정책 누락(KeyError)이 이렇게 보이지 않는 실패가 됐다."""
     tier = cfg.role_defaults[role].tier
     inst = None
+    # `sid`를 **밖에** 둔다. 안쪽 코루틴의 지역변수로 두면 실패·취소 시 세션을 가리키는
+    # 것이 프로그램 어디에도 남지 않아 `archive`할 손잡이가 사라진다 — 회차마다 워커가
+    # 하나씩 살아남았다 (2026-08-24, tutor_ta._open과 같은 결함).
+    sid: str | None = None
     try:
         inst = await orch.spawn(role, tier, execution_id=exec_id, node_id=node_id,
                                 task_scope=scope, worktree=worktree)
@@ -121,18 +125,35 @@ async def _ask(orch, cfg, role: Role, *, exec_id: str, node_id: str, scope: str,
             # 시킨다. 상한을 nudge에만 걸면 정작 매달리는 쪽이 무방비가 된다
             # (2026-08-24: 첫 turn이 끝나지 않아 `_lock` 뒤의 모든 회차가 조용히
             # 멈췄다 — 사용자에게는 "@tutor가 무반응"으로만 보였다).
+            nonlocal sid
             sid = await orch.start_worker(inst, intro)
             return await orch.adapters[inst.provider].send(sid, nudge)
 
         out = await asyncio.wait_for(_both_turns(), timeout=TURN_TIMEOUT)
     except Exception as e:
+        reason = f"{type(e).__name__}: {e}"
         if notes is not None:
-            notes.append(f"{role.value} 세션 실패: {type(e).__name__}: {e}")
+            notes.append(f"{role.value} 세션 실패: {reason}")
+        # **사유를 trace에도 남긴다.** notes는 메모리라 회차가 끝나면 사라지고, 화면에는
+        # "문항을 만들지 못했습니다"만 남는다 — 그러면 원인을 나중에 볼 방법이 없다.
+        try:
+            orch.trace.append(AUTHOR_FAILED_EVENT, task_id=exec_id, execution_id=exec_id,
+                              payload={"role": role.value, "node": node_id,
+                                       "reason": reason})
+        except Exception:
+            pass
         return None
     finally:
         if inst is not None:
+            # 1회용 인스턴스다 — 프로세스(`archive`)와 registry 행(`finish`)을 **둘 다**
+            # 반납한다. `finish`만 하면 행은 닫히는데 워커는 계속 돈다.
+            if sid is not None:
+                try:
+                    await orch.adapters[inst.provider].archive(sid)
+                except Exception:
+                    pass
             try:
-                orch.registry.finish(inst.instance_id)  # 1회용 인스턴스 반납
+                orch.registry.finish(inst.instance_id)
             except Exception:
                 pass
     return out.structured if isinstance(out.structured, dict) else None
@@ -183,10 +204,25 @@ async def _verify(orch, cfg, *, exec_id, repo_path, questions: list[Question],
 
 
 async def issue_quiz(orch, cfg, *, repo_name: str | None, repo_path: str | None,
-                     exec_id: str, misses: list[dict],
-                     count: int = QUIZ_COUNT) -> IssueResult:
-    """한 회차를 출제한다. 반환 문항이 `count`보다 적으면 `shortfall`이 선다."""
+                     exec_id: str, misses: list[dict], count: int = QUIZ_COUNT,
+                     progress=None) -> IssueResult:
+    """한 회차를 출제한다. 반환 문항이 `count`보다 적으면 `shortfall`이 선다.
+
+    `progress(stage)`는 단계가 바뀔 때마다 불린다(async). 이 파이프라인은 실측 18분까지
+    걸리는데 그동안 호출자가 아무 말도 못 하면 사용자에게는 **무반응과 구분되지 않는다**
+    (2026-08-24: 회차 시작부터 첫 문항까지 18분 침묵 → 사용자가 멘션을 반복했다).
+    진행 표시가 실패해도 출제는 계속한다 — 곁다리가 본 작업을 죽이면 안 된다.
+    """
     notes: list[str] = []
+
+    async def _tick(stage: str) -> None:
+        if progress is None:
+            return
+        try:
+            await progress(stage)
+        except Exception:
+            pass
+
     allowed = {m["q_key"]: m.get("evidence") or []
                for m in misses if m.get("q_key")}
     intro = AUTHOR_INTRO.format(n=DRAFT_COUNT)
@@ -196,12 +232,15 @@ async def issue_quiz(orch, cfg, *, repo_name: str | None, repo_path: str | None,
                                                     ensure_ascii=False, indent=1)),
             k=MAX_CARRIED)
 
+    await _tick(f"출제 중… ({DRAFT_COUNT}문항 초안)")
     drafted = await _author(orch, cfg, exec_id=exec_id, repo_path=repo_path,
                             intro=intro, allowed_keys=allowed, notes=notes)
+    await _tick(f"인용 대조 중… (초안 {len(drafted)}문항)")
     cited, dropped = verify_citations(drafted, repo_path or ".")
     if dropped:
         notes.append(f"인용 대조에서 {len(dropped)}문항 폐기 "
                      f"({', '.join(sorted({r for _, r in dropped}))})")
+    await _tick(f"교차 검증 중… ({len(cited)}문항)")
     verified, rejects = await _verify(orch, cfg, exec_id=exec_id,
                                       repo_path=repo_path, questions=cited, notes=notes)
     if rejects:

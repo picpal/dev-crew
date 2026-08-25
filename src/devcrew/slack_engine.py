@@ -416,20 +416,20 @@ def slack_posters(brain_client, crew_client):
 
 
 def make_tutor_say(client, channel: str, thread):
-    """@tutor 응답 poster — 스레드에 달되 **채널에도 함께 게시한다**.
+    """@tutor 응답 poster — 회차는 **스레드 안에서만** 돈다.
 
-    스레드 답글은 어느 클라이언트에서도 채널 피드에 뜨지 않는다. 데스크톱은 멘션 직후
-    스레드 패널이 열린 채라 보였을 뿐이고, 모바일에는 그 패널이 없어 회차 전체가 통째로
-    보이지 않았다 (2026-08-24). 회차 상태의 키는 여전히 `thread_ts`이므로 이어 풀기·재개는
-    그대로다 — 게시 위치만 넓힌다.
+    한때 `reply_broadcast=True`로 채널에도 함께 게시했다. "모바일에서 회차가 안 보인다"는
+    진단 때문이었는데 그 진단이 반쪽이었다 — 스레드 답글은 PC든 모바일이든 스레드 안에서
+    정상적으로 보인다. broadcast가 바꾸는 것은 *스레드를 열지 않아도 보이느냐* 하나뿐이고,
+    그 한 탭의 대가로 **정답과 해설이 채널 전체에 게시**됐다. 후속 질문 답변에는 회차의
+    답안지가 그대로 들어 있으므로, 같은 채널에서 아직 그 repo를 풀지 않은 사람에게는
+    스포일러다 (2026-08-24 최종 리뷰 I7 → 사용자 결정으로 broadcast 철회).
 
-    `reply_broadcast`는 스레드 답글에만 유효하다. 스레드가 없으면 켜지 않는다.
+    모바일에서는 부모 메시지의 "N개의 답글"을 탭하거나 스레드 탭에서 본다.
     """
     async def say(*, text, thread_ts=None, blocks=None):
-        ts = thread_ts or thread
         return await client.chat_postMessage(
-            channel=channel, text=text, thread_ts=ts, blocks=blocks,
-            reply_broadcast=bool(ts))
+            channel=channel, text=text, thread_ts=thread_ts or thread, blocks=blocks)
     return say
 
 
@@ -459,6 +459,87 @@ def make_tutor_action(tutor, client):
         await tutor.on_answer(thread_ts=thread, value=value, say=say, strip=strip,
                               channel=ch, user=(body.get("user") or {}).get("id", ""))
     return on_action
+
+
+# 문두의 "@tutor" 주소 지정 토큰 딱 하나만 지운다. `+`로 "한 개 이상"을 허용하면
+# "<@U0BRV19AMLL> <@U999>가 왜 여기 나와?"처럼 질문 본문이 멘션으로 시작할 때 그
+# 본문 멘션까지 선두로 취급해 같이 삼켜버린다 — `^`로 문자열 시작에 고정하되 토큰은
+# 정확히 하나만 매치해서 본문 중간(혹은 바로 뒤)의 다른 사람 멘션은 건드리지 않는다.
+_TUTOR_MENTION_PREFIX_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*")
+
+
+def make_tutor_question(tutor, client):
+    """스레드 후속 질문 라우터 (#19). `message`와 `app_mention` 둘 다 여기로 모은다.
+
+    **봇 메시지와 subtype 붙은 메시지는 진입 전에 버린다.** `message.channels` 구독은
+    스레드 답글도 배달하므로, 봇이 스레드에 단 답변이 그대로 `message` 이벤트로 되돌아온다
+    (broadcast를 껐어도 마찬가지다) — 거르지 않으면 봇이 자기 답변에 답하는 무한 루프가 된다.
+
+    스레드 밖(최상위) 메시지도 버린다. 회차는 스레드 단위이므로 스레드가 없으면
+    후속 질문일 수 없다.
+
+    **스레드 안에서 `@tutor 질문`을 하면 Slack이 `app_mention`과 `message` 두 이벤트를
+    서로 다른 `event_id`로 각각 보낸다.** `TutorHandler._dedupe`는 `event_id`로 걸러
+    이 경우를 못 잡는다(애초에 이 라우터는 그걸 호출하지도 않는다) — 그래서 메시지
+    자신의 정체성인 `(channel, ts)`로 직접 막는다. `app_mention` 분기를 없애서 풀 수도
+    있어 보이지만, `docs/tutor-setup.md`가 현재 `app_mention` 구독만 안내하고 있어서
+    그 설정의 워크스페이스에는 그게 유일한 경로다 — 지우면 기능이 통째로 사라진다.
+    """
+    seen: set[tuple[str, str]] = set()
+    max_seen = 1000
+
+    async def route(body: dict) -> None:
+        ev = body.get("event") or {}
+        if ev.get("bot_id") or ev.get("subtype"):
+            return
+        thread = ev.get("thread_ts")
+        if not thread or thread == ev.get("ts"):
+            return
+        key = (ev.get("channel", ""), ev.get("ts", ""))
+        if key in seen:
+            return
+        if len(seen) >= max_seen:
+            seen.clear()
+        seen.add(key)
+        text = _TUTOR_MENTION_PREFIX_RE.sub("", ev.get("text") or "").strip()
+        if not text:
+            return
+        ch = ev.get("channel", "")
+        say = make_tutor_say(client, ch, thread)
+        await tutor.on_question(thread_ts=thread, text=text,
+                                user=ev.get("user") or "", say=say, channel=ch)
+    return route
+
+
+def make_tutor_dispatch(tutor, client, question=None):
+    """`app_mention` 라우팅 결정 — 스레드 안의 회차에 대한 멘션이면 질문, 아니면 회차 시작.
+
+    **클로저 밖**에 둔다. 이 분기가 `_amain` 안에 있으면 세 줄을 통째로 지워도 테스트가
+    전부 초록이다 — 이 저장소가 배선을 두 번 조용히 잃은 그 자리다 (lessons.md C1).
+
+    회차 유무를 보는 이유: **모든** in-thread 멘션을 질문으로 보내면 스레드 안에서
+    `@tutor myrepo:` 로 새 회차를 시작하는 길이 사라진다. `on_question`은 회차가 없는
+    스레드에서 조용히 무시하므로(그게 옳다 — 봇과 무관한 대화에 끼어들지 않는다)
+    사용자에게는 무반응으로만 보인다. repo 접두사 검증은 `on_mention`이 이미 하므로
+    여기서 겹쳐 하지 않는다.
+
+    `question`은 `message` 핸들러가 쓰는 라우터와 **같은 인스턴스여야 한다.** 중복
+    차단 상태(`(channel, ts)` set)가 그 클로저 안에 있어서, 따로 만들면 스레드 안의
+    `@tutor 질문`이 app_mention과 message 두 이벤트로 각각 통과해 같은 질문에 답이
+    두 번 나간다. 넘기지 않으면 여기서 하나 만든다(단독 사용 편의).
+    """
+    question = question or make_tutor_question(tutor, client)
+
+    async def dispatch(body: dict) -> None:
+        ev = body.get("event") or {}
+        thread = ev.get("thread_ts")
+        if thread and thread != ev.get("ts") and tutor.has_round(thread):
+            await question(body)
+            return
+        say = make_tutor_say(client, ev.get("channel", ""), thread or ev.get("ts"))
+        await tutor.on_mention(body, say)
+
+    return dispatch
 
 
 def make_crew_dispatch(post_handoff, post_crew, handler, roots: dict | None = None,
@@ -717,7 +798,7 @@ async def _amain() -> None:
     tutor_bot = _real_token(os.environ.get("TUTOR_BOT_TOKEN"), "xoxb-")
     tutor_app_token = _real_token(os.environ.get("TUTOR_APP_TOKEN"), "xapp-")
     if tutor_bot and tutor_app_token:
-        from .slack_tutor import TutorHandler
+        from .slack_tutor import TutorHandler, sweep_loop
 
         tutor_app = AsyncApp(token=tutor_bot)
 
@@ -732,17 +813,22 @@ async def _amain() -> None:
         tutor = TutorHandler(runner.orch, runner.cfg, runner.repos,
                              react=tutor_react, status=tutor_status)
         tutor_action = make_tutor_action(tutor, tutor_app.client)
+        tutor_question = make_tutor_question(tutor, tutor_app.client)
+        # 같은 라우터 인스턴스를 넘긴다 — 중복 차단 상태를 공유해야 app_mention과
+        # message로 두 번 들어오는 같은 질문에 답이 두 번 나가지 않는다.
+        tutor_dispatch = make_tutor_dispatch(tutor, tutor_app.client, tutor_question)
 
         @tutor_app.event("app_mention")
         async def on_tutor_mention(body, say):
-            ev = body["event"]
-            tsay = make_tutor_say(tutor_app.client, ev["channel"],
-                                  ev.get("thread_ts") or ev.get("ts"))
-            await tutor.on_mention(body, tsay)
+            # 분기(질문이냐 새 회차냐)는 `make_tutor_dispatch`가 한다 — 클로저 안에
+            # 두면 배선이 통째로 사라져도 테스트가 전부 초록이다 (lessons.md C1).
+            await tutor_dispatch(body)
 
         @tutor_app.event("message")
         async def on_tutor_message(body, say):
-            return                       # 회차 진행은 버튼으로만 — 자유 답글은 받지 않는다
+            # 회차 진행(보기 선택)은 버튼으로만 받는다. 자유 답글은 채점이 끝난
+            # 회차의 **후속 질문**으로만 취급한다 (#19).
+            await tutor_question(body)
 
         @tutor_app.action(re.compile("tutor_answer_.*"))
         async def on_tutor_answer(ack, body):
@@ -757,6 +843,9 @@ async def _amain() -> None:
             await ack()
 
         tasks.append(AsyncSocketModeHandler(tutor_app, tutor_app_token).start_async())
+        # 유휴 TA 세션 청소. 축출이 답변 직후에만 돌면 "마지막 질문 뒤 아무도 안 묻는"
+        # 흔한 경우에 TTL이 무의미해진다 — 실제로 17시간 산 워커가 있었다 (2026-08-25).
+        tasks.append(sweep_loop(tutor))
         print("devcrew: @tutor 학습 앱 활성화")
 
     print("devcrew slack engine: Socket Mode 연결 중… (@mention으로 작업을 요청하세요)")

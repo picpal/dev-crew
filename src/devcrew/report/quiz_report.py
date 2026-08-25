@@ -18,6 +18,7 @@ import html as _html
 import re
 
 from ..quiz import Scorecard
+from .brain_report import md_lite
 from .charts import CHART_CSS, bar_chart, render_diagram
 
 TEMPLATE_VERSION = "quiz-2"
@@ -286,5 +287,72 @@ def render_quiz_report(card: Scorecard, *, repo: str | None,
 </section>
 {panel}
 {"".join(groups)}
+</main>
+</body></html>"""
+
+
+# ── 후속 질문 답변 리포트 ────────────────────────────────────────────────────
+# 답변은 Slack mrkdwn으로 쓰인다 — 굵게가 별 **하나**다. `_BOLD_RE`(이중 별표)만으로는
+# 강조가 전부 날문자로 남는다. `**이중**`은 건드리지 않도록 앞뒤 lookaround로 막는다.
+_SINGLE_BOLD_RE = re.compile(r"(?<![*\w])\*([^*\n]+)\*(?![*\w])")
+
+_TA_CSS = """
+.ta-prose{font-size:1.02rem;line-height:1.75}
+.ta-prose p{margin:0 0 .9em}
+.ta-prose ul,.ta-prose ol{margin:0 0 .9em 1.2em;padding:0}
+.ta-prose li{margin:.25em 0}
+.ta-prose pre{overflow-x:auto;padding:.8em 1em;border-radius:8px;
+  background:var(--surface-2);border:1px solid var(--line)}
+.ta-prose blockquote{margin:0 0 .9em;padding:.2em 0 .2em 1em;
+  border-left:3px solid var(--line);color:var(--ink-3)}
+.ta-q{margin:0;font-weight:600}
+/* vision은 자기 종이색(밝은 배경)을 가진 그림을 낸다 — 다크 모드에서 카드에
+   꽉 차면 흰 덩어리가 테두리에 붙는다. 여백을 줘 도판처럼 앉힌다. */
+.fig{margin:0;padding:6px}
+.fig svg{display:block;width:100%;height:auto;max-width:100%;border-radius:6px}
+"""
+
+
+def render_ta_answer(*, question: str, answer: str,
+                     citations, repo: str | None, diagram: str | None = None) -> str:
+    """후속 질문 답변 → 단일 파일 HTML.
+
+    Slack 한 메시지에 못 담는 답변만 여기로 온다. 스레드에는 첫 문단과 링크가 남는다
+    (`tutor_ta.slack_head`) — 자르고 "잘렸습니다"라고 적는 것보다 낫다.
+
+    **인용을 여기서 처음 보여준다.** 지금까지 citations는 trace에만 남고 학습자에게는
+    한 번도 보이지 않았다 — 모델이 산문에 적은 경로가 전부였다. 이미 기계 대조를 통과한
+    것들이라 그대로 실을 수 있다.
+    """
+    body = md_lite(_SINGLE_BOLD_RE.sub(r"**\1**", answer or "")) \
+        or '<p class="empty">답변 본문이 비어 있습니다.</p>'
+    evi = "".join(
+        f'<div class="evi"><div class="evi-at">'
+        f'{_e(c.path)}:{c.start_line}–{c.end_line}</div>'
+        f'<div class="evi-quote{_prose(c.path)}">{_e(c.quote)}</div></div>'
+        for c in (citations or []))
+    cites = (f'<section class="card"><h2 class="panel-title">근거</h2>{evi}</section>'
+             if evi else "")
+    where = (f'<p class="where">대상 저장소 <code>{_e(repo)}</code></p>' if repo else "")
+    # **이미 살균된 SVG만 온다** (`tutor_vis.extract_svg`). 여기서 escape하면 그림이
+    # 날문자로 찍히므로 그대로 넣는다 — 대신 넣기 전 단계에서 실행 가능한 것을 뗀다.
+    fig = (f'<section class="card"><figure class="fig">{diagram}</figure></section>'
+           if diagram else "")
+    return f"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>후속 질문 답변</title><style>{_CSS}{_TA_CSS}</style></head><body>
+<main class="page">
+<header class="masthead">
+  <p class="eyebrow">dev-crew · 학습 후속 질문</p>
+  <h1>질문에 대한 답변</h1>
+  {where}
+</header>
+<section class="card"><h2 class="panel-title">질문</h2>
+  <p class="ta-q">{_e(question)}</p></section>
+{fig}
+<section class="card"><div class="ta-prose">{body}</div></section>
+{cites}
 </main>
 </body></html>"""

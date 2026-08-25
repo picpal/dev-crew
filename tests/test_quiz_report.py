@@ -158,3 +158,47 @@ def test_korean_prose_keeps_words_whole():
     assert "word-break:keep-all" in html
     evi = html.split(".evi-quote{")[1].split("}")[0]
     assert "word-break:normal" in evi          # 인용은 원문 그대로
+
+
+def test_ta_answer_report_renders_prose_citations_and_escapes():
+    """후속 질문 답변 리포트 — 본문·인용·질문이 다 들어가고 주입은 막힌다.
+
+    답변은 Slack mrkdwn(별 **하나**)으로 쓰인다 — HTML에서도 굵게 나와야 한다.
+    인용은 지금까지 학습자에게 **아예 보이지 않았다**(trace에만 남았다). 리포트가
+    그걸 처음으로 보여주는 자리다.
+    """
+    from devcrew.quiz import Evidence
+    from devcrew.report.quiz_report import render_ta_answer
+
+    html = render_ta_answer(
+        question="<script>alert(1)</script> restart가 왜 그래?",
+        answer="*핵심*: `cmd_restart`가 먼저 정지한다.\n\n두 번째 문단이다.",
+        citations=[Evidence(path="deploy/bin/appsec-lib.sh", start_line=1281,
+                            end_line=1283, quote="cmd_restart() {")],
+        repo="secret-management")
+
+    assert html.startswith("<!doctype html>") and html.rstrip().endswith("</html>")
+    assert "<script>alert(1)</script>" not in html          # 이스케이프됐다
+    assert "&lt;script&gt;" in html
+    assert "<strong>핵심</strong>" in html                   # 별 하나 → 굵게
+    assert "<code>cmd_restart</code>" in html
+    assert "두 번째 문단" in html
+    assert "deploy/bin/appsec-lib.sh" in html and "1281" in html
+    assert "cmd_restart() {" in html or "cmd_restart() {" in html.replace("&#x27;", "'")
+    assert "<script" not in html.lower().replace("&lt;script", "")   # JS 없음
+
+
+def test_ta_answer_report_survives_no_citations():
+    """개념 설명이라 인용이 없을 수 있다 — 빈 배열이 페이지를 깨뜨리면 안 된다."""
+    from devcrew.report.quiz_report import render_ta_answer
+
+    html = render_ta_answer(question="왜?", answer="그래서다.", citations=[], repo=None)
+    assert "그래서다." in html and html.startswith("<!doctype html>")
+
+
+def test_ta_answer_report_does_not_mangle_double_star_bold():
+    """모델이 표준 마크다운(`**굵게**`)으로 쓸 때도 별이 날문자로 남지 않는다."""
+    from devcrew.report.quiz_report import render_ta_answer
+
+    html = render_ta_answer(question="q", answer="**표준**도 굵게", citations=[], repo=None)
+    assert "<strong>표준</strong>" in html and "**" not in html

@@ -2,6 +2,15 @@
 // POST /answer → 리포트 폼 선택 답변을 Slack 스레드에 게시 (brain 인터뷰 회신 경로)
 // 접근 제어는 Cloudflare Access가 Worker 앞단에서 담당 (#5)
 const CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self';";
+// 코드 실행 리포트(`code-*`)만 인라인 스크립트를 허용한다. **'unsafe-inline'이 아니라
+// 해시다** — 하네스가 넣은 그 스크립트 하나만 돌고, 이스케이프 버그로 끼어든 스크립트는
+// 여전히 막힌다. 그래서 backstop은 다른 리포트뿐 아니라 이 페이지에서도 살아 있다.
+// 해시 원본: `src/devcrew/report/code_report.py: JS_SRC`.
+// 어긋나면 스크립트가 조용히 차단되므로
+// `tests/test_code_report.py::test_worker_csp_matches_the_script_hash`가 대조한다.
+const CODE_SCRIPT_HASH = "sha256-RcLeU86abWMUnIPPnRECpLxPzpalL4NNLwqlZc2ILZI=";
+const CODE_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
+  + `form-action 'self'; script-src '${CODE_SCRIPT_HASH}';`;
 const MARKER = "\ud83d\udce9 \uc120\ud0dd \ub2f5\ubcc0:"; // 📩 선택 답변:
 
 const esc = (v) => String(v).replace(/[&<>"']/g, (c) =>
@@ -118,7 +127,8 @@ export default {
     if (!html) return new Response(`no report for ${m[1]}`, { status: 404 });
     return new Response(html, {
       headers: { "content-type": "text/html; charset=utf-8",
-                 "content-security-policy": CSP, "cache-control": "no-cache" },
+                 "content-security-policy": m[1].startsWith("code-") ? CODE_CSP : CSP,
+                 "cache-control": "no-cache" },
     });
   },
 };

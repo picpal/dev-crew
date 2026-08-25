@@ -19,6 +19,13 @@ roleDefaults:
   # 출제는 Claude 고품질, 검증은 Codex — provider가 갈려야 교차 검증이다 (#19 D4)
   TUTOR:          { tier: HIGH_CAPABILITY }
   TUTOR_VERIFIER: { tier: CODEX_DEFAULT }
+  # 후속 질문은 정답·근거·해설이 주어진 상태에서 시작한다 — 백지 출제보다 쉬운 과업이고
+  # 대화는 리듬이 중요하다. 부족하면 tier만 올린다.
+  TUTOR_TA:       { tier: DEFAULT }
+  # 실행 추적은 답변보다 어렵다 — 분기·루프를 실제로 따라가야 한다.
+  TUTOR_CODE:     { tier: HIGH_CAPABILITY }
+  # 무엇을 그릴지는 이미 정해져서 온다 — 그리기 자체는 어려운 과업이 아니다.
+  TUTOR_VIS:      { tier: DEFAULT }
 
 # §10.3 loop guard — Task 실패가 아니라 결정 지점 진입 조건
 loopPolicy:
@@ -45,6 +52,9 @@ loopPolicy:
     BRAIN:        600000
     TUTOR:        400000
     TUTOR_VERIFIER: 300000
+    TUTOR_TA:       300000
+    TUTOR_CODE:     300000
+    TUTOR_VIS:      200000
 
 # crew leader 결정 세션의 컨텍스트 정책 (사용자 결정 2026-08-20)
 # persistent: 결정마다 fresh 세션 대신 스레드 단위로 세션을 유지한다 — 이전 결정과

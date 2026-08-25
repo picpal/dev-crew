@@ -1,0 +1,86 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "citations",
+    "code_focus",
+    "diagram",
+    "answer"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "NOT_PASS",
+        "NEED_REPLAN",
+        "BLOCKED",
+        "INSUFFICIENT_CAPABILITY"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "citations": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "start_line",
+          "end_line",
+          "quote"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "start_line": {
+            "type": "integer"
+          },
+          "end_line": {
+            "type": "integer"
+          },
+          "quote": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "code_focus": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "symbol"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "symbol": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "diagram": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "answer": {
+      "type": "string"
+    }
+  }
+}

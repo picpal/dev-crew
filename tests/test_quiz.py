@@ -291,3 +291,32 @@ def test_grading_is_one_atomic_event_so_retry_is_idempotent(tmp_path):
     again = record_scorecard(t, "E", card, prior_keys=set())
     assert first == again
     assert sorted(m["q_key"] for m in open_misses(t, "E")) == sorted(q.key for q in qs)
+
+
+def test_verify_evidence_splits_real_from_fabricated(tmp_path):
+    """evidence 단위 대조 — 답변은 틀린 인용만 떼고 본문은 낸다."""
+    from devcrew.quiz import Evidence, verify_evidence
+
+    (tmp_path / "a.py").write_text("line1\nline2\nline3\n")
+    real = Evidence(path="a.py", start_line=2, end_line=2, quote="line2")
+    fake = Evidence(path="a.py", start_line=2, end_line=2, quote="없는 문장")
+    ghost = Evidence(path="ghost.py", start_line=1, end_line=1, quote="line1")
+
+    kept, dropped = verify_evidence([real, fake, ghost], tmp_path)
+
+    assert kept == [real]
+    assert [e for e, _ in dropped] == [fake, ghost]
+    assert all(reason for _, reason in dropped)      # 사유 없이 버리지 않는다
+
+
+def test_verify_citations_still_drops_the_whole_question(tmp_path):
+    """출제의 처분은 그대로다 — 근거 하나가 가짜면 문항을 버린다."""
+    from devcrew.quiz import Evidence, Question, verify_citations
+
+    (tmp_path / "a.py").write_text("line1\nline2\n")
+    q = Question(area="A", type="CORRECT", stem="s", options=["1", "2", "3", "4"],
+                 answer_index=0, explanation="e",
+                 evidence=[Evidence(path="a.py", start_line=1, end_line=1, quote="line1"),
+                           Evidence(path="a.py", start_line=1, end_line=1, quote="가짜")])
+    passed, dropped = verify_citations([q], tmp_path)
+    assert passed == [] and len(dropped) == 1

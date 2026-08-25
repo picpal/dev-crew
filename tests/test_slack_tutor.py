@@ -1,6 +1,8 @@
 """slack_tutor — 퀴즈 세션·문항 진행·재개·채점 발행 (FakeAdapter, Slack 없음)."""
 import asyncio
-import dataclasses
+
+
+import time
 
 import pytest
 
@@ -17,11 +19,10 @@ class Scripted(FakeAdapter):
         super().__init__(script=["ok"] * 50)
         self.queue = list(structured)
 
-    async def send(self, session_id, message):
-        out = await super().send(session_id, message)
-        if not self.queue:
-            return out
-        return dataclasses.replace(out, structured=self.queue.pop(0))
+    def _next_structured(self, session_id, n):
+        # `send`가 아니라 이 훅을 덮는다 — `send`를 덮으면 "스키마 없는 세션은 구조화
+        # 출력을 내지 않는다"는 실 어댑터 계약까지 함께 우회한다 (base.py 참조).
+        return self.queue.pop(0) if self.queue else super()._next_structured(session_id, n)
 
 
 class SaySpy:
@@ -55,10 +56,16 @@ def repo(tmp_path):
     return d
 
 
-def make_handler(tmp_path, repo, *, n=12, published=None):
+def make_handler(tmp_path, repo, *, n=12, published=None, ta_answers=3):
     trace = TraceStore(tmp_path / "t.db")
+    # 첫 항목 뒤로는 TUTOR_TA(후속 질문)용 — 이 role도 tier DEFAULT(CLAUDE_CODE)라 같은
+    # author adapter를 쓴다. 출제가 첫 send()에서 첫 항목을 소비하므로, 후속 질문의
+    # send()들은 이어지는 항목을 순서대로 받는다. `ta_answers`만큼 질문을 이어 물을 수
+    # 있다 — 세션 재사용(두 번째 질문부터 같은 세션)을 테스트하려면 2개 이상 필요하다.
     author = Scripted([{"status": "PASS", "summary": "s",
-                        "questions": [_q(i, start=i + 1) for i in range(n)]}])
+                        "questions": [_q(i, start=i + 1) for i in range(n)]}] +
+                      [{"answer": f"후속 질문에 대한 답변 {i + 1}.", "citations": []}
+                       for i in range(ta_answers)])
     verifier = Scripted([{"status": "PASS", "summary": "v",
                           "verdicts": [{"index": i, "verdict": "PASS", "reason": "ok"}
                                        for i in range(n)]}])
@@ -439,3 +446,1084 @@ async def test_second_round_says_it_is_waiting_instead_of_going_silent(tmp_path,
         h._lock.release()
     await asyncio.wait_for(task, timeout=10)
     assert "1 / 10" in say.messages[-1]["text"]      # 풀리면 이어서 시작한다
+
+
+@pytest.mark.asyncio
+async def test_question_during_an_open_round_is_refused_once(tmp_path, repo):
+    """진행 중에는 정답을 공개하지 않는다 — 질문은 그 원칙을 우회하는 경로다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    before = len(say.messages)
+
+    await h.on_question(thread_ts="100.1", text="3번 답이 뭐야?", user="U-OWNER", say=say)
+    assert "채점" in say.messages[-1]["text"]
+    after_first = len(say.messages)
+
+    await h.on_question(thread_ts="100.1", text="그래도 알려줘", user="U-OWNER", say=say)
+    assert len(say.messages) == after_first     # 두 번째부터는 조용히 버린다
+    assert after_first == before + 1
+
+
+@pytest.mark.asyncio
+async def test_question_after_grading_gets_an_answer(tmp_path, repo):
+    """채점 리포트가 아니라 실제 TA 답변이 새로 나가야 한다 — no-op으로도 통과하면
+    안 된다 (`_finish`가 이미 채점 리포트를 보낸 뒤라 메시지가 있다는 것만으로는
+    `on_question`이 뭔가 했다는 증거가 안 된다)."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)                     # 10문항을 다 풀어 채점까지
+    n = len(say.messages)
+    await h.on_question(thread_ts="100.1", text="왜 그런가요?", user="U-OWNER", say=say)
+    assert len(say.messages) == n + 1
+    assert say.messages[-1]["thread_ts"] == "100.1"
+    assert "후속 질문에 대한 답변" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_only_the_round_owner_may_ask(tmp_path, repo):
+    """답변에는 정답과 근거가 그대로 들어간다 — 남에게는 스포일러다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    n = len(say.messages)
+    await h.on_question(thread_ts="100.1", text="왜?", user="U-STRANGER", say=say)
+    assert len(say.messages) == n + 1
+    assert "시작한 사람" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_question_on_an_unknown_thread_is_ignored(tmp_path, repo):
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_question(thread_ts="999.9", text="왜?", user="U-OWNER", say=say)
+    assert say.messages == []
+
+
+@pytest.mark.asyncio
+async def test_answer_failure_is_reported_not_swallowed(tmp_path, repo, monkeypatch):
+    """조용히 삼키면 사용자도 우리도 원인을 못 찾는다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import TutorTAError
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def boom(*a, **kw):
+        raise TutorTAError("TimeoutError")
+
+    monkeypatch.setattr(st, "ask", boom)
+    await h.on_question(thread_ts="100.1", text="왜?", user="U-OWNER", say=say)
+    assert "TimeoutError" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_expired_round_refuses_questions(tmp_path, repo):
+    """하루가 지나면 그때의 근거로 답하는 것이 오히려 틀린 설명이 된다."""
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    h.sessions["100.1"].started_at -= st.ROUND_TTL + 1
+
+    n = len(say.messages)
+    await h.on_question(thread_ts="100.1", text="왜?", user="U-OWNER", say=say)
+    assert len(say.messages) == n + 1
+    assert "하루가 지나" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_question_and_answer_are_recorded_in_trace(tmp_path, repo):
+    """세션은 프로세스와 함께 사라지지만 trace는 남는다."""
+    from devcrew.quiz import QUESTION_EVENT, TA_ANSWER_EVENT
+
+    h, trace, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    await h.on_question(thread_ts="100.1", text="왜 그런가요?", user="U-OWNER", say=say)
+
+    kinds = [e["event_type"] for e in trace.events(execution_id="QUIZ-100.1")]
+    assert QUESTION_EVENT in kinds and TA_ANSWER_EVENT in kinds
+
+
+@pytest.mark.asyncio
+async def test_second_question_reuses_the_same_ta_session(tmp_path, repo):
+    """이 기능의 목적 — 대화가 이어져야 앞 질문의 맥락 위에서 답한다. 매번 새 세션을
+    열면 회차 맥락을 다시 준다 해도 방금 나눈 대화 자체는 잊는다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    author = h.orch.adapters[Provider.CLAUDE_CODE]
+    sessions_before = len(author.turns)      # 출제 때 이미 세션 하나를 씀
+
+    await h.on_question(thread_ts="100.1", text="첫 번째 질문", user="U-OWNER", say=say)
+    sid1, provider1 = h.sessions["100.1"].ta_session_id, h.sessions["100.1"].ta_provider
+    sessions_after_first = len(author.turns)
+    assert sessions_after_first == sessions_before + 1     # 새 세션 하나만 열렸다
+
+    await h.on_question(thread_ts="100.1", text="두 번째 질문", user="U-OWNER", say=say)
+    sid2, provider2 = h.sessions["100.1"].ta_session_id, h.sessions["100.1"].ta_provider
+
+    assert sid1 is not None and sid1 == sid2
+    assert provider1 == provider2
+    assert len(author.turns) == sessions_after_first        # 두 번째는 세션을 새로 안 연다
+    assert say.messages[-2]["text"] != say.messages[-1]["text"]   # 서로 다른 답변
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_confuse_another_rounds_grading_as_done(tmp_path, repo):
+    """GRADED_EVENT(오답 노트)는 사용자·repo 단위 네임스페이스라 어느 회차의 채점인지
+    특정하지 못한다. 이 회차를 방치한 채 같은 사용자가 같은 repo로 다른 회차를 채점해도,
+    그 이벤트로 이 회차를 '끝난 것'으로 보면 아직 풀지 않은 문항의 정답·해설이 새는
+    정답 유출이다 (리뷰 2026-08-24 재현). done은 이 회차 자신의 execution_id에 남는
+    ROUND_GRADED_EVENT로만 판정해야 한다."""
+    from devcrew.quiz import GRADED_EVENT, note_id
+
+    h, trace, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)             # 회차 A(100.1) — 방치, 채점 안 됨
+
+    # "다른 회차"가 채점됐다고 가정한다 — GRADED_EVENT는 회차를 구분하지 않는
+    # note_id(사용자·repo) 네임스페이스에 쌓이므로, 이 회차의 것과 구분할 수 없다.
+    trace.append(GRADED_EVENT, task_id="OTHER-ROUND",
+                execution_id=note_id("U-OWNER", "myrepo"),
+                payload={"missed": [], "cleared": []})
+
+    h.sessions.clear()                             # 프로세스 재시작
+    n = len(say.messages)
+    await h.on_question(thread_ts="100.1", text="3번 답이 뭐야?", user="U-OWNER", say=say)
+
+    assert h.sessions["100.1"].done is False
+    assert len(say.messages) == n + 1
+    assert "채점" in say.messages[-1]["text"]        # 여전히 NEED_GRADED — 유출 없음
+
+
+@pytest.mark.asyncio
+async def test_resume_restores_done_for_the_same_graded_round(tmp_path, repo):
+    """방치된 다른 회차와 달리, 실제로 채점을 마친 이 회차는 재시작 뒤에도 후속
+    질문을 받아야 한다 — fail-closed가 항상 거절로 이어지면 그것도 결함이다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)                        # 채점까지 완료
+    assert h.sessions["100.1"].done is True
+
+    h.sessions.clear()                              # 프로세스 재시작
+    n = len(say.messages)
+    await h.on_question(thread_ts="100.1", text="왜 그런가요?", user="U-OWNER", say=say)
+
+    assert h.sessions["100.1"].done is True
+    assert len(say.messages) == n + 1
+    assert "채점" not in say.messages[-1]["text"]    # 거절이 아니라 실제 답변
+
+
+# --- 최종 리뷰 fix (2026-08-24): TA 세션 반납 (C3) + 만료 안내 1회 게이트 (I3) ---
+
+
+async def ask_once(h, say, *, thread="100.1", text="왜?", user="U-OWNER"):
+    await h.on_question(thread_ts=thread, text=text, user=user, say=say, channel="C1")
+
+
+@pytest.mark.asyncio
+async def test_expired_round_reclaims_the_ta_session(tmp_path, repo):
+    """"이 회차는 못 쓴다"고 말하는 바로 그 자리가 그 회차의 워커를 반납할 마지막
+    자리다. 거절만 하고 살려 두면 회수 경로가 아예 없는 것과 같다 (최종 리뷰 C3)."""
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    await ask_once(h, say)
+
+    sess = h.sessions["100.1"]
+    sid, iid = sess.ta_session_id, sess.ta_instance_id
+    assert sid and iid
+    author = h.orch.adapters[Provider.CLAUDE_CODE]
+    assert sid not in author.archived
+
+    sess.started_at -= st.ROUND_TTL + 1
+    await ask_once(h, say)
+
+    assert "하루가 지나" in say.messages[-1]["text"]
+    assert sid in author.archived                                   # 워커를 반납했고
+    assert all(r["instance_id"] != iid for r in h.orch.registry.active())   # 행도 지웠다
+    assert "100.1" not in h.sessions
+
+
+@pytest.mark.asyncio
+async def test_expiry_notice_is_sent_once_per_round(tmp_path, repo, monkeypatch):
+    """만료 안내에도 회차당 1회 게이트를 둔다. 없으면 그 스레드의 **모든** 답글마다
+    안내가 나가고, tutor 메시지는 전부 채널 브로드캐스트라 그때마다 채널이 울린다 —
+    owner 검사는 이 뒤에 있으므로 남의 답글에도 나간다 (최종 리뷰 I3).
+
+    시계를 통째로 옮긴다: 메모리 세션의 `started_at`만 흔들면 trace 쪽은 아직
+    싱싱해서, 세션이 반납된 다음 답글이 `_resume`으로 되살아나 버린다.
+    """
+    import time as _time
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    later = _time.time() + 30 * 3600
+    monkeypatch.setattr("devcrew.slack_tutor.time.time", lambda: later)
+
+    n = len(say.messages)
+    await ask_once(h, say)                                   # 첫 답글 — 안내
+    assert len(say.messages) == n + 1 and "하루가 지나" in say.messages[-1]["text"]
+
+    for who in ("U-OWNER", "U-STRANGER", "U-THIRD"):         # 이어지는 답글들
+        await ask_once(h, say, user=who, text="그냥 잡담")
+    assert len(say.messages) == n + 1                        # 더는 끼어들지 않는다
+
+
+@pytest.mark.asyncio
+async def test_expiry_notice_is_gated_on_the_trace_restore_path_too(tmp_path, repo,
+                                                                    monkeypatch):
+    """메모리 세션이 없으면 `_resume`이 매번 trace를 다시 읽고 매번 안내를 보냈다 —
+    재시작 뒤가 오히려 더 시끄러웠던 자리다."""
+    import time as _time
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    h.sessions.clear()                                       # 프로세스 재시작
+    later = _time.time() + 30 * 3600
+    monkeypatch.setattr("devcrew.slack_tutor.time.time", lambda: later)
+
+    n = len(say.messages)
+    for _ in range(4):
+        await ask_once(h, say)
+    assert len(say.messages) == n + 1
+    assert "하루가 지나" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_idle_ta_session_is_reclaimed(tmp_path, repo):
+    """스레드당 살아 있는 세션을 두는 설계에서 유휴 반납은 선택이 아니다 —
+    하루 10회차면 일주일에 70개의 워커 서브프로세스가 쌓인다 (최종 리뷰 C3)."""
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    await ask_once(h, say)
+    sid = h.sessions["100.1"].ta_session_id
+
+    h.sessions["100.1"].ta_touched -= st.TA_IDLE_TTL + 1
+    await h._evict_ta()
+
+    assert sid in h.orch.adapters[Provider.CLAUDE_CODE].archived
+    assert "100.1" not in h.sessions
+
+
+@pytest.mark.asyncio
+async def test_evict_never_drops_a_round_that_is_still_being_answered(tmp_path, repo):
+    """말없이 죽이면 학습자에겐 답이 끊긴 스레드만 남는다 (slack_brain과 같은 규칙)."""
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    await ask_once(h, say)
+
+    h.sessions["100.1"].ta_touched -= st.TA_IDLE_TTL + 1
+    h.sessions["100.1"].ta_busy = True
+    await h._evict_ta()
+    assert "100.1" in h.sessions
+
+
+@pytest.mark.asyncio
+async def test_evict_drops_the_oldest_over_the_cap(tmp_path, repo):
+    """상한이 없으면 유휴 TTL 안쪽에서도 무제한으로 쌓인다."""
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    await ask_once(h, say)
+    old = _idle_ta_session(h, "900.1", touched=h.sessions["100.1"].ta_touched - 60)
+
+    orig, st.MAX_TA_SESSIONS = st.MAX_TA_SESSIONS, 1
+    try:
+        await h._evict_ta()
+    finally:
+        st.MAX_TA_SESSIONS = orig
+    assert "900.1" not in h.sessions and "100.1" in h.sessions   # 오래된 쪽부터
+    assert old in h.orch.adapters[Provider.CLAUDE_CODE].archived
+
+
+def _idle_ta_session(h, thread_ts, *, touched, sid="fake-other"):
+    """TA 세션이 열려 있는 다른 스레드의 회차를 하나 심는다 → 그 session_id.
+
+    `sid`는 **세션마다 달라야** 어느 쪽이 반납됐는지 구분할 수 있다 — 기본값을 그대로
+    둔 채 두 개를 심으면 두 세션이 같은 id를 갖고 단언이 통과할 수 없다.
+    """
+    from devcrew.slack_tutor import QuizSession
+    sess = QuizSession(channel="C1", thread_ts=thread_ts, owner="U-OTHER",
+                       repo_name="myrepo", questions=[], done=True)
+    sess.ta_session_id = sid
+    sess.ta_provider = Provider.CLAUDE_CODE
+    sess.ta_instance_id = "tut-other"
+    sess.ta_touched = touched
+    h.sessions[thread_ts] = sess
+    return sess.ta_session_id
+
+
+@pytest.mark.asyncio
+async def test_answering_a_question_reclaims_other_idle_ta_sessions(tmp_path, repo):
+    """축출을 함수로만 두고 아무도 부르지 않으면 반납 경로가 없는 것과 같다 —
+    배선 자체를 본다 (lessons C1)."""
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    import time as _time
+    old = _idle_ta_session(h, "900.1", touched=_time.monotonic() - st.TA_IDLE_TTL - 1)
+
+    await ask_once(h, say)
+
+    assert "900.1" not in h.sessions
+    assert old in h.orch.adapters[Provider.CLAUDE_CODE].archived
+
+
+# --- 최종 리뷰 fix (2026-08-24): owner 게이트(I6) · mrkdwn(I2) · repo(I4) · lock(I1) ---
+
+
+@pytest.mark.asyncio
+async def test_an_empty_owner_closes_the_gate_instead_of_opening_it(tmp_path, repo):
+    """`if sess.owner and user != sess.owner`는 owner가 빈 문자열이면 통째로 False가
+    되어 **누구나** 정답·근거·해설이 담긴 답변을 받는다. `_resume`이
+    `payload.get("owner", "")`로 복원하므로 필드가 없던 옛 회차·손상된 페이로드가
+    곧바로 개방이 된다 — 이 브랜치의 안전 속성 전체가 걸린 한 줄인데 실패 방향이
+    열림이었다 (최종 리뷰 I6). fail-closed로 돌린다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    h.sessions["100.1"].owner = ""            # 옛 회차 / 손상된 페이로드
+
+    n = len(say.messages)
+    await ask_once(h, say, user="U-ANYONE")
+
+    assert len(say.messages) == n + 1
+    assert "시작한 사람" in say.messages[-1]["text"]
+    assert "후속 질문에 대한 답변" not in say.messages[-1]["text"]
+    assert h.sessions["100.1"].ta_session_id is None     # 세션도 열지 않았다
+
+
+@pytest.mark.asyncio
+async def test_answer_text_is_converted_to_slack_mrkdwn(tmp_path, repo, monkeypatch):
+    """문항은 전부 `rich()`를 거치는데 TA 답변만 원문 그대로 나가고 있었다.
+    `**굵게**`는 날문자로 찍히고 `<T>`는 Slack이 엔티티로 먹어 통째로 사라진다 —
+    코드를 설명하는 봇이라 둘 다 첫 사용에서 나온다 (최종 리뷰 I2, lessons C12).
+    변환 뒤에도 잘림 표기와 인용 공개가 읽히는지 함께 고정한다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import DROPPED_NOTE, TRUNCATED_NOTE, Answer
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    body = ("**핵심은 여기다** — `Callable[<T>]`가 그 자리다"
+            + TRUNCATED_NOTE + DROPPED_NOTE.format(n=2))
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=body, citations=[], dropped=2,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    await ask_once(h, say)
+
+    out = say.messages[-1]["text"]
+    assert "*핵심은 여기다*" in out and "**핵심은 여기다**" not in out
+    assert "&lt;T&gt;" in out                       # Slack이 먹지 않도록 이스케이프됐다
+    assert "_… 답변이 길어 잘렸습니다_" in out        # 잘림 표기가 살아남았고
+    assert "_근거 2건은 대조에 실패해 제외했습니다_" in out   # 인용 공개도 살아남았다
+
+
+@pytest.mark.asyncio
+async def test_unregistered_repo_refuses_instead_of_reading_the_harness_repo(tmp_path, repo):
+    """`repos.get(...) or ""`의 빈 문자열은 조용히 넘어가지 않는다: `worktree=""`는
+    작업 디렉토리 고정을 건너뛰어 워커가 하네스 자기 repo에서 뜨고, `Path("")`는
+    cwd라 인용 대조까지 하네스 기준이 된다 — **틀린 repo의 인용이 "대조 통과"로
+    표시된다** (최종 리뷰 I4). 거짓을 가르치느니 답하지 않는다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    h.repos.pop("myrepo")                  # repos.yaml에서 이름이 바뀐 뒤 재기동
+
+    n = len(say.messages)
+    await ask_once(h, say)
+
+    assert len(say.messages) == n + 1
+    assert "찾을 수 없어" in say.messages[-1]["text"]
+    assert "후속 질문에 대한 답변" not in say.messages[-1]["text"]
+    assert h.sessions["100.1"].ta_session_id is None     # 세션을 열지 않았다
+
+
+def _graded_twin(h, thread_ts, owner):
+    """이미 채점이 끝난 다른 스레드의 회차 — 같은 문항을 재사용한다."""
+    from devcrew.slack_tutor import QuizSession
+    src = h.sessions["100.1"]
+    sess = QuizSession(channel="C1", thread_ts=thread_ts, owner=owner,
+                       repo_name="myrepo", questions=list(src.questions),
+                       answers=dict(src.answers), done=True)
+    h.sessions[thread_ts] = sess
+    return sess
+
+
+@pytest.mark.asyncio
+async def test_another_threads_turn_does_not_block_this_thread(tmp_path, repo):
+    """lock이 `TutorHandler` 하나에 하나뿐이라 학습자 B가 **다른 스레드**에서 물어도
+    남의 질문 때문에 최대 `TURN_TIMEOUT`(300초)을 기다렸고, 그러면서 존재하지도 않는
+    "앞선 질문"에 대한 안내를 받았다. 스펙의 동시성 단위는 스레드다 (최종 리뷰 I1)."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    _graded_twin(h, "200.1", "U-B")
+
+    await h._ta_lock_for("100.1").acquire()          # A의 질문이 처리 중
+    try:
+        n = len(say.messages)
+        await asyncio.wait_for(
+            h.on_question(thread_ts="200.1", text="왜?", user="U-B", say=say,
+                          channel="C1"), timeout=10)
+    finally:
+        h._ta_lock_for("100.1").release()
+
+    assert all("앞선 질문" not in m["text"] for m in say.messages[n:])
+    assert "후속 질문에 대한 답변" in say.messages[-1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_the_busy_notice_still_fires_within_the_same_thread(tmp_path, repo):
+    """스레드별로 갈랐다고 같은 스레드의 안내까지 사라지면 안 된다 — 말해 주지 않으면
+    무반응으로 보이고 학습자는 질문을 반복한다 (C14)."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    await h._ta_lock_for("100.1").acquire()
+    try:
+        task = asyncio.create_task(
+            h.on_question(thread_ts="100.1", text="왜?", user="U-OWNER", say=say,
+                          channel="C1"))
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if say.messages and "앞선 질문" in say.messages[-1]["text"]:
+                break
+        assert "앞선 질문" in say.messages[-1]["text"]
+    finally:
+        h._ta_lock_for("100.1").release()
+    await asyncio.wait_for(task, timeout=10)
+    assert "후속 질문에 대한 답변" in say.messages[-1]["text"]   # 풀리면 이어서 답한다
+
+
+@pytest.mark.asyncio
+async def test_has_round_survives_a_restart(tmp_path, repo):
+    """라우팅(질문이냐 새 회차냐)을 메모리 세션만 보고 정하면, 재시작 뒤에는 채점이
+    끝난 스레드에서 새 회차가 열린다 — 회차의 진실은 trace다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    assert h.has_round("100.1") is True
+
+    h.sessions.clear()                                # 프로세스 재시작
+    assert h.has_round("100.1") is True
+    assert h.has_round("999.9") is False
+
+
+# --- Fix round 2 (2026-08-24): 축출 코드가 들여온 결함 두 건 ---
+
+
+def _plain_round(h, thread_ts):
+    """TA 세션이 없는 회차 — 진행 중이거나 아무도 질문하지 않은 스레드."""
+    from devcrew.slack_tutor import QuizSession
+    h.sessions[thread_ts] = QuizSession(channel="C1", thread_ts=thread_ts,
+                                        owner="U-X", repo_name="myrepo", questions=[])
+
+
+@pytest.mark.asyncio
+async def test_the_cap_counts_live_ta_sessions_not_every_round(tmp_path, repo):
+    """상한의 대상은 **살아 있는 워커**다. 분모를 `self.sessions`로 두면 TA 세션이
+    없는 회차(진행 중·아무도 안 물어본 스레드)까지 세는데 그 dict는 `_drop` 말고는
+    줄지 않는다 — 엔진이 회차 50개를 넘겨 본 뒤로는 조건이 영구히 참이 되어 매 답변마다
+    `live`가 바닥까지 비워지고, 후보가 방금 답한 회차뿐이면 그 회차가 죽는다.
+    누수는 아니지만 대화 연속성이 사라진다 — 이 기능의 존재 이유가 그것이다."""
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    for i in range(60):                       # TA 세션이 없는 회차 60개
+        _plain_round(h, f"8{i:02d}.1")
+    assert len(h.sessions) > st.MAX_TA_SESSIONS
+
+    await ask_once(h, say)
+    sid = h.sessions["100.1"].ta_session_id if "100.1" in h.sessions else None
+    assert sid, "방금 답한 회차가 자기 답변 뒤에 축출됐다"
+
+    await ask_once(h, say, text="그럼 그건?")
+    assert h.sessions["100.1"].ta_session_id == sid      # 같은 세션을 이어 쓴다
+    # **이 회차의 TA 세션이** 반납되지 않았는지만 본다. 전역 `archived`가 비었는지
+    # 보면 안 된다 — 출제/검증은 1회용이라 정상적으로 반납되고 여기에 쌓인다.
+    assert sid not in h.orch.adapters[Provider.CLAUDE_CODE].archived
+
+
+@pytest.mark.asyncio
+async def test_an_answer_survives_being_evicted_mid_turn(tmp_path, repo):
+    """`ta_busy`는 lock을 잡은 **뒤**에 세워진다. 게이트 통과부터 그 줄까지 사이에는
+    `_set_status`(운영에선 실제 네트워크 호출)와 lock 대기가 있고, 그동안 이 회차는
+    `live`에 남아 있다. 다른 스레드의 답변이 끝나며 `_evict_ta`를 돌리면 이 회차가
+    `_drop`될 수 있고, 그러면 답변은 `self.sessions`에 없는 객체 위에서 끝나 새로 연
+    세션의 손잡이가 아무 데도 남지 않는다 — C3가 없애려던 바로 그 상태다."""
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    sess = h.sessions["100.1"]
+
+    async def evict_during_status(channel, thread_ts, text):
+        # 게이트와 ta_busy 사이의 창 — 다른 스레드의 답변이 끝나며 축출이 돈다
+        await h._drop(sess)
+
+    h.status = evict_during_status
+    await ask_once(h, say)
+
+    assert "100.1" in h.sessions, "답변이 끝난 회차가 sessions에 없다 — 손잡이 소실"
+    assert h.sessions["100.1"].ta_session_id
+    assert h.sessions["100.1"].ta_session_id == sess.ta_session_id
+
+
+@pytest.mark.asyncio
+async def test_report_publish_failure_records_the_reason(tmp_path, repo):
+    """리포트 발행이 실패하면 **사유를** trace에 남기고 스레드에도 한 줄 적는다.
+
+    2026-08-24 16:29 실제로 발행이 실패했는데 `except Exception: url = None`이 사유를
+    통째로 삼켜, 나중에 채점·렌더·업로드를 전부 다시 확인하고도 원인을 알 수 없었다.
+    채점 자체는 이미 끝났으므로 회차를 되돌리지는 않는다 — 사유만 남긴다.
+    """
+    from devcrew.quiz import REPORT_FAILED_EVENT
+
+    def boom(task_id, html):
+        raise RuntimeError("R2 업로드 거부")
+
+    h, trace, _ = make_handler(tmp_path, repo)
+    h.publish = boom
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    reasons = [e["payload"]["reason"] for e in trace.events(event_type=REPORT_FAILED_EVENT)]
+    assert any("R2 업로드 거부" in r for r in reasons), reasons
+    assert any("R2 업로드 거부" in (m["text"] or "") for m in say.messages), \
+        "사용자도 왜 링크가 없는지 알아야 한다"
+
+
+@pytest.mark.asyncio
+async def test_authoring_posts_a_line_per_stage(tmp_path, repo):
+    """출제는 몇 분씩 걸린다 — 단계마다 한 줄을 적는다.
+
+    2026-08-24 회차 시작부터 첫 문항까지 18분 동안 스레드가 완전히 조용했다.
+    사용자에게는 무반응과 구분되지 않아 멘션을 반복하게 된다.
+    """
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    joined = "\n".join(m["text"] or "" for m in say.messages)
+    for stage in ("출제", "검증", "게시"):
+        assert stage in joined, f"{stage} 단계 표시가 없다:\n{joined}"
+
+
+@pytest.mark.asyncio
+async def test_ta_answer_event_records_status_and_summary(tmp_path, repo):
+    """TA 답변 이벤트에 `status`/`summary`를 남긴다.
+
+    2026-08-24: 모델이 스키마 거절 루프에 걸려 `answer: "test"`, `summary: "test"`인
+    최소 payload를 냈고 하네스는 그것을 정상 답변으로 서빙했다. 그때 trace에는 `answer`만
+    있어서 "성실한 답인가 스키마를 때운 것인가"를 기록만으로 판별할 수 없었다 (C15).
+    """
+    from devcrew.quiz import TA_ANSWER_EVENT
+
+    h, trace, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    await h.on_question(thread_ts="100.1", text="왜 그런가요?", say=say,
+                        user="U-OWNER", channel="C1")
+
+    evs = trace.events(event_type=TA_ANSWER_EVENT)
+    assert evs, "TA 답변 이벤트가 없다"
+    p = evs[-1]["payload"]
+    assert "status" in p and "summary" in p, p
+
+
+def _long_answer(n=2600):
+    return ("*핵심*: 여기가 요점이다.\n\n" + "본문이 길게 이어진다. " * (n // 12))
+
+
+@pytest.mark.asyncio
+async def test_long_answer_goes_to_a_report_link(tmp_path, repo, monkeypatch):
+    """Slack 한 메시지에 못 담는 답변은 HTML 리포트로 흘리고 머리말+링크만 남긴다.
+
+    예전에는 2000자에서 잘라 "답변이 길어 잘렸습니다"만 남았고, 학습자는 나머지를 볼
+    방법이 없었다. **trace에는 전문이 그대로 남는다** — 화면 표시가 기록을 깎으면 안 된다.
+    """
+    import devcrew.slack_tutor as st
+    from devcrew.quiz import TA_ANSWER_EVENT
+    from devcrew.tutor_ta import Answer
+
+    body = _long_answer()
+    h, trace, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=body, citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    await h.on_question(thread_ts="100.1", text="길게 설명해줘", say=say,
+                        user="U-OWNER", channel="C1")
+
+    last = say.messages[-1]["text"]
+    assert "여기가 요점이다" in last, "무엇에 대한 답인지 스레드에서 보여야 한다"
+    # URL은 본문이 아니라 **버튼**에 있다 (2026-08-25)
+    assert _button_of(say.messages[-1])["url"].startswith("https://reports.example")
+    assert len(last) < 1000, f"머리말만 남아야 한다 ({len(last)}자)"
+    assert any("ta-" in tid for tid, _ in pub), [tid for tid, _ in pub]
+
+    stored = trace.events(event_type=TA_ANSWER_EVENT)[-1]["payload"]["answer"]
+    assert stored == body, "기록은 전문이어야 한다"
+
+
+@pytest.mark.asyncio
+async def test_short_answer_still_posts_inline(tmp_path, repo, monkeypatch):
+    """짧은 답변까지 링크로 보내면 매번 브라우저를 열어야 한다 — 그대로 스레드에 쓴다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+
+    h, _, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+    before = len(pub)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text="짧은 답이다.", citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    await h.on_question(thread_ts="100.1", text="왜?", say=say, user="U-OWNER",
+                        channel="C1")
+
+    assert say.messages[-1]["text"] == "짧은 답이다."
+    assert len(pub) == before, "짧은 답변은 리포트를 만들지 않는다"
+
+
+@pytest.mark.asyncio
+async def test_report_failure_falls_back_to_the_truncated_body(tmp_path, repo, monkeypatch):
+    """발행이 실패해도 답변은 준다 — 잘라서라도 보내고, 사유를 남긴다.
+
+    링크를 못 만들었다고 답을 통째로 삼키면, 모델은 제대로 답했는데 학습자만 잃는다.
+    """
+    import devcrew.slack_tutor as st
+    from devcrew.quiz import REPORT_FAILED_EVENT
+    from devcrew.tutor_ta import Answer
+
+    h, trace, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    def boom(task_id, html):
+        raise RuntimeError("R2 거부")
+
+    h.publish = boom
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=_long_answer(), citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    await h.on_question(thread_ts="100.1", text="길게", say=say, user="U-OWNER",
+                        channel="C1")
+
+    joined = "\n".join(m["text"] or "" for m in say.messages)
+    assert "여기가 요점이다" in joined and "본문이 길게 이어진다" in joined
+    reasons = [e["payload"]["reason"] for e in trace.events(event_type=REPORT_FAILED_EVENT)]
+    assert any("R2 거부" in r for r in reasons), reasons
+
+
+@pytest.mark.asyncio
+async def test_code_question_produces_an_execution_report(tmp_path, repo, monkeypatch):
+    """TA가 `code_focus`를 달면 실행 리포트를 만들어 링크를 준다.
+
+    산문 열 줄보다 "코드 좌 / 상태 우, 2초에 한 칸"이 훨씬 잘 보인다는 것이 이 경로의
+    이유다. 짧은 답변이라도 code_focus가 있으면 리포트를 만든다.
+    """
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+    from devcrew.tutor_code import Line, Step, Trace, Var
+
+    h, _, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text="짧은 요약이다.", citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1",
+                      code_focus={"path": "a.py", "symbol": "f"})
+
+    async def fake_trace(*a, **kw):
+        return Trace(title="a.py 실행", role_of_code="역할", path="a.py",
+                     lines=[Line(number=1, text="line1"), Line(number=2, text="line2")],
+                     steps=[Step(line=1, reason="첫 줄", vars=[Var("x", "1", True)]),
+                            Step(line=2, reason="둘째 줄", vars=[])])
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    monkeypatch.setattr(st, "trace_code", fake_trace)
+    await h.on_question(thread_ts="100.1", text="이 코드 어떻게 돌아?", say=say,
+                        user="U-OWNER", channel="C1")
+
+    last = say.messages[-1]["text"]
+    assert "짧은 요약이다" in last
+    assert _button_of(say.messages[-1])["url"].startswith("https://reports.example")
+    assert any(tid.startswith("code-") for tid, _ in pub), [tid for tid, _ in pub]
+    html = next(html for tid, html in pub if tid.startswith("code-"))
+    assert "@keyframes" in html and "첫 줄" in html
+
+
+@pytest.mark.asyncio
+async def test_trace_failure_still_delivers_the_answer(tmp_path, repo, monkeypatch):
+    """추적에 실패해도 답변은 준다 — 리포트는 곁다리지 답이 아니다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+    from devcrew.tutor_code import TraceUnavailable
+
+    h, trace, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text="그래도 이 답은 나가야 한다.", citations=[],
+                      dropped=0, provider=Provider.CLAUDE_CODE, instance_id="i1",
+                      code_focus={"path": "a.py", "symbol": None})
+
+    async def boom(*a, **kw):
+        raise TraceUnavailable("대상을 찾지 못했습니다")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    monkeypatch.setattr(st, "trace_code", boom)
+    await h.on_question(thread_ts="100.1", text="이 코드?", say=say, user="U-OWNER",
+                        channel="C1")
+
+    joined = "\n".join(m["text"] or "" for m in say.messages)
+    assert "그래도 이 답은 나가야 한다" in joined
+
+
+def _button_of(msg):
+    for b in msg.get("blocks") or []:
+        if b["type"] == "actions":
+            return b["elements"][0]
+    return None
+
+
+@pytest.mark.asyncio
+async def test_long_answer_report_link_is_a_button(tmp_path, repo, monkeypatch):
+    """리포트 링크는 **버튼**으로 나간다 (사용자 2026-08-25).
+
+    날 URL은 스레드에서 그냥 파란 글자라 다른 리포트(채점)와 모양이 어긋나고, 모바일에서
+    눌러야 할 것인지도 덜 분명하다. 채점 리포트가 이미 `tutor_report` 버튼을 쓴다.
+    `text`는 알림 미리보기로 읽히므로 URL이 아니라 사람이 읽을 문장을 남긴다.
+    """
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=_long_answer(), citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    await h.on_question(thread_ts="100.1", text="길게", say=say, user="U-OWNER",
+                        channel="C1")
+
+    btn = _button_of(say.messages[-1])
+    assert btn and btn["type"] == "button", say.messages[-1]
+    assert btn["url"].startswith("https://reports.example")
+    assert btn["action_id"] == "tutor_report"
+    # **화면에 보이는 것**(section)에는 날 URL이 없다. `text`는 blocks가 있으면
+    # Slack이 표시하지 않고 알림 미리보기·폴백으로만 쓰므로 링크를 남겨 둔다 —
+    # blocks를 못 받는 say로 되돌아갈 때 링크가 사라지지 않게.
+    section = say.messages[-1]["blocks"][0]["text"]["text"]
+    assert "여기가 요점이다" in section and "https://" not in section
+    assert "https://reports.example" in say.messages[-1]["text"], "폴백에 링크가 없다"
+
+
+@pytest.mark.asyncio
+async def test_code_report_link_is_a_button(tmp_path, repo, monkeypatch):
+    """실행 리포트도 같다 — 버튼 문구만 다르다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+    from devcrew.tutor_code import Line, Step, Trace
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text="짧은 요약이다.", citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1",
+                      code_focus={"path": "a.py", "symbol": "f"})
+
+    async def fake_trace(*a, **kw):
+        return Trace(title="t", role_of_code="r", path="a.py",
+                     lines=[Line(1, "x"), Line(2, "y")],
+                     steps=[Step(1, "첫 줄", []), Step(2, "둘째 줄", [])])
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    monkeypatch.setattr(st, "trace_code", fake_trace)
+    await h.on_question(thread_ts="100.1", text="이 코드 어떻게 돌아?", say=say,
+                        user="U-OWNER", channel="C1")
+
+    btn = _button_of(say.messages[-1])
+    assert btn and btn["type"] == "button", say.messages[-1]
+    assert "실행" in btn["text"]["text"]
+    assert "https://" not in say.messages[-1]["blocks"][0]["text"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_blocks_are_valid_and_within_slack_limits(tmp_path, repo, monkeypatch):
+    """버튼 라벨은 `plain_text`라 마크다운이 없고 길이 상한이 있다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+
+    h, _, _ = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=_long_answer(4000), citations=[], dropped=3,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1")
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    await h.on_question(thread_ts="100.1", text="길게", say=say, user="U-OWNER",
+                        channel="C1")
+    assert_block_kit_valid(say.messages[-1]["blocks"])
+
+
+@pytest.mark.asyncio
+async def test_diagram_spec_reaches_the_report(tmp_path, repo, monkeypatch):
+    """tutor가 `diagram`을 달면 그림이 리포트에 실린다 (호출자→피호출자 배선).
+
+    순수 함수 테스트는 배선을 증명하지 않는다 — 이 저장소는 같은 이유로 배선을 세 번
+    조용히 잃었다(lessons C1). spec이 `draw()`까지 가고 그 결과가 HTML에 들어가는지 본다.
+    """
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+
+    seen = {}
+    h, _, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=_long_answer(), citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1",
+                      diagram="정지 → 확인 → 기동 흐름도")
+
+    async def fake_draw(orch, cfg, *, exec_id, spec):
+        seen["spec"] = spec
+        return '<svg viewBox="0 0 10 10"><title>흐름</title></svg>'
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    monkeypatch.setattr(st, "draw", fake_draw)
+    await h.on_question(thread_ts="100.1", text="설명해줘", say=say, user="U-OWNER",
+                        channel="C1")
+
+    assert seen.get("spec") == "정지 → 확인 → 기동 흐름도", "spec이 draw까지 안 갔다"
+    html = next(h for tid, h in pub if tid.startswith("ta-"))
+    assert "<svg viewBox=" in html and "흐름" in html
+
+
+@pytest.mark.asyncio
+async def test_report_is_complete_without_a_diagram(tmp_path, repo, monkeypatch):
+    """그림은 곁다리다 — 못 그렸다고 답변을 막으면 안 된다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+
+    h, _, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=_long_answer(), citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1",
+                      diagram="그릴 수 없는 것")
+
+    async def fake_draw(*a, **kw):
+        return None
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    monkeypatch.setattr(st, "draw", fake_draw)
+    await h.on_question(thread_ts="100.1", text="설명해줘", say=say, user="U-OWNER",
+                        channel="C1")
+
+    html = next(h for tid, h in pub if tid.startswith("ta-"))
+    assert "<svg" not in html and "여기가 요점이다" in html
+    assert _button_of(say.messages[-1]), "링크는 그대로 나가야 한다"
+
+
+@pytest.mark.asyncio
+async def test_code_report_carries_its_diagram(tmp_path, repo, monkeypatch):
+    """실행 리포트도 같다 — TUTOR_CODE가 낸 spec으로 그린다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+    from devcrew.tutor_code import Line, Step, Trace
+
+    h, _, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text="요약", citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1",
+                      code_focus={"path": "a.py", "symbol": None})
+
+    async def fake_trace(*a, **kw):
+        return Trace(title="t", role_of_code="r", path="a.py",
+                     lines=[Line(1, "x"), Line(2, "y")],
+                     steps=[Step(1, "a", []), Step(2, "b", [])],
+                     diagram="루프 구조")
+
+    async def fake_draw(orch, cfg, *, exec_id, spec):
+        assert spec == "루프 구조"
+        return '<svg viewBox="0 0 10 10"><title>루프</title></svg>'
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    monkeypatch.setattr(st, "trace_code", fake_trace)
+    monkeypatch.setattr(st, "draw", fake_draw)
+    await h.on_question(thread_ts="100.1", text="이 코드?", say=say, user="U-OWNER",
+                        channel="C1")
+
+    html = next(h for tid, h in pub if tid.startswith("code-"))
+    assert "<svg viewBox=" in html and "루프" in html
+
+
+@pytest.mark.asyncio
+async def test_sweep_idle_reclaims_sessions_past_the_ttl(tmp_path, repo):
+    """TTL이 지난 TA 세션은 아무도 다시 묻지 않아도 반납된다 (사용자 2026-08-25).
+
+    축출은 지금까지 **답변 직후에만** 돌았다 — 그래서 마지막 질문 뒤 아무도 안 물으면
+    TTL이 지나도 세션이 남았다. 실제로 17시간 산 워커를 정리 중에 발견했다.
+    """
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    stale = _idle_ta_session(h, "900.1", touched=time.monotonic() - st.TA_IDLE_TTL - 60,
+                             sid="stale-1")
+    fresh = _idle_ta_session(h, "900.2", touched=time.monotonic(), sid="fresh-2")
+
+    await h.sweep_idle()
+
+    archived = h.orch.adapters[Provider.CLAUDE_CODE].archived
+    assert stale in archived, "TTL이 지난 세션을 반납하지 않았다"
+    assert fresh not in archived, "아직 살아 있는 세션까지 죽였다"
+    assert "900.1" not in h.sessions and "900.2" in h.sessions
+
+
+@pytest.mark.asyncio
+async def test_sweep_never_touches_a_session_mid_answer(tmp_path, repo):
+    """답변 중인 회차를 말없이 죽이면 학습자에겐 답이 끊긴 스레드만 남는다."""
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_handler(tmp_path, repo)
+    sid = _idle_ta_session(h, "900.3", touched=time.monotonic() - st.TA_IDLE_TTL - 60)
+    h.sessions["900.3"].ta_busy = True
+
+    await h.sweep_idle()
+    assert sid not in h.orch.adapters[Provider.CLAUDE_CODE].archived
+    assert "900.3" in h.sessions
+
+
+@pytest.mark.asyncio
+async def test_sweep_loop_actually_calls_the_sweep(tmp_path, repo):
+    """**배선 테스트.** 루프가 실제로 sweep을 부르는지 본다 — 순수 함수 테스트는
+    배선을 증명하지 않는다 (lessons C1). 이 저장소는 같은 이유로 배선을 세 번 잃었다."""
+    import asyncio
+
+    from devcrew.slack_tutor import sweep_loop
+
+    h, _, _ = make_handler(tmp_path, repo)
+    calls = []
+    h.sweep_idle = lambda: calls.append(1) or asyncio.sleep(0)
+
+    task = asyncio.create_task(sweep_loop(h, interval=0.01))
+    await asyncio.sleep(0.06)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert len(calls) >= 2, f"루프가 sweep을 부르지 않았다 ({len(calls)}회)"
+
+
+@pytest.mark.asyncio
+async def test_sweep_loop_survives_a_failing_sweep(tmp_path, repo):
+    """쓸어담기 하나가 실패해도 루프가 죽으면 안 된다 — 그러면 이후 전부 안 돈다."""
+    import asyncio
+
+    from devcrew.slack_tutor import sweep_loop
+
+    h, _, _ = make_handler(tmp_path, repo)
+    calls = []
+
+    async def boom():
+        calls.append(1)
+        raise RuntimeError("registry 접근 실패")
+
+    h.sweep_idle = boom
+    task = asyncio.create_task(sweep_loop(h, interval=0.01))
+    await asyncio.sleep(0.06)
+    alive = not task.done()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert alive and len(calls) >= 2, f"루프가 죽었다 ({len(calls)}회 호출)"

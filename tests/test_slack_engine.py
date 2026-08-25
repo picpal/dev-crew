@@ -771,10 +771,14 @@ def test_plain_checkout_has_a_single_candidate(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_tutor_say_broadcasts_to_the_channel():
-    """스레드 답글은 어느 클라이언트에서도 채널 피드에 뜨지 않는다. 데스크톱은 멘션
-    직후 스레드 패널이 열려 있어 보였을 뿐이고, 모바일에는 그 패널이 없어 회차 전체가
-    보이지 않았다 (2026-08-24). 회차 키는 여전히 thread_ts다 — 게시 위치만 넓힌다."""
+async def test_tutor_say_keeps_everything_inside_the_thread():
+    """회차는 **스레드 안에서만** 돈다 — 채널 피드로 새어 나가지 않는다.
+
+    한때 `reply_broadcast`로 채널에도 함께 게시했다. 모바일에서 회차가 안 보인다는 진단
+    때문이었는데, 실제로는 스레드 답글은 PC·모바일 모두 스레드 안에서 정상적으로 보인다 —
+    broadcast가 바꾸는 것은 "스레드를 열지 않아도 보이느냐" 하나뿐이었다. 그 한 탭의
+    대가로 **정답과 해설이 채널 전체에 게시**됐다 (2026-08-24 최종 리뷰 I7). 회차를 아직
+    풀지 않은 사람에게는 스포일러다."""
     from devcrew.slack_engine import make_tutor_say
 
     class Client:
@@ -791,7 +795,7 @@ async def test_tutor_say_broadcasts_to_the_channel():
     await say(text="문항", blocks=[{"x": 1}])
     kw = client.calls[0]
     assert kw["channel"] == "C1" and kw["thread_ts"] == "100.1"
-    assert kw["reply_broadcast"] is True, "채널에도 게시하지 않으면 모바일에서 안 보인다"
+    assert not kw.get("reply_broadcast"), "채널 피드로 새면 정답·해설이 회차 밖으로 나간다"
     assert kw["blocks"] == [{"x": 1}]
 
     # 호출자가 스레드를 명시하면 그쪽을 따른다 (기본 thread는 폴백이다)
@@ -800,8 +804,8 @@ async def test_tutor_say_broadcasts_to_the_channel():
 
 
 @pytest.mark.asyncio
-async def test_tutor_say_never_broadcasts_without_a_thread():
-    """`reply_broadcast`는 스레드 답글에만 유효하다 — thread 없이 켜면 API가 거부한다."""
+async def test_tutor_say_never_broadcasts_at_all():
+    """스레드가 없을 때도 마찬가지다 — broadcast는 어느 경로에서도 켜지지 않는다."""
     from devcrew.slack_engine import make_tutor_say
 
     class Client:
@@ -814,4 +818,267 @@ async def test_tutor_say_never_broadcasts_without_a_thread():
 
     client = Client()
     await make_tutor_say(client, "C1", None)(text="스레드 없음")
-    assert client.calls[0]["reply_broadcast"] is False
+    assert not client.calls[0].get("reply_broadcast")
+
+
+@pytest.mark.asyncio
+async def test_tutor_question_router_ignores_bot_messages():
+    """tutor 응답은 채널에 broadcast되고 그건 다시 message 이벤트로 돌아온다.
+    거르지 않으면 봇이 자기 답변에 답하는 무한 루프가 된다."""
+    from devcrew.slack_engine import make_tutor_question
+
+    class H:
+        def __init__(self):
+            self.calls = []
+
+        async def on_question(self, **kw):
+            self.calls.append(kw)
+
+    class Client:
+        async def chat_postMessage(self, **kw):
+            return {"ts": "1"}
+
+    h = H()
+    route = make_tutor_question(h, Client())
+
+    await route({"event": {"type": "message", "bot_id": "B1", "text": "내 답변",
+                           "thread_ts": "100.1", "channel": "C1", "user": "U1"}})
+    await route({"event": {"type": "message", "subtype": "message_changed",
+                           "text": "수정됨", "thread_ts": "100.1",
+                           "channel": "C1", "user": "U1"}})
+    assert h.calls == []
+
+
+@pytest.mark.asyncio
+async def test_tutor_question_router_forwards_thread_replies():
+    from devcrew.slack_engine import make_tutor_question
+
+    class H:
+        def __init__(self):
+            self.calls = []
+
+        async def on_question(self, **kw):
+            self.calls.append(kw)
+
+    class Client:
+        async def chat_postMessage(self, **kw):
+            return {"ts": "1"}
+
+    h = H()
+    await make_tutor_question(h, Client())(
+        {"event": {"type": "message", "text": "왜 그런가요?", "thread_ts": "100.1",
+                   "ts": "100.9", "channel": "C1", "user": "U-OWNER"}})
+    assert h.calls[0]["thread_ts"] == "100.1"
+    assert h.calls[0]["user"] == "U-OWNER"
+    assert h.calls[0]["text"] == "왜 그런가요?"
+
+
+@pytest.mark.asyncio
+async def test_top_level_message_is_not_a_question():
+    """스레드 밖 채널 메시지는 회차와 무관하다 — 건드리지 않는다."""
+    from devcrew.slack_engine import make_tutor_question
+
+    class H:
+        def __init__(self):
+            self.calls = []
+
+        async def on_question(self, **kw):
+            self.calls.append(kw)
+
+    class Client:
+        async def chat_postMessage(self, **kw):
+            return {"ts": "1"}
+
+    h = H()
+    await make_tutor_question(h, Client())(
+        {"event": {"type": "message", "text": "잡담", "ts": "200.1",
+                   "channel": "C1", "user": "U1"}})
+    assert h.calls == []
+
+
+@pytest.mark.asyncio
+async def test_mention_strips_the_bot_handle_from_the_question():
+    """스레드에서 `@tutor 이거 왜 이래?`가 가장 자연스러운 형태다."""
+    from devcrew.slack_engine import make_tutor_question
+
+    class H:
+        def __init__(self):
+            self.calls = []
+
+        async def on_question(self, **kw):
+            self.calls.append(kw)
+
+    class Client:
+        async def chat_postMessage(self, **kw):
+            return {"ts": "1"}
+
+    h = H()
+    await make_tutor_question(h, Client())(
+        {"event": {"type": "app_mention", "text": "<@U0BRV19AMLL> 이거 왜 이래?",
+                   "thread_ts": "100.1", "ts": "100.9",
+                   "channel": "C1", "user": "U-OWNER"}})
+    assert h.calls[0]["text"] == "이거 왜 이래?"
+
+
+@pytest.mark.asyncio
+async def test_tutor_question_router_dedupes_same_message_across_event_types():
+    """Slack은 스레드 안 "@tutor 질문"을 app_mention과 message 두 이벤트로, 서로 다른
+    event_id로 보낸다. event_id로는 걸러지지 않으므로 메시지 자신의 (channel, ts)로
+    막아야 한다 — 안 그러면 같은 질문에 답이 두 번 나간다."""
+    from devcrew.slack_engine import make_tutor_question
+
+    class H:
+        def __init__(self):
+            self.calls = []
+
+        async def on_question(self, **kw):
+            self.calls.append(kw)
+
+    class Client:
+        async def chat_postMessage(self, **kw):
+            return {"ts": "1"}
+
+    h = H()
+    route = make_tutor_question(h, Client())
+
+    await route({"event_id": "Ev1", "event": {"type": "app_mention",
+                 "text": "<@U0BRV19AMLL> 이거 왜 이래?", "thread_ts": "100.1",
+                 "ts": "100.9", "channel": "C1", "user": "U-OWNER"}})
+    await route({"event_id": "Ev2", "event": {"type": "message",
+                 "text": "<@U0BRV19AMLL> 이거 왜 이래?", "thread_ts": "100.1",
+                 "ts": "100.9", "channel": "C1", "user": "U-OWNER"}})
+
+    assert len(h.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_mention_only_strips_leading_bot_handle_not_mentions_inside():
+    """`@tutor <@U999>가 왜 여기 나와?`처럼 질문 본문 안에 다른 사람 멘션이 있으면
+    그건 질문의 주어다 — 지워버리면 문장이 깨져 복구할 수 없다."""
+    from devcrew.slack_engine import make_tutor_question
+
+    class H:
+        def __init__(self):
+            self.calls = []
+
+        async def on_question(self, **kw):
+            self.calls.append(kw)
+
+    class Client:
+        async def chat_postMessage(self, **kw):
+            return {"ts": "1"}
+
+    h = H()
+    await make_tutor_question(h, Client())(
+        {"event": {"type": "app_mention",
+                   "text": "<@U0BRV19AMLL> <@U999>가 왜 여기 나와?",
+                   "thread_ts": "100.1", "ts": "100.9",
+                   "channel": "C1", "user": "U-OWNER"}})
+    assert h.calls[0]["text"] == "<@U999>가 왜 여기 나와?"
+
+
+# ── @tutor app_mention 라우팅 분기 (최종 리뷰 I5) ────────────────────────────
+class DispatchSpy:
+    """회차 유무를 스스로 아는 tutor 대역."""
+
+    def __init__(self, rounds=()):
+        self.rounds = set(rounds)
+        self.questions = []
+        self.mentions = []
+
+    def has_round(self, thread_ts):
+        return thread_ts in self.rounds
+
+    async def on_question(self, **kw):
+        self.questions.append(kw)
+
+    async def on_mention(self, body, say):
+        self.mentions.append(body)
+
+
+class DispatchClient:
+    async def chat_postMessage(self, **kw):
+        return {"ts": "1"}
+
+
+@pytest.mark.asyncio
+async def test_tutor_dispatch_routes_an_in_thread_mention_with_a_round_to_a_question():
+    """채점이 끝난 스레드의 `@tutor 이거 왜 이래?`는 새 회차가 아니라 질문이다.
+    이 결정이 `_amain`의 클로저 안에 있어 어떤 테스트도 닿지 못했다 (lessons C1 —
+    이 저장소가 배선을 두 번 조용히 잃은 자리)."""
+    from devcrew.slack_engine import make_tutor_dispatch
+
+    t = DispatchSpy(rounds={"100.1"})
+    await make_tutor_dispatch(t, DispatchClient())(
+        {"event": {"type": "app_mention", "text": "<@U0BRV19AMLL> 이거 왜 이래?",
+                   "thread_ts": "100.1", "ts": "100.9", "channel": "C1",
+                   "user": "U-OWNER"}})
+    assert t.mentions == []
+    assert t.questions[0]["thread_ts"] == "100.1"
+    assert t.questions[0]["text"] == "이거 왜 이래?"
+
+
+@pytest.mark.asyncio
+async def test_tutor_dispatch_starts_a_round_for_an_in_thread_mention_with_no_round():
+    """**모든** in-thread 멘션을 질문으로 보내면 스레드 안에서 `@tutor myrepo:` 로
+    회차를 시작하는 길이 사라진다 — `on_question`은 회차가 없으면 조용히 무시하므로
+    사용자에게는 무반응이 된다 (최종 리뷰 I5의 부수 회귀)."""
+    from devcrew.slack_engine import make_tutor_dispatch
+
+    t = DispatchSpy()
+    await make_tutor_dispatch(t, DispatchClient())(
+        {"event": {"type": "app_mention", "text": "<@U0BRV19AMLL> myrepo:",
+                   "thread_ts": "100.1", "ts": "100.9", "channel": "C1",
+                   "user": "U-OWNER"}})
+    assert t.questions == []
+    assert len(t.mentions) == 1
+
+
+@pytest.mark.asyncio
+async def test_tutor_dispatch_sends_a_top_level_mention_to_on_mention():
+    from devcrew.slack_engine import make_tutor_dispatch
+
+    t = DispatchSpy(rounds={"200.1"})
+    await make_tutor_dispatch(t, DispatchClient())(
+        {"event": {"type": "app_mention", "text": "<@U0BRV19AMLL> myrepo:",
+                   "ts": "200.1", "channel": "C1", "user": "U-OWNER"}})
+    assert t.questions == [] and len(t.mentions) == 1
+
+
+@pytest.mark.asyncio
+async def test_tutor_dispatch_shares_the_dedupe_state_with_the_message_router():
+    """스레드 안의 `@tutor 질문`은 app_mention과 message 두 이벤트로 온다. 분기를
+    꺼내면서 라우터를 따로 만들면 중복 차단 상태(`(channel, ts)`)가 갈라져 같은
+    질문에 답이 두 번 나간다."""
+    from devcrew.slack_engine import make_tutor_dispatch, make_tutor_question
+
+    t = DispatchSpy(rounds={"100.1"})
+    client = DispatchClient()
+    question = make_tutor_question(t, client)
+    dispatch = make_tutor_dispatch(t, client, question)
+
+    ev = {"text": "<@U0BRV19AMLL> 이거 왜 이래?", "thread_ts": "100.1",
+          "ts": "100.9", "channel": "C1", "user": "U-OWNER"}
+    await dispatch({"event_id": "Ev1", "event": {**ev, "type": "app_mention"}})
+    await question({"event_id": "Ev2", "event": {**ev, "type": "message"}})
+
+    assert len(t.questions) == 1
+
+
+def test_engine_starts_the_tutor_sweep_loop():
+    """엔진이 `sweep_loop`를 task로 띄우는지 **소스에서** 확인한다.
+
+    이 배선은 네트워크·Slack 토큰이 있어야 도는 자리에 있어 함수로 부를 seam이 없다.
+    그래서 약한 테스트다 — 루프가 실제로 도는 것은 `test_slack_tutor.py`가 따로 잡고,
+    여기서 잡는 것은 **그 줄이 사라지는 것** 하나다. 그것만으로 충분한 이유는, 이
+    저장소가 배선을 잃은 세 번이 전부 "코드는 멀쩡한데 부르는 자리가 없어진" 경우였기
+    때문이다 (lessons C1).
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src" / "devcrew" / "slack_engine.py"
+    body = src.read_text()
+    assert "sweep_loop" in body, "sweep_loop 배선이 사라졌다"
+    assert re.search(r"tasks\.append\(\s*sweep_loop\(", body), \
+        "sweep_loop가 실행 task로 등록되지 않았다 — import만 남으면 돌지 않는다"

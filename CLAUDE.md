@@ -56,6 +56,8 @@ LLM(leader)은 정책이 답을 못 정하는 **5개 트리거에서만** 호출
 | `slack_brain.py` | brain 봇 — 인터뷰 세션, brief 산출, 핸드오프 |
 | `slack_tutor.py` | tutor 봇 — 학습 회차, 문항 진행, 채점 발행 |
 | `quiz.py` `tutor.py` | 문항 모델·인용 대조·채점·오답 노트 / 출제 파이프라인 |
+| `tutor_ta.py` `tutor_code.py` | 후속 질문 답변 / 코드 실행 흐름 추적 (좌우 분할 리포트) |
+| `tutor_vis.py` | 리포트 다이어그램 — `vision` 스킬 호출, SVG 추출·살균·**테마 토큰 매핑** |
 | `store/trace.py` | append-only 이벤트(진실) + projection. `store/registry.py` = 세션 레지스트리 |
 | `usage.py` | 컨텍스트 점유 실측/표기 |
 | `repos.py` `worktree.py` | repo 레지스트리(+base 브랜치), git worktree 격리 |
@@ -71,14 +73,27 @@ LLM(leader)은 정책이 답을 못 정하는 **5개 트리거에서만** 호출
    쓰지 않는다. `.env`는 gitignore 유지.
 2. **harness MCP는 read-only.** leader는 `get_execution_state` / `get_worker_result` /
    `get_trace_events`만 갖는다. 쓰기 도구를 주지 않는다.
-3. **워커 쓰기는 자기 worktree 안으로 제한.** `enforcement.make_can_use_tool`의 경로
+3. **Claude Code 스킬은 role별로 이름을 명시해서만 연다.** `RolePolicy.skills`에 적은
+   role만 Skill 도구를 갖는다 — `"all"`은 쓰지 않는다(컨텍스트 낭비 + 의도치 않은 능력).
+   `setting_sources`도 넘기지 않는다: 없이도 호출되고, 넣으면 사용자 전역 설정이 워커에
+   통째로 딸려 온다. **쓰기가 필요한 스킬을 쓰는 role은 cwd가 repo면 안 된다** —
+   tutor role은 worktree가 아니라 사용자의 **실제 repo**를 cwd로 받기 때문에,
+   `TUTOR_VIS`만 임시 디렉토리에서 돌린다(`tutor_vis.draw`).
+
+4. **워커 쓰기는 자기 worktree 안으로 제한.** `enforcement.make_can_use_tool`의 경로
    게이트. DEVELOPER만 `Bash`를 갖고, 나머지는 읽기 중심.
-4. **trace는 append-only.** UPDATE/DELETE 트리거로 DB 레벨에서 막혀 있다. 이벤트가
+5. **trace는 append-only.** UPDATE/DELETE 트리거로 DB 레벨에서 막혀 있다. 이벤트가
    진실이고 projection은 재구축 가능해야 한다.
-5. **strict JSON schema 규약**: `required`는 모든 property를 포함한다. 선택 필드는
+6. **strict JSON schema 규약**: `required`는 모든 property를 포함한다. 선택 필드는
    nullable 타입으로 표현한다(`tests/test_roles.py::_assert_strict`가 강제).
-6. **HTML 리포트는 단일 파일** — 인라인 CSS, JS 없음, 모든 출력 이스케이프, strict CSP.
-7. **main 병합·외부 발신은 사용자 결정.** 임의로 하지 않는다.
+7. **HTML 리포트는 단일 파일** — 인라인 CSS, JS 없음, 모든 출력 이스케이프, strict CSP.
+   JS 금지는 취향이 아니라 **worker가 강제한다**: `worker/src/index.js`의
+   `default-src 'none'`이 스크립트를 실행 자체 안 시킨다(`style-src 'unsafe-inline'`만
+   열려 있다). 코드 실행 리포트의 2초 자동 진행·수동 스텝이 전부 CSS(`@keyframes` +
+   `animation-delay`, 라디오 + `:checked ~`)로 서 있는 이유다. JS 제어를 얹으려면
+   worker CSP를 고치고 재배포해야 하고, 그건 모델이 쓴 내용을 렌더하는 **모든** 리포트의
+   backstop을 여는 거래다.
+8. **main 병합·외부 발신은 사용자 결정.** 임의로 하지 않는다.
 
 ---
 
@@ -96,6 +111,10 @@ LLM(leader)은 정책이 답을 못 정하는 **5개 트리거에서만** 호출
 - **세션 이월(carry)**: 같은 Slack 스레드의 후속 요청은 작업 공간과 노드/leader 세션을
   이어받는다. repo나 base 브랜치가 바뀌면 끊는다. 프로세스 재시작 시 `SessionCarryLost`로
   새 세션 폴백.
+- **유휴 TA 세션은 10분마다 쓸어담는다** (`slack_tutor.sweep_loop`). 축출을 답변
+  경로에만 걸면 "마지막 질문 뒤 아무도 안 묻는" 흔한 경우에 `TA_IDLE_TTL`(6h)이
+  무의미해진다 — 17시간 산 워커를 실제로 발견했다(2026-08-25). 답변 중인 회차
+  (`ta_busy`)는 건드리지 않는다.
 - **`@crew /clear` / `@brain /clear`** 로 그 스레드 컨텍스트를 비운다. worktree와 커밋은
   남긴다. 실행 중에는 거부 — 중지 버튼을 먼저 쓰게 한다.
 
@@ -153,6 +172,10 @@ uv run python -u -m devcrew.slack_engine   # 브리지 (env 필요)
 | `전달` | brief 산출 → crew 인계 (재인계는 delta만) |
 | `@brain /clear` | 인터뷰 세션 정리 |
 | `@tutor <repo>:` | 그 repo에 대한 10문항 학습 회차 시작 (버튼으로 응답) |
+| `@tutor` 스레드에 답글·멘션 | 채점 후 후속 질문. `TUTOR_TA`가 repo를 읽고 근거를 달아 답한다 |
+| 그중 **코드 실행** 질문 | `TUTOR_CODE`가 좌: 코드 / 우: 스텝별 변수 상태 리포트를 만든다 (2초에 한 칸) |
+| 그림이 말이 되는 질문 | tutor가 `diagram`에 무엇을 그릴지 적으면 `TUTOR_VIS`가 `vision` 스킬로 그려 리포트에 싣는다 |
+| 답변이 2,000자 초과 | 자르지 않고 HTML 리포트로 흘리고 첫 문단 + 📄 링크를 남긴다 |
 
 응답 형태로 의도가 구분된다: **버튼 = 골라야 할 결정**, **본문 산문 = 이어갈 논의**,
 **📄 링크 = 읽고 넘어갈 결론**(최종 brief 또는 3,000자 초과분).
