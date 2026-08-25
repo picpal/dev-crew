@@ -64,9 +64,20 @@ def claude_options_kwargs(role: Role, *, cwd: str | None) -> dict:
         "allowed_tools": list(p.allowed_tools),
         "permission_mode": p.permission_mode,
         "cwd": cwd,
+        # **항상 넘긴다.** 생략하면 SDK가 CLI 기본값에 맡기고 그건 전부 로드다 —
+        # 사용자 전역 `~/.claude/settings.json`과 cwd의 CLAUDE.md가 워커 컨텍스트에
+        # 딸려 들어간다. 실측(2026-08-25, `claude -p` + 도구 차단): 플래그가 없으면
+        # cwd의 CLAUDE.md가 주입되고 `--setting-sources=`면 주입되지 않는다.
+        # 즉 '안 넘기면 격리'가 아니라 '안 넘기면 전부'다.
+        #
+        # project/local은 어느 role에도 열지 않는다: 워커의 cwd는 대상 repo의
+        # worktree라, 그 repo의 `.claude/settings.json`(훅 포함)과 CLAUDE.md가
+        # role 프롬프트를 덮어쓰는 주입 표면이 된다.
+        "setting_sources": ["user"] if p.skills else [],
     }
-    # 선언한 role에만 붙인다. `setting_sources`는 넘기지 않는다 — 없이도 Skill 호출이
-    # 되는 것을 실측했고(2026-08-25), 넣으면 사용자 전역 설정이 워커에 통째로 딸려 온다.
+    # 스킬은 선언한 role에만 붙인다. 전역 스킬이 user source에 살기 때문에 그 role만
+    # `user`를 여는 것이고, `[]`로는 SDK가 스킬을 찾지 못한다 — 자동 보정
+    # (`_apply_skills_defaults`)은 `setting_sources is None`일 때만 발동한다.
     if p.skills:
         kw["skills"] = list(p.skills)
     return kw

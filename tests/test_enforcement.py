@@ -134,3 +134,29 @@ def test_tutor_roles_are_read_only():
         assert not any(t.startswith("Bash") for t in p.allowed_tools)
     # 검증자는 Codex 세션이다 — 샌드박스도 읽기 전용으로 못 박는다
     assert ROLE_POLICY[Role.TUTOR_VERIFIER].sandbox == "read-only"
+
+
+# ── setting_sources: 워커에 사용자·프로젝트 설정을 딸려 보내지 않는다 ──────────
+def test_every_role_pins_setting_sources():
+    """`setting_sources`를 안 넘기면 SDK가 CLI 기본값에 맡기고, 그건 **전부 로드**다.
+
+    실측(2026-08-25, `claude -p` + 도구 차단): 플래그가 없으면 cwd의 CLAUDE.md가
+    컨텍스트에 주입되고, `--setting-sources=`면 주입되지 않는다. 즉 '안 넘기면
+    격리'가 아니라 '안 넘기면 전부'다 — 넘기는 것이 좁히는 쪽이다.
+    """
+    for role in Role:
+        kw = claude_options_kwargs(role, cwd="/tmp/wt")
+        assert "setting_sources" in kw, f"{role.value}: 기본값에 맡기면 전부 로드된다"
+        assert "project" not in kw["setting_sources"], role.value
+        assert "local" not in kw["setting_sources"], role.value
+
+
+def test_only_skill_roles_load_the_user_source():
+    """스킬을 선언한 role만 `user`를 연다 — 전역 스킬이 거기 살기 때문이다.
+
+    `[]`로는 SDK가 스킬을 못 찾는다: 자동 보정(`_apply_skills_defaults`)은
+    `setting_sources is None`일 때만 발동하므로 명시적으로 열어 줘야 한다.
+    """
+    for role in Role:
+        sources = claude_options_kwargs(role, cwd="/tmp/wt")["setting_sources"]
+        assert sources == (["user"] if ROLE_POLICY[role].skills else []), role.value

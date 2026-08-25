@@ -75,8 +75,12 @@ LLM(leader)은 정책이 답을 못 정하는 **5개 트리거에서만** 호출
    `get_trace_events`만 갖는다. 쓰기 도구를 주지 않는다.
 3. **Claude Code 스킬은 role별로 이름을 명시해서만 연다.** `RolePolicy.skills`에 적은
    role만 Skill 도구를 갖는다 — `"all"`은 쓰지 않는다(컨텍스트 낭비 + 의도치 않은 능력).
-   `setting_sources`도 넘기지 않는다: 없이도 호출되고, 넣으면 사용자 전역 설정이 워커에
-   통째로 딸려 온다. **쓰기가 필요한 스킬을 쓰는 role은 cwd가 repo면 안 된다** —
+   **`setting_sources`는 항상 명시한다** — 생략하면 SDK가 CLI 기본값에 맡기고 그건
+   *전부 로드*다(사용자 전역 설정 + cwd의 CLAUDE.md). 스킬 없는 role은 `[]`,
+   스킬 쓰는 role은 `["user"]`(전역 스킬이 거기 산다). `project`/`local`은 어느
+   role에도 열지 않는다 — 워커 cwd는 대상 repo의 worktree라 그 repo의
+   `.claude/settings.json`(훅 포함)과 CLAUDE.md가 role 프롬프트를 덮어쓰는 주입
+   표면이 된다. **쓰기가 필요한 스킬을 쓰는 role은 cwd가 repo면 안 된다** —
    tutor role은 worktree가 아니라 사용자의 **실제 repo**를 cwd로 받기 때문에,
    `TUTOR_VIS`만 임시 디렉토리에서 돌린다(`tutor_vis.draw`).
 

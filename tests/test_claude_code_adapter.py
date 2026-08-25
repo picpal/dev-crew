@@ -10,6 +10,7 @@ SDK가 받는 옵션 객체 자체를 봐야 한다 — mock이 아니라 실제
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -214,3 +215,34 @@ async def test_failed_first_turn_disconnects_the_client(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         await adapter.start_session(make_inst(), "시작")
     assert len(FailingSDKClient.disconnected) == 1
+
+
+async def test_setting_sources_reach_the_sdk_on_start_and_resume(tmp_path, monkeypatch):
+    """policy가 정해도 어댑터가 안 넘기면 아무 의미가 없다 (lessons.md C1).
+
+    `setting_sources`를 생략하면 SDK는 CLI 기본값에 맡기고 그건 **전부 로드**다 —
+    사용자 전역 설정과 cwd의 CLAUDE.md가 워커에 딸려 들어간다(실측 2026-08-25).
+    그래서 값이 `ClaudeAgentOptions`까지 실제로 흐르는지, resume에서도 유지되는지
+    본다.
+    """
+    adapter = make_adapter(tmp_path, monkeypatch)
+    session_id = await adapter.start_session(make_inst(), "시작")
+    start_opts = FakeSDKClient.captured_options[-1]
+    assert start_opts.setting_sources == []          # DEVELOPER: 스킬 없음 → 완전 격리
+
+    await adapter.resume(session_id, "재개")
+    assert FakeSDKClient.captured_options[-1].setting_sources == []
+
+
+async def test_skill_role_opens_only_the_user_source(tmp_path, monkeypatch):
+    """전역 스킬은 user source에 산다 — 그 role만 그걸 연다.
+
+    `[]`로는 못 찾는다: SDK의 자동 보정은 `setting_sources is None`일 때만 발동한다
+    (`_apply_skills_defaults`). project/local은 열지 않는다 — 대상 repo의
+    `.claude/settings.json`(훅 포함)과 CLAUDE.md가 워커 행동을 바꾸면 안 된다.
+    """
+    adapter = make_adapter(tmp_path, monkeypatch)
+    inst = replace(make_inst(), role=Role.TUTOR_VIS)
+
+    await adapter.start_session(inst, "그려")
+    assert FakeSDKClient.captured_options[-1].setting_sources == ["user"]
