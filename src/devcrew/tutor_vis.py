@@ -50,6 +50,52 @@ def sanitize_svg(svg: str) -> str:
     return _URL_ATTR_RE.sub(_url, out)
 
 
+
+# ── 테마 맞추기 ─────────────────────────────────────────────────────────────
+# 리포트는 테마 반응형이다(`prefers-color-scheme`). vision은 자기 기본 팔레트(밝은 종이)
+# 로 그리므로 그대로 실으면 다크 모드에서 흰 덩어리가 앉는다. 그렇다고 vision의 **다크
+# 템플릿**을 고르면 이번엔 라이트가 어긋난다 — 한쪽을 고르는 문제가 아니다.
+# 그래서 색을 우리 토큰으로 바꿔 그림이 페이지 테마를 그대로 따라가게 한다.
+#
+# 같은 hex라도 **속성에 따라 뜻이 다르다**: `fill="#2d3142"`는 글자, `stroke`는 테두리다.
+# 테두리까지 `--ink-1`로 보내면 다크에서 순백 테두리가 되어 그림이 소리친다.
+# 폴백(`var(--x, #원래색)`)을 남겨 토큰이 없는 곳에서도 원래대로 그려진다.
+_PALETTE: dict[tuple[str, str], str] = {
+    ("fill", "#ffffff"): "--surface",        # 상자 채움
+    ("fill", "#f5f5f5"): "--surface-2",      # 종이 + 화살표 라벨 마스크 (배경과 같아야 한다)
+    ("fill", "#2d3142"): "--ink-1",          # 글자
+    ("fill", "#4f5d75"): "--ink-2",          # 보조 글자
+    ("fill", "#0f766e"): "--good",           # 강조 (정상 경로)
+    ("stroke", "#ffffff"): "--surface",
+    ("stroke", "#f5f5f5"): "--surface-2",
+    # 테두리·화살표는 **내용**이지 미세 구분선이 아니다. `--line-strong`으로 보내면
+    # 다크에서 `#383835`가 되어 화살표와 점선 테두리가 배경에 묻힌다(실측 2026-08-25).
+    # 원본의 두 단 위계(진한 테두리 / 흐린 화살표)를 잉크 두 단으로 옮긴다.
+    ("stroke", "#2d3142"): "--ink-2",        # 상자 테두리
+    ("stroke", "#4f5d75"): "--ink-3",        # 화살표·점선
+    ("stroke", "#0f766e"): "--good",
+}
+_ACCENT_TINT = "rgba(15,118,110,0.08)"
+_ACCENT_TINT_TOKEN = "color-mix(in srgb, var(--good, #0f766e) 8%, transparent)"
+_COLOR_ATTR_RE = re.compile(r'\b(fill|stroke)="([^"]+)"')
+
+
+def theme_svg(svg: str) -> str:
+    """vision 기본 팔레트 → 리포트 토큰. 모르는 색은 건드리지 않는다.
+
+    뜻을 모르는 색을 옮기면 그림이 망가진다 — 매핑에 없는 값은 그대로 둔다.
+    (그래서 TUTOR_VIS 프롬프트가 "기본 팔레트를 벗어나지 마라"고 못박는다.)
+    """
+    def _sub(m: re.Match) -> str:
+        attr, val = m.group(1), m.group(2).strip()
+        if val.replace(" ", "").lower() == _ACCENT_TINT:
+            return f'{attr}="{_ACCENT_TINT_TOKEN}"'
+        token = _PALETTE.get((attr, val.lower()))
+        return f'{attr}="var({token}, {val})"' if token else m.group(0)
+
+    return _COLOR_ATTR_RE.sub(_sub, svg or "")
+
+
 def extract_svg(html: str) -> str | None:
     """vision이 낸 HTML에서 `<svg>` 한 덩어리만 떼어 낸다.
 
@@ -60,7 +106,7 @@ def extract_svg(html: str) -> str | None:
     m = _SVG_RE.search(html or "")
     if not m:
         return None
-    svg = sanitize_svg(m.group(0))
+    svg = theme_svg(sanitize_svg(m.group(0)))
     return svg if 0 < len(svg) <= MAX_SVG else None
 
 

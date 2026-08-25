@@ -118,3 +118,67 @@ async def test_file_name_cannot_escape_the_scratch_dir(tmp_path):
     (tmp_path / "secret.html").write_text(f"<html>{SVG}</html>")
     ad = Drawing(f"<html>{SVG}</html>", name="../../secret.html")
     assert await draw(make_orch(tmp_path, ad), load_config(), exec_id="E", spec="s") is None
+
+
+def test_palette_maps_to_report_tokens_in_both_themes():
+    """vision 기본 팔레트를 **우리 토큰**으로 바꾼다 (사용자 2026-08-25).
+
+    리포트는 테마 반응형이다(`prefers-color-scheme`). 그래서 vision의 다크 템플릿을
+    고르면 다크는 맞고 **라이트가 반대로 어긋난다.** 색을 토큰에 매핑하면 그림이 페이지
+    테마를 그대로 따라가 두 모드가 다 맞는다.
+
+    같은 hex라도 **속성에 따라 뜻이 다르다** — `fill="#2d3142"`는 글자고
+    `stroke="#2d3142"`는 테두리다. 테두리까지 `--ink-1`로 보내면 다크에서 순백 테두리가
+    돼 그림이 소리친다.
+    """
+    from devcrew.tutor_vis import theme_svg
+
+    out = theme_svg('<rect fill="#ffffff" stroke="#2d3142"/>'
+                    '<text fill="#2d3142">글</text>'
+                    '<text fill="#4f5d75">보조</text>'
+                    '<line stroke="#4f5d75"/>'
+                    '<rect width="100%" fill="#f5f5f5"/>'
+                    '<line stroke="#0f766e"/>')
+    assert 'fill="var(--surface, #ffffff)"' in out
+    assert 'stroke="var(--ink-2, #2d3142)"' in out
+    assert 'fill="var(--ink-1, #2d3142)"' in out
+    assert 'fill="var(--ink-2, #4f5d75)"' in out
+    assert 'stroke="var(--ink-3, #4f5d75)"' in out
+    assert 'fill="var(--surface-2, #f5f5f5)"' in out
+    assert 'stroke="var(--good, #0f766e)"' in out
+
+
+def test_fallback_keeps_the_diagram_readable_standalone():
+    """토큰이 없는 곳(파일로 따로 열기 등)에서도 원래 색으로 그려져야 한다."""
+    from devcrew.tutor_vis import theme_svg
+
+    out = theme_svg('<text fill="#2d3142">x</text>')
+    assert "#2d3142" in out, "폴백 색이 사라졌다"
+
+
+def test_unknown_colors_are_left_alone():
+    """기본 팔레트 밖의 색은 건드리지 않는다 — 뜻을 모르는 색을 옮기면 그림이 망가진다."""
+    from devcrew.tutor_vis import theme_svg
+
+    out = theme_svg('<rect fill="#c22f2f"/><circle fill="url(#grad)"/>')
+    assert 'fill="#c22f2f"' in out and 'fill="url(#grad)"' in out
+
+
+def test_accent_tint_becomes_a_token_mix():
+    """강조 색의 옅은 채움도 따라가야 한다 — 안 그러면 다크에서 그 면만 뜬다."""
+    from devcrew.tutor_vis import theme_svg
+
+    out = theme_svg('<rect fill="rgba(15,118,110,0.08)"/>')
+    assert "color-mix(in srgb, var(--good, #0f766e) 8%, transparent)" in out
+
+
+@pytest.mark.asyncio
+async def test_draw_applies_the_theme(tmp_path):
+    """배선 — `draw()`가 살균만 하고 테마 매핑을 빠뜨리면 안 된다."""
+    from devcrew.tutor_vis import draw
+
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg">'
+           '<text fill="#2d3142">글</text></svg>')
+    ad = Drawing(f"<html>{svg}</html>")
+    out = await draw(make_orch(tmp_path, ad), load_config(), exec_id="E", spec="s")
+    assert out and "var(--ink-1" in out

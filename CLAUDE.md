@@ -57,7 +57,7 @@ LLM(leader)은 정책이 답을 못 정하는 **5개 트리거에서만** 호출
 | `slack_tutor.py` | tutor 봇 — 학습 회차, 문항 진행, 채점 발행 |
 | `quiz.py` `tutor.py` | 문항 모델·인용 대조·채점·오답 노트 / 출제 파이프라인 |
 | `tutor_ta.py` `tutor_code.py` | 후속 질문 답변 / 코드 실행 흐름 추적 (좌우 분할 리포트) |
-| `tutor_vis.py` | 리포트 다이어그램 — `vision` 스킬 호출, SVG 추출·살균 |
+| `tutor_vis.py` | 리포트 다이어그램 — `vision` 스킬 호출, SVG 추출·살균·**테마 토큰 매핑** |
 | `store/trace.py` | append-only 이벤트(진실) + projection. `store/registry.py` = 세션 레지스트리 |
 | `usage.py` | 컨텍스트 점유 실측/표기 |
 | `repos.py` `worktree.py` | repo 레지스트리(+base 브랜치), git worktree 격리 |
