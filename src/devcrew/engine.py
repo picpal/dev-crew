@@ -427,6 +427,22 @@ class WorkflowEngine:
             elif action == "PROCEED":
                 record_decision("CLASSIFY", raw, raw, producer_id, degraded=False)
                 path.append("leader:CLASSIFY→PROCEED")
+            elif action == "INVESTIGATE_ONLY":
+                # 코드를 바꾸는 요청이 아니라 답을 찾는 요청 — 조사 노드만 남긴다.
+                # 조사 노드가 없으면 아무것도 안 도는 실행이 되므로 강등한다: 빈 실행을
+                # COMPLETED로 보고하면 "했는데 결과가 없다"와 구분되지 않는다.
+                if not any(r.spec.investigative for r in nodes):
+                    applied = {"action": "ASK_USER", "target_node": None,
+                              "rationale": "INVESTIGATE_ONLY인데 조사 노드가 없는 템플릿"}
+                    record_decision("CLASSIFY", raw, applied, producer_id, degraded=True)
+                    path.append("leader:CLASSIFY→ASK_USER")
+                    return done("NEEDS_HUMAN",
+                                "CLASSIFY 결정 무효 — 이 워크플로에 조사 노드가 없다")
+                for r in nodes:
+                    if not r.spec.investigative:
+                        r.skipped = True
+                record_decision("CLASSIFY", raw, raw, producer_id, degraded=False)
+                path.append("leader:CLASSIFY→INVESTIGATE_ONLY")
             else:
                 applied = {"action": "ASK_USER", "target_node": None,
                           "rationale": f"invalid CLASSIFY action {action!r}"}

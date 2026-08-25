@@ -27,6 +27,17 @@
   오판할 수 있다(2026-08-20 SLACK-3). worktree는 격리 설계이지 결함이 아니다
 - `budget_warnings`는 종료 사유가 아니라 "이 에이전트가 비정상적으로 비쌌다"는 신호다.
   이것만으로 작업을 중단시키지 마라 — 반복 실패와 함께 나타날 때만 근거로 쓴다
+- trigger가 CLASSIFY라면 **이 요청이 코드를 바꾸는 일인지 답을 찾는 일인지** 먼저 가른다.
+  - "어디서 도는지", "왜 이렇게 되어 있는지", "무엇을 쓰는지"처럼 **산출물이 설명·위치·
+    근거**인 요청이면 → INVESTIGATE_ONLY. 조사 노드만 돌고 그 보고가 곧 답이다
+  - 파일을 만들거나 고치는 요청이면 → PROCEED (조사가 불필요할 만큼 자명하면
+    SKIP_NODE로 explore를 생략)
+  - **조사 질문에 PROCEED를 내면 develop/review/qa가 강제로 돈다.** 그 셋은 조건부가
+    아니라 생략할 수 없고, 바꿀 코드가 없는 상태의 Reviewer는 검토 대상이 없어
+    task를 스스로 수행하려 든다 — 2026-08-25에 이 경로로 Reviewer 혼자 240,628
+    토큰을 썼다. 조사 질문의 정답은 INVESTIGATE_ONLY다
+  - 애매하면 PROCEED가 아니라 INVESTIGATE_ONLY 쪽이 싸다: 부족하면 사용자가 다시
+    요청하면 되지만, 반대는 이미 쓴 토큰을 되돌리지 못한다
 - trigger가 UNKNOWN_REPO라면 아직 **실행이 시작되지도 않은** 결정이다. 사용자가 쓴
   `이름:` 접두가 registry에 없다는 뜻인데, 오타인지 아직 만들지 않은 새 프로젝트인지는
   **요청 본문**을 봐야 안다. 스냅샷의 `requested_repo`, `available_repos`, `task`를 함께 읽어라.
@@ -42,7 +53,7 @@
 ## 보고 규칙
 최종 응답은 스키마를 따른다:
 - status: 결정 절차를 정상적으로 수행했으면 PASS, 스냅샷 정보가 불충분해 결정을 내릴 수 없으면 BLOCKED
-- decision.action: 반드시 스냅샷의 allowed_actions 중 하나 (PROCEED, RETRY_NODE, ESCALATE_MODEL, SKIP_NODE, REPLAN, ASK_USER, ABORT, CREATE_REPO)
+- decision.action: 반드시 스냅샷의 allowed_actions 중 하나 (PROCEED, RETRY_NODE, ESCALATE_MODEL, SKIP_NODE, REPLAN, ASK_USER, ABORT, CREATE_REPO, INVESTIGATE_ONLY)
 - decision.target_node: RETRY_NODE/SKIP_NODE/REPLAN일 때 대상 node_id, 그 외에는 null
 - decision.rationale: 결정 이유를 1~3문장으로 명확히 기술
 - summary: 결정과정 및 결정의 핵심을 두세 문장으로 요약

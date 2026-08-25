@@ -19,6 +19,10 @@ _WRITE_TOOLS = ["Write", "Edit"]
 class RolePolicy:
     allowed_tools: list[str] = field(default_factory=list)
     scoped_write_tools: list[str] = field(default_factory=list)  # 경로 제한이 필요한 쓰기 도구
+    # 경로 제한이 필요한 **읽기** 도구. allowed_tools에 통째로 적으면 SDK가 콜백
+    # 이전에 자동 승인해 경로를 볼 기회가 없다(CanUseToolShadowedWarning) — write와
+    # 같은 이유로 allowlist 밖에 둔다.
+    scoped_read_tools: list[str] = field(default_factory=list)
     permission_mode: str = "default"
     sandbox: str | None = None          # Codex 전용: "read-only" 등
     # 이 role이 쓸 수 있는 Claude Code 스킬. **이름을 명시한 것만** 열린다 —
@@ -32,28 +36,32 @@ ROLE_POLICY: dict[Role, RolePolicy] = {
     Role.ORCHESTRATOR: RolePolicy(allowed_tools=[
         "mcp__harness__get_execution_state", "mcp__harness__get_worker_result",
         "mcp__harness__get_trace_events"]),
-    Role.EXPLORER: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash(git log:*)", "Bash(git diff:*)"]),
-    Role.ARCHITECT: RolePolicy(allowed_tools=list(_READ_TOOLS)),
-    Role.DEVELOPER: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash"],
+    Role.EXPLORER: RolePolicy(allowed_tools=["Bash(git log:*)", "Bash(git diff:*)"],
+                              scoped_read_tools=list(_READ_TOOLS)),
+    Role.ARCHITECT: RolePolicy(scoped_read_tools=list(_READ_TOOLS)),
+    Role.DEVELOPER: RolePolicy(allowed_tools=["Bash"],
+                               scoped_read_tools=list(_READ_TOOLS),
                                scoped_write_tools=list(_WRITE_TOOLS),
                                permission_mode="acceptEdits"),
-    Role.SECURITY: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash(git log:*)"]),
-    Role.REVIEWER: RolePolicy(allowed_tools=list(_READ_TOOLS), sandbox="read-only"),
-    Role.QA: RolePolicy(allowed_tools=[*_READ_TOOLS, "Bash"]),
-    Role.BRAIN: RolePolicy(allowed_tools=list(_READ_TOOLS)),  # 인터뷰 근거용 읽기 전용
+    Role.SECURITY: RolePolicy(allowed_tools=["Bash(git log:*)"],
+                              scoped_read_tools=list(_READ_TOOLS)),
+    Role.REVIEWER: RolePolicy(scoped_read_tools=list(_READ_TOOLS), sandbox="read-only"),
+    Role.QA: RolePolicy(allowed_tools=["Bash"], scoped_read_tools=list(_READ_TOOLS)),
+    Role.BRAIN: RolePolicy(scoped_read_tools=list(_READ_TOOLS)),  # 인터뷰 근거용 읽기 전용
     # 학습 Agent (#19) — 출제·검증 모두 repo를 **읽기만** 한다. 학습 도구가 코드를
     # 만질 이유가 없고, Bash도 주지 않는다 (근거는 파일 읽기로 충분하다).
-    Role.TUTOR: RolePolicy(allowed_tools=list(_READ_TOOLS)),
-    Role.TUTOR_VERIFIER: RolePolicy(allowed_tools=list(_READ_TOOLS), sandbox="read-only"),
+    Role.TUTOR: RolePolicy(scoped_read_tools=list(_READ_TOOLS)),
+    Role.TUTOR_VERIFIER: RolePolicy(scoped_read_tools=list(_READ_TOOLS), sandbox="read-only"),
     # 후속 질문 답변 — 저장된 해설에 갇히지 않고 repo를 직접 읽는다. 읽기만 한다.
-    Role.TUTOR_TA: RolePolicy(allowed_tools=list(_READ_TOOLS)),
+    Role.TUTOR_TA: RolePolicy(scoped_read_tools=list(_READ_TOOLS)),
     # 학습 도구가 코드를 만질 이유가 없다 — TUTOR_TA와 같은 격리.
-    Role.TUTOR_CODE: RolePolicy(allowed_tools=list(_READ_TOOLS)),
+    Role.TUTOR_CODE: RolePolicy(scoped_read_tools=list(_READ_TOOLS)),
     # 그리기는 파일을 만들고 vision의 검증 스크립트를 돌려야 해서 쓰기·Bash가 필요하다.
     # 다른 tutor role과 달리 **cwd가 사용자 repo가 아니다** — `tutor_vis`가 매번
     # 임시 디렉토리를 만들어 넘긴다. 그래서 이 권한이 repo에 닿지 않는다.
     Role.TUTOR_VIS: RolePolicy(
-        allowed_tools=[*_READ_TOOLS, *_WRITE_TOOLS, "Bash"],
+        allowed_tools=["Bash"], scoped_read_tools=list(_READ_TOOLS),
+        scoped_write_tools=list(_WRITE_TOOLS),
         permission_mode="acceptEdits", skills=["vision"]),
 }
 
@@ -107,6 +115,7 @@ def make_can_use_tool(role: Role, trace: TraceStore, *, task_id: str, workspace_
     policy = ROLE_POLICY[role]
     allowed = policy.allowed_tools
     scoped_tools = policy.scoped_write_tools
+    read_tools = policy.scoped_read_tools
     workspace_resolved = Path(workspace_root).resolve() if workspace_root else None
 
     def _match(tool_name: str) -> bool:
@@ -120,10 +129,34 @@ def make_can_use_tool(role: Role, trace: TraceStore, *, task_id: str, workspace_
     def _is_scoped_tool(tool_name: str) -> bool:
         return tool_name in scoped_tools
 
+    def _inside(raw: str) -> bool:
+        """raw 경로가 작업 공간 안인가. 판단할 수 없으면 False (fail-closed)."""
+        if workspace_resolved is None:
+            return False
+        try:
+            return Path(raw).expanduser().resolve().is_relative_to(workspace_resolved)
+        except (ValueError, OSError, RuntimeError):
+            return False
+
     async def can_use_tool(tool_name: str, tool_input: dict, context) -> PermissionResultAllow | PermissionResultDeny:
         # Check allowlisted tools
         if _match(tool_name):
             return PermissionResultAllow(updated_input=tool_input)
+
+        # 읽기도 작업 공간 안으로 (2026-08-25). 경로 인자가 **없으면** 도구는 cwd
+        # 기준으로 도는데 cwd가 곧 작업 공간이므로 통과시킨다 — 여기서 막으면
+        # `Grep(pattern)` 같은 정상 호출이 전부 거부된다.
+        if tool_name in read_tools:
+            target = tool_input.get("file_path") or tool_input.get("path")
+            if workspace_resolved is not None and (not target or _inside(str(target))):
+                return PermissionResultAllow(updated_input=tool_input)
+            reason = ("no_workspace_root" if workspace_resolved is None
+                      else "path_outside_workspace")
+            trace.append("PermissionDeniedEvent", task_id=task_id,
+                         payload={"role": role.value, "tool": tool_name,
+                                  "file_path": str(target or ""), "reason": reason})
+            return PermissionResultDeny(
+                message=f"role {role.value} may only read inside {workspace_resolved}")
 
         # Check scoped write tools (Write, Edit) with path confinement
         if _is_scoped_tool(tool_name):

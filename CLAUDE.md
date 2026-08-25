@@ -31,7 +31,7 @@ LLM(leader)은 정책이 답을 못 정하는 **5개 트리거에서만** 호출
 
 | 트리거 | 허용 action |
 |---|---|
-| CLASSIFY | PROCEED, SKIP_NODE |
+| CLASSIFY | PROCEED, SKIP_NODE, INVESTIGATE_ONLY |
 | NEED_REPLAN | REPLAN, ASK_USER, ABORT |
 | BLOCKED | RETRY_NODE, ESCALATE_MODEL, ASK_USER, ABORT |
 | INSUFFICIENT_CAPABILITY | ESCALATE_MODEL, ASK_USER, ABORT |
@@ -90,8 +90,16 @@ resolve_unknown_repo`)이 처리한다. `이름:` 접두가 registry에 없을 �
    tutor role은 worktree가 아니라 사용자의 **실제 repo**를 cwd로 받기 때문에,
    `TUTOR_VIS`만 임시 디렉토리에서 돌린다(`tutor_vis.draw`).
 
-4. **워커 쓰기는 자기 worktree 안으로 제한.** `enforcement.make_can_use_tool`의 경로
-   게이트. DEVELOPER만 `Bash`를 갖고, 나머지는 읽기 중심.
+4. **워커의 읽기·쓰기는 자기 작업 공간 안으로 제한.** `enforcement.make_can_use_tool`의
+   경로 게이트. **`allowed_tools`에 통째로 적은 도구는 콜백을 건너뛴다** — SDK가 그
+   전에 자동 승인한다(`CanUseToolShadowedWarning`). 그래서 경로를 봐야 하는 도구는
+   allowlist가 아니라 `scoped_read_tools`/`scoped_write_tools`에 적는다.
+
+   **이 게이트는 Claude 워커에만 걸린다.** Codex는 샌드박스 3종(`read-only` /
+   `workspace-write` / `full-access`)뿐이고 **읽기 범위 개념이 없다** — `read-only`는
+   쓰기만 막고 파일시스템 전체를 읽을 수 있다(실측 2026-08-25). Codex role
+   (REVIEWER·TUTOR_VERIFIER)의 읽기 범위는 **프롬프트로만** 좁혀지고 강제되지 않는다.
+   Codex role에 새 책임을 줄 때 이 비대칭을 전제로 설계한다.
 5. **trace는 append-only.** UPDATE/DELETE 트리거로 DB 레벨에서 막혀 있다. 이벤트가
    진실이고 projection은 재구축 가능해야 한다.
 6. **strict JSON schema 규약**: `required`는 모든 property를 포함한다. 선택 필드는

@@ -27,7 +27,8 @@
             "REPLAN",
             "ASK_USER",
             "ABORT",
-            "CREATE_REPO"
+            "CREATE_REPO",
+            "INVESTIGATE_ONLY"
           ]
         },
         "target_node": {

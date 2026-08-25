@@ -256,7 +256,13 @@ def test_tutor_vis_can_write_but_never_into_a_repo():
     from devcrew.schema import Role
 
     p = ROLE_POLICY[Role.TUTOR_VIS]
-    assert "Write" in p.allowed_tools and "Bash" in p.allowed_tools
+    assert "Bash" in p.allowed_tools
+    # 쓰기는 **경로 게이트를 타야** 한다 — allowed_tools에 있으면 SDK가 콜백 이전에
+    # 자동 승인해 임시 디렉토리 밖으로 나가는 것을 막을 수 없다.
+    assert p.scoped_write_tools == ["Write", "Edit"]
+    assert "Write" not in p.allowed_tools and "Edit" not in p.allowed_tools
     for role in (Role.TUTOR, Role.TUTOR_TA, Role.TUTOR_CODE):
-        assert "Write" not in ROLE_POLICY[role].allowed_tools
-        assert "Bash" not in ROLE_POLICY[role].allowed_tools
+        pol = ROLE_POLICY[role]
+        assert not pol.scoped_write_tools
+        assert "Write" not in pol.allowed_tools
+        assert "Bash" not in pol.allowed_tools

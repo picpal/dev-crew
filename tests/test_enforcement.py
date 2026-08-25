@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from devcrew.enforcement import (
@@ -9,7 +11,8 @@ from devcrew.store.trace import TraceStore
 
 def test_role_policy_matches_design_3_4():
     assert "Write" not in ROLE_POLICY[Role.EXPLORER].allowed_tools
-    assert "Read" in ROLE_POLICY[Role.EXPLORER].allowed_tools
+    # 읽기는 allowlist가 아니라 scoped — allowlist에 있으면 콜백이 경로를 못 본다
+    assert "Read" in ROLE_POLICY[Role.EXPLORER].scoped_read_tools
     # Developer는 Write를 scoped_write_tools로 관리 (경로 제한)
     assert "Write" not in ROLE_POLICY[Role.DEVELOPER].allowed_tools
     assert "Write" in ROLE_POLICY[Role.DEVELOPER].scoped_write_tools
@@ -39,17 +42,17 @@ async def test_can_use_tool_denies_and_logs(tmp_path):
     # SDK 런타임은 {"behavior": ...} dict가 아니라 PermissionResultAllow/Deny
     # 인스턴스를 요구한다 (claude-agent-sdk==0.2.139 조사, Task 7).
     trace = TraceStore(tmp_path / "trace.db")
-    cb = make_can_use_tool(Role.EXPLORER, trace, task_id="T-1")
-    allow = await cb("Read", {"file_path": "/x"}, None)
+    cb = make_can_use_tool(Role.EXPLORER, trace, task_id="T-1", workspace_root=str(tmp_path))
+    allow = await cb("Read", {"file_path": str(tmp_path / "x")}, None)
+    read_out = await cb("Read", {"file_path": "/etc/hosts"}, None)
     deny = await cb("Write", {"file_path": "/x"}, None)
     bash_deny = await cb("Bash", {"command": "echo hi > /x"}, None)
     assert allow.behavior == "allow"
+    assert read_out.behavior == "deny"      # 읽기도 작업 공간 밖은 막는다
     assert deny.behavior == "deny"
     assert bash_deny.behavior == "deny"
     evs = trace.events(event_type="PermissionDeniedEvent")
-    assert len(evs) == 2
-    assert evs[0]["payload"]["tool"] == "Write"
-    assert evs[1]["payload"]["tool"] == "Bash"
+    assert [e["payload"]["tool"] for e in evs] == ["Read", "Write", "Bash"]
 
 
 async def test_scoped_write_confinement(tmp_path):
@@ -129,7 +132,7 @@ def test_tutor_roles_are_read_only():
     """출제·검증은 repo를 읽기만 한다. 쓰기나 Bash를 주면 학습 도구가 코드를 만진다."""
     for role in (Role.TUTOR, Role.TUTOR_VERIFIER):
         p = ROLE_POLICY[role]
-        assert "Read" in p.allowed_tools and "Grep" in p.allowed_tools
+        assert "Read" in p.scoped_read_tools and "Grep" in p.scoped_read_tools
         assert p.scoped_write_tools == []
         assert not any(t.startswith("Bash") for t in p.allowed_tools)
     # 검증자는 Codex 세션이다 — 샌드박스도 읽기 전용으로 못 박는다
@@ -160,3 +163,53 @@ def test_only_skill_roles_load_the_user_source():
     for role in Role:
         sources = claude_options_kwargs(role, cwd="/tmp/wt")["setting_sources"]
         assert sources == (["user"] if ROLE_POLICY[role].skills else []), role.value
+
+
+# ── 읽기도 작업 공간 안으로 (2026-08-25) ──────────────────────────────────────
+def test_read_tools_are_scoped_not_blanket_allowed():
+    """`allowed_tools`에 통째로 적힌 도구는 콜백을 **건너뛴다** — SDK가 그 전에
+    자동 승인한다(CanUseToolShadowedWarning). 경로를 보려면 write처럼 allowlist에서
+    빼고 콜백으로 흘려야 한다.
+    """
+    for role in Role:
+        p = ROLE_POLICY[role]
+        for tool in ("Read", "Grep", "Glob"):
+            assert tool not in p.allowed_tools, f"{role.value}: {tool}이 콜백을 건너뛴다"
+
+
+@pytest.mark.asyncio
+async def test_reads_outside_the_workspace_are_denied(tmp_path):
+    """워커가 대상 repo 밖을 읽을 이유가 없다.
+
+    2026-08-25: 검토 대상 diff가 없던 REVIEWER가 task를 스스로 수행하려 파일을
+    뒤지며 240,628 토큰을 썼다. Codex 쪽은 샌드박스에 읽기 범위 개념이 없어 막을
+    수 없지만, Claude 쪽은 이 콜백으로 막을 수 있다.
+    """
+    trace = TraceStore(tmp_path / "t.db")
+    ws = tmp_path / "wt"
+    ws.mkdir()
+    gate = make_can_use_tool(Role.EXPLORER, trace, task_id="T1", workspace_root=str(ws))
+
+    ok = await gate("Read", {"file_path": str(ws / "a.py")}, None)
+    assert type(ok).__name__ == "PermissionResultAllow"
+
+    for tool, args in (("Read", {"file_path": str(tmp_path / "outside.txt")}),
+                       ("Grep", {"pattern": "x", "path": "/etc"}),
+                       ("Glob", {"pattern": "**/*", "path": str(Path.home())})):
+        res = await gate(tool, args, None)
+        assert type(res).__name__ == "PermissionResultDeny", (tool, args)
+
+    reasons = [e["payload"]["reason"] for e in trace.events(event_type="PermissionDeniedEvent")]
+    assert reasons == ["path_outside_workspace"] * 3
+
+
+@pytest.mark.asyncio
+async def test_reads_without_an_explicit_path_stay_in_the_workspace(tmp_path):
+    """경로를 안 주면 도구는 cwd 기준으로 돈다 — 그건 이미 작업 공간이므로 통과."""
+    trace = TraceStore(tmp_path / "t.db")
+    ws = tmp_path / "wt"
+    ws.mkdir()
+    gate = make_can_use_tool(Role.EXPLORER, trace, task_id="T1", workspace_root=str(ws))
+    for tool, args in (("Grep", {"pattern": "x"}), ("Glob", {"pattern": "**/*.py"})):
+        res = await gate(tool, args, None)
+        assert type(res).__name__ == "PermissionResultAllow", (tool, args)

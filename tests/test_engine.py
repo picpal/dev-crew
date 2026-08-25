@@ -772,3 +772,50 @@ async def test_outcome_digest_is_bounded(tmp_path):
     assert len(d["summary"]) == 800
     assert len(d["findings"]) == 10 and len(d["changed_files"]) == 10
     assert d["node_id"] == "review" and d["transition"] == "NOT_PASS"
+
+
+# ── INVESTIGATE_ONLY — 조사 요청에 파이프라인 전체를 태우지 않는다 ────────────
+async def test_investigate_only_runs_only_the_investigative_node(tmp_path):
+    """조사 질문은 explore 하나로 끝난다.
+
+    이게 없으면 leader는 조사 요청임을 알아도 표현할 action이 없다: CLASSIFY는
+    실행당 1회고 SKIP_NODE는 대상 1개인데 develop/review는 conditional이 아니라
+    아예 건너뛸 수 없다 — 최소 3개 노드가 강제된다 (2026-08-25 SLACK-11,
+    REVIEWER 혼자 240,628 토큰).
+    """
+    async def decide(trigger, snapshot):
+        assert trigger == "CLASSIFY"
+        return {"action": "INVESTIGATE_ONLY", "target_node": None,
+                "rationale": "코드를 바꾸는 요청이 아니라 위치를 묻는 질문"}, "ORC-0", 0
+
+    # EXPLORER는 CLAUDE_CODE 어댑터를 쓴다 — 그 role의 schema를 만족하는 fixture여야
+    # NEED_REPLAN으로 강등되지 않는다.
+    engine, adapter, _ = make_engine(
+        tmp_path, [GENERIC_PASS], [PASS_REVIEW], decide_fn=decide,
+        template=DEFAULT_TEMPLATE)
+    r = await engine.run(execution_id="I1", task="이 기능이 어디서 도는지 찾아줘")
+
+    assert r.status == "COMPLETED"
+    assert r.path[0] == "leader:CLASSIFY→INVESTIGATE_ONLY"
+    assert [h["node_id"] for h in r.node_history] == ["explore"]
+    for node in ("develop", "review", "qa"):
+        assert f"{node}:SKIPPED" in r.path
+    # 돈이 실제로 안 나갔는지 — role_tokens에 워커 역할이 EXPLORER만 있어야 한다
+    assert set(r.role_tokens) <= {"EXPLORER", "ORCHESTRATOR"}
+
+
+async def test_investigate_only_degrades_when_nothing_is_investigative(tmp_path):
+    """조사 노드가 없는 템플릿에서 INVESTIGATE_ONLY면 아무 노드도 안 돈다 —
+    빈 실행을 COMPLETED로 보고하지 말고 사람에게 넘긴다 (fail-closed)."""
+    async def decide(trigger, snapshot):
+        return {"action": "INVESTIGATE_ONLY", "target_node": None, "rationale": "r"}, "ORC-0", 0
+
+    tmpl = WorkflowTemplate("no-explore", (
+        NodeSpec("develop", Role.DEVELOPER, "구현: {task}"),
+        NodeSpec("qa", Role.QA, "검증: {task}", conditional=True),
+    ))
+    engine, _, _ = make_engine(tmp_path, [GENERIC_PASS], [PASS_REVIEW],
+                               decide_fn=decide, template=tmpl)
+    r = await engine.run(execution_id="I2", task="t")
+    assert r.status == "NEEDS_HUMAN"
+    assert not r.node_history                    # 워커를 하나도 띄우지 않았다

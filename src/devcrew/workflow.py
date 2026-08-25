@@ -10,11 +10,16 @@ from dataclasses import dataclass
 from .schema import Role
 
 DECISION_ACTIONS = ["PROCEED", "RETRY_NODE", "ESCALATE_MODEL", "SKIP_NODE",
-                    "REPLAN", "ASK_USER", "ABORT", "CREATE_REPO"]
+                    "REPLAN", "ASK_USER", "ABORT", "CREATE_REPO",
+                    "INVESTIGATE_ONLY"]
 
 # 트리거별 허용 action — 엔진이 LLM 결정을 이 목록과 대조 검증한다 (spec 결정 3)
 ALLOWED_BY_TRIGGER: dict[str, list[str]] = {
-    "CLASSIFY": ["PROCEED", "SKIP_NODE"],
+    # INVESTIGATE_ONLY — 코드를 바꾸는 요청이 아니라 **답을 찾는** 요청일 때.
+    # SKIP_NODE로는 표현할 수 없다: 대상이 1개뿐이고 develop/review는 conditional이
+    # 아니라 아예 못 건너뛴다. 그래서 조사 질문에도 최소 3개 노드가 강제됐다
+    # (2026-08-25 SLACK-11 — REVIEWER 혼자 240,628 토큰).
+    "CLASSIFY": ["PROCEED", "SKIP_NODE", "INVESTIGATE_ONLY"],
     "NEED_REPLAN": ["REPLAN", "ASK_USER", "ABORT"],
     "BLOCKED": ["RETRY_NODE", "ESCALATE_MODEL", "ASK_USER", "ABORT"],
     "INSUFFICIENT_CAPABILITY": ["ESCALATE_MODEL", "ASK_USER", "ABORT"],
@@ -38,6 +43,9 @@ class NodeSpec:
     message: str                      # 노드 최초 투입 메시지, {task} placeholder 지원
     conditional: bool = False         # CLASSIFY 결정으로 생략 가능
     loop_back_to: str | None = None   # NOT_PASS 시 복귀 노드 (None=자기 자신 재시도)
+    # 이 노드만으로 조사 요청의 답이 되는가. INVESTIGATE_ONLY가 남기는 노드다 —
+    # 나머지는 전부 생략된다.
+    investigative: bool = False
 
 
 @dataclass(frozen=True)
@@ -71,7 +79,7 @@ class WorkflowTemplate:
 
 DEFAULT_TEMPLATE = WorkflowTemplate("default-v1", (
     NodeSpec("explore", Role.EXPLORER, "다음 작업을 위한 사전 조사를 수행해 보고해: {task}",
-             conditional=True),
+             conditional=True, investigative=True),
     NodeSpec("develop", Role.DEVELOPER, "다음 작업을 구현하고 확인 후 보고해: {task}"),
     NodeSpec("review", Role.REVIEWER,
              "직전 Developer의 변경(git diff HEAD)을 검토 판정해. 작업: {task}",
