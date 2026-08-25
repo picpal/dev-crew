@@ -7,10 +7,11 @@ workspace_roots:
   - ~/Desktop/workspace
 
 # 명시 등록은 자동 탐색을 이긴다. `branch`를 주면 실행용 worktree(wt/slack-N)를
-# 그 브랜치에서 딴다 — 작업 코드가 아직 병합되지 않았다면 반드시 지정한다.
+# 그 브랜치에서 딴다 — **작업 코드가 아직 병합되지 않았다면 반드시 지정한다.**
 # 없으면 HEAD에서 따서 워커가 그 코드가 없는 트리에서 작업하게 된다
 # (2026-08-20 SLACK-3).
-repos:
-  dev-crew:
-    path: ~/Desktop/workspace/dev-crew
-    branch: wt/tutor      # 하네스 작업 브랜치 (main 병합 전)
+#
+# 지금은 비어 있다. dev-crew도 자동 등록분(base = HEAD = main)으로 충분하다 —
+# 하네스 작업이 main에 병합됐기 때문이다(PR #27, 2026-08-25). 다시 미병합 브랜치에서
+# 작업하게 되면 그때 여기에 `branch:`를 적는다.
+repos: {}
