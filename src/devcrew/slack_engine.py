@@ -744,7 +744,7 @@ async def _amain() -> None:
     brain_bot = _real_token(os.environ.get("BRAIN_BOT_TOKEN"), "xoxb-")
     brain_app_token = _real_token(os.environ.get("BRAIN_APP_TOKEN"), "xapp-")
     if brain_bot and brain_app_token:
-        from .slack_brain import BrainHandler
+        from .slack_brain import BrainHandler, answer_mark
 
         brain_app = AsyncApp(token=brain_bot)
 
@@ -787,7 +787,7 @@ async def _amain() -> None:
             async def strip():
                 await brain_app.client.chat_update(
                     channel=ch, ts=msg["ts"], blocks=[],
-                    text=(msg.get("text") or "질문")[:2800] + f"\n\n✅ 선택: {value}")
+                    text=(msg.get("text") or "질문")[:2800] + f"\n\n{answer_mark(value)}")
 
             await brain.on_answer(thread_ts=thread, value=value, say=bsay, strip=strip,
                                   channel=ch, user=(body.get("user") or {}).get("id", ""))
