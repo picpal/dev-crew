@@ -147,6 +147,9 @@ class Answer:
     # **작게 유지한다** — 여기에 코드나 스텝을 담으면 스키마에 큰 필드가 둘이 되고,
     # 순서로는 하나밖에 못 지켜 앞엣것이 뒤엣것을 삼킨다 (lessons C15).
     code_focus: dict | None = None
+    # 무엇을 그릴지에 대한 **산문 설명**. 그리기는 TUTOR_VIS가 한다.
+    # 여기에 SVG를 담지 않는 이유도 C15다 — 큰 필드는 하나로 족하다.
+    diagram: str | None = None
     provider: object | None = None
     # 반납 손잡이. `archive`는 session_id로 하지만 `registry.finish`는 instance_id로만
     # 할 수 있어서, 호출자가 회차를 닫을 때 둘 다 필요하다.
@@ -280,11 +283,13 @@ async def ask(orch, cfg, *, exec_id: str, repo_path: str, question: str,
         if not isinstance(focus, dict) or not isinstance(focus.get("path"), str) \
                 or not focus["path"].strip():
             focus = None
+        spec = raw.get("diagram")
+        spec = spec.strip() if isinstance(spec, str) and spec.strip() else None
     except BaseException:
         if inst is not None:
             await _reclaim(orch, inst, sid)
         raise
     return Answer(session_id=sid, text=text, citations=kept, dropped=dropped,
-                  status=status, summary=summary, code_focus=focus,
+                  status=status, summary=summary, code_focus=focus, diagram=spec,
                   provider=inst.provider if inst is not None else provider,
                   instance_id=inst.instance_id if inst is not None else instance_id)

@@ -1336,3 +1336,104 @@ async def test_blocks_are_valid_and_within_slack_limits(tmp_path, repo, monkeypa
     await h.on_question(thread_ts="100.1", text="길게", say=say, user="U-OWNER",
                         channel="C1")
     assert_block_kit_valid(say.messages[-1]["blocks"])
+
+
+@pytest.mark.asyncio
+async def test_diagram_spec_reaches_the_report(tmp_path, repo, monkeypatch):
+    """tutor가 `diagram`을 달면 그림이 리포트에 실린다 (호출자→피호출자 배선).
+
+    순수 함수 테스트는 배선을 증명하지 않는다 — 이 저장소는 같은 이유로 배선을 세 번
+    조용히 잃었다(lessons C1). spec이 `draw()`까지 가고 그 결과가 HTML에 들어가는지 본다.
+    """
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+
+    seen = {}
+    h, _, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=_long_answer(), citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1",
+                      diagram="정지 → 확인 → 기동 흐름도")
+
+    async def fake_draw(orch, cfg, *, exec_id, spec):
+        seen["spec"] = spec
+        return '<svg viewBox="0 0 10 10"><title>흐름</title></svg>'
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    monkeypatch.setattr(st, "draw", fake_draw)
+    await h.on_question(thread_ts="100.1", text="설명해줘", say=say, user="U-OWNER",
+                        channel="C1")
+
+    assert seen.get("spec") == "정지 → 확인 → 기동 흐름도", "spec이 draw까지 안 갔다"
+    html = next(h for tid, h in pub if tid.startswith("ta-"))
+    assert "<svg viewBox=" in html and "흐름" in html
+
+
+@pytest.mark.asyncio
+async def test_report_is_complete_without_a_diagram(tmp_path, repo, monkeypatch):
+    """그림은 곁다리다 — 못 그렸다고 답변을 막으면 안 된다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+
+    h, _, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text=_long_answer(), citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1",
+                      diagram="그릴 수 없는 것")
+
+    async def fake_draw(*a, **kw):
+        return None
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    monkeypatch.setattr(st, "draw", fake_draw)
+    await h.on_question(thread_ts="100.1", text="설명해줘", say=say, user="U-OWNER",
+                        channel="C1")
+
+    html = next(h for tid, h in pub if tid.startswith("ta-"))
+    assert "<svg" not in html and "여기가 요점이다" in html
+    assert _button_of(say.messages[-1]), "링크는 그대로 나가야 한다"
+
+
+@pytest.mark.asyncio
+async def test_code_report_carries_its_diagram(tmp_path, repo, monkeypatch):
+    """실행 리포트도 같다 — TUTOR_CODE가 낸 spec으로 그린다."""
+    import devcrew.slack_tutor as st
+    from devcrew.tutor_ta import Answer
+    from devcrew.tutor_code import Line, Step, Trace
+
+    h, _, pub = make_handler(tmp_path, repo)
+    say = SaySpy()
+    await h.on_mention(mention(), say)
+    await answer_all(h, say)
+
+    async def fake_ask(*a, **kw):
+        return Answer(session_id="s1", text="요약", citations=[], dropped=0,
+                      provider=Provider.CLAUDE_CODE, instance_id="i1",
+                      code_focus={"path": "a.py", "symbol": None})
+
+    async def fake_trace(*a, **kw):
+        return Trace(title="t", role_of_code="r", path="a.py",
+                     lines=[Line(1, "x"), Line(2, "y")],
+                     steps=[Step(1, "a", []), Step(2, "b", [])],
+                     diagram="루프 구조")
+
+    async def fake_draw(orch, cfg, *, exec_id, spec):
+        assert spec == "루프 구조"
+        return '<svg viewBox="0 0 10 10"><title>루프</title></svg>'
+
+    monkeypatch.setattr(st, "ask", fake_ask)
+    monkeypatch.setattr(st, "trace_code", fake_trace)
+    monkeypatch.setattr(st, "draw", fake_draw)
+    await h.on_question(thread_ts="100.1", text="이 코드?", say=say, user="U-OWNER",
+                        channel="C1")
+
+    html = next(h for tid, h in pub if tid.startswith("code-"))
+    assert "<svg viewBox=" in html and "루프" in html

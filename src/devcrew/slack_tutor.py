@@ -27,6 +27,7 @@ from .repos import RepoRegistryError, format_repo_names, split_repo_prefix
 from .slack_brain import to_mrkdwn
 from .tutor import issue_quiz
 from .tutor_code import trace_code
+from .tutor_vis import draw
 from .tutor_ta import (SLACK_LIMIT, TRUNCATED_NOTE, TutorTAError, ask,
                        round_context, slack_head)
 
@@ -491,7 +492,8 @@ class TutorHandler:
             return
         try:
             html = render_ta_answer(question=question, answer=res.text,
-                                    citations=res.citations, repo=sess.repo_name)
+                                    citations=res.citations, repo=sess.repo_name,
+                                    diagram=await self._diagram(thread_ts, res.diagram))
             url = await asyncio.to_thread(self.publish,
                                           self._ta_report_id(thread_ts, question), html)
         except Exception as e:
@@ -525,7 +527,8 @@ class TutorHandler:
                 self.orch, self.cfg, exec_id=round_id(thread_ts), repo_path=repo_path,
                 focus_path=res.code_focus.get("path"),
                 focus_symbol=res.code_focus.get("symbol"), question=question)
-            html = render_code_report(tr, question=question, repo=sess.repo_name)
+            html = render_code_report(tr, question=question, repo=sess.repo_name,
+                                      diagram=await self._diagram(thread_ts, tr.diagram))
             return await asyncio.to_thread(
                 self.publish, self._code_report_id(thread_ts, question), html)
         except Exception as e:
@@ -537,6 +540,18 @@ class TutorHandler:
             except Exception:
                 pass
             return None
+
+    async def _diagram(self, thread_ts: str, spec: str | None) -> str | None:
+        """`diagram` spec이 있으면 그려서 살균된 SVG를 돌려준다. 없거나 실패하면 None.
+
+        **그림은 곁다리다.** 못 그렸다고 답변을 막지 않는다 — `draw()`가 조용히 None을
+        내고 리포트는 그림 없이 나간다. 그리기는 별도 세션(TUTOR_VIS)이고 **임시
+        디렉토리**에서 돈다: 쓰기가 필요한 유일한 tutor role이라, 사용자 repo를 cwd로
+        받는 다른 role과 섞지 않는다.
+        """
+        if not spec:
+            return None
+        return await draw(self.orch, self.cfg, exec_id=round_id(thread_ts), spec=spec)
 
     @staticmethod
     def _code_report_id(thread_ts: str, question: str) -> str:

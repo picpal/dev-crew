@@ -59,6 +59,7 @@ class Trace:
     lines: list[Line]
     steps: list[Step]
     dropped: int = 0
+    diagram: str | None = None      # 무엇을 그릴지 (산문). 그리기는 TUTOR_VIS가 한다
 
 
 INTRO = ("아래 repo에서 학습자가 물은 코드의 **실행 흐름**을 추적한다. " + NOTE + "\n"
@@ -173,7 +174,10 @@ async def trace_code(orch, cfg, *, exec_id: str, repo_path: str,
         if len(steps) < MIN_STEPS:
             raise TraceUnavailable(
                 f"화면 범위 안의 스텝이 {len(steps)}개뿐입니다 (버린 스텝 {dropped}개)")
+        spec = raw.get("diagram")
         return Trace(title=str(raw.get("title") or "코드 실행 흐름"),
+                     diagram=(spec.strip() if isinstance(spec, str) and spec.strip()
+                              else None),
                      role_of_code=str(raw.get("role_of_code") or ""),
                      path=str(raw.get("file") or ""), lines=lines, steps=steps,
                      dropped=dropped)

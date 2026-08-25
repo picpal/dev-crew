@@ -187,6 +187,9 @@ h1{margin:.25em 0 .18em;font-size:1.38rem;line-height:1.32}
 .is-changed .vv::after{content:" ←";opacity:.7}
 .novars{margin:0;font-size:.84rem;color:var(--ink-3)}
 .note{margin:12px 0 0;font-size:.83rem;color:var(--ink-3)}
+.fig{margin:0 0 14px;background:var(--surface);border:1px solid var(--line);
+  border-radius:10px;padding:12px}
+.fig svg{display:block;width:100%;height:auto;max-width:100%}
 """
 
 
@@ -260,7 +263,8 @@ body:has(.rt:checked) .track{animation:none}
 """
 
 
-def render_code_report(trace, *, question: str, repo: str | None = None) -> str:
+def render_code_report(trace, *, question: str, repo: str | None = None,
+                       diagram: str | None = None) -> str:
     """실행 추적 → 단일 파일 HTML. 스크립트 없음, 외부 참조 없음."""
     steps = list(trace.steps)
     n = len(steps)
@@ -318,6 +322,8 @@ def render_code_report(trace, *, question: str, repo: str | None = None) -> str:
     more = f'<p class="rest">{_md(rest)}</p>' if rest else ""
     role = (f'<details class="role{"" if rest else " is-short"}">'
             f'<summary>{_md(lead)}</summary>{more}</details>')
+    # 이미 살균된 SVG만 온다 (`tutor_vis.extract_svg`) — 그대로 넣는다.
+    fig = f'<figure class="fig">{diagram}</figure>' if diagram else ""
     dropped = (f'<p class="note">스텝 {trace.dropped}건은 표시 범위 밖을 가리켜 '
                f'제외했습니다.</p>' if trace.dropped else "")
     where = " · ".join(x for x in (_e(repo) if repo else "", _e(trace.path)) if x)
@@ -335,6 +341,7 @@ def render_code_report(trace, *, question: str, repo: str | None = None) -> str:
 <p class="where">{where}</p>
 <p class="q"><b>질문</b><br>{_md(question)}</p>
 {role}
+{fig}
 <input class="auto" type="radio" name="st" id="stAuto">
 {radios}
 <div class="bar">

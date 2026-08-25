@@ -6,6 +6,7 @@
     "summary",
     "citations",
     "code_focus",
+    "diagram",
     "answer"
   ],
   "properties": {
@@ -71,6 +72,12 @@
           ]
         }
       }
+    },
+    "diagram": {
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "answer": {
       "type": "string"

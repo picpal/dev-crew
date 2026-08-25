@@ -27,7 +27,7 @@ WORKER_ROLES = {Role.EXPLORER, Role.DEVELOPER, Role.REVIEWER, Role.QA}
 # 번들과 버전이 달라(None != 실제 버전) RoleBundleError로 죽는다.
 BUNDLED_ROLES = WORKER_ROLES | {Role.ORCHESTRATOR, Role.BRAIN,
                                 Role.TUTOR, Role.TUTOR_VERIFIER, Role.TUTOR_TA,
-                                Role.TUTOR_CODE}
+                                Role.TUTOR_CODE, Role.TUTOR_VIS}
 
 
 class ReviewQueue:

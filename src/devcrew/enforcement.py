@@ -21,6 +21,9 @@ class RolePolicy:
     scoped_write_tools: list[str] = field(default_factory=list)  # 경로 제한이 필요한 쓰기 도구
     permission_mode: str = "default"
     sandbox: str | None = None          # Codex 전용: "read-only" 등
+    # 이 role이 쓸 수 있는 Claude Code 스킬. **이름을 명시한 것만** 열린다 —
+    # `"all"`은 전역 스킬 전체를 끌어와 컨텍스트를 낭비하고 의도치 않은 능력을 준다.
+    skills: list[str] = field(default_factory=list)
 
 
 # DESIGN.md §3.4 표의 코드화
@@ -46,16 +49,27 @@ ROLE_POLICY: dict[Role, RolePolicy] = {
     Role.TUTOR_TA: RolePolicy(allowed_tools=list(_READ_TOOLS)),
     # 학습 도구가 코드를 만질 이유가 없다 — TUTOR_TA와 같은 격리.
     Role.TUTOR_CODE: RolePolicy(allowed_tools=list(_READ_TOOLS)),
+    # 그리기는 파일을 만들고 vision의 검증 스크립트를 돌려야 해서 쓰기·Bash가 필요하다.
+    # 다른 tutor role과 달리 **cwd가 사용자 repo가 아니다** — `tutor_vis`가 매번
+    # 임시 디렉토리를 만들어 넘긴다. 그래서 이 권한이 repo에 닿지 않는다.
+    Role.TUTOR_VIS: RolePolicy(
+        allowed_tools=[*_READ_TOOLS, *_WRITE_TOOLS, "Bash"],
+        permission_mode="acceptEdits", skills=["vision"]),
 }
 
 
 def claude_options_kwargs(role: Role, *, cwd: str | None) -> dict:
     p = ROLE_POLICY[role]
-    return {
+    kw = {
         "allowed_tools": list(p.allowed_tools),
         "permission_mode": p.permission_mode,
         "cwd": cwd,
     }
+    # 선언한 role에만 붙인다. `setting_sources`는 넘기지 않는다 — 없이도 Skill 호출이
+    # 되는 것을 실측했고(2026-08-25), 넣으면 사용자 전역 설정이 워커에 통째로 딸려 온다.
+    if p.skills:
+        kw["skills"] = list(p.skills)
+    return kw
 
 
 def codex_session_kwargs(role: Role, *, cwd: str | None) -> dict:

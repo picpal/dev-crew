@@ -306,11 +306,15 @@ _TA_CSS = """
 .ta-prose blockquote{margin:0 0 .9em;padding:.2em 0 .2em 1em;
   border-left:3px solid var(--line);color:var(--ink-3)}
 .ta-q{margin:0;font-weight:600}
+/* vision은 자기 종이색(밝은 배경)을 가진 그림을 낸다 — 다크 모드에서 카드에
+   꽉 차면 흰 덩어리가 테두리에 붙는다. 여백을 줘 도판처럼 앉힌다. */
+.fig{margin:0;padding:6px}
+.fig svg{display:block;width:100%;height:auto;max-width:100%;border-radius:6px}
 """
 
 
 def render_ta_answer(*, question: str, answer: str,
-                     citations, repo: str | None) -> str:
+                     citations, repo: str | None, diagram: str | None = None) -> str:
     """후속 질문 답변 → 단일 파일 HTML.
 
     Slack 한 메시지에 못 담는 답변만 여기로 온다. 스레드에는 첫 문단과 링크가 남는다
@@ -330,6 +334,10 @@ def render_ta_answer(*, question: str, answer: str,
     cites = (f'<section class="card"><h2 class="panel-title">근거</h2>{evi}</section>'
              if evi else "")
     where = (f'<p class="where">대상 저장소 <code>{_e(repo)}</code></p>' if repo else "")
+    # **이미 살균된 SVG만 온다** (`tutor_vis.extract_svg`). 여기서 escape하면 그림이
+    # 날문자로 찍히므로 그대로 넣는다 — 대신 넣기 전 단계에서 실행 가능한 것을 뗀다.
+    fig = (f'<section class="card"><figure class="fig">{diagram}</figure></section>'
+           if diagram else "")
     return f"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -343,6 +351,7 @@ def render_ta_answer(*, question: str, answer: str,
 </header>
 <section class="card"><h2 class="panel-title">질문</h2>
   <p class="ta-q">{_e(question)}</p></section>
+{fig}
 <section class="card"><div class="ta-prose">{body}</div></section>
 {cites}
 </main>

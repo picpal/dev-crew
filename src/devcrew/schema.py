@@ -36,6 +36,9 @@ class Role(str, enum.Enum):
     # 코드 실행 흐름 추적 — 스텝별 줄·이유·변수 변화를 낸다. 코드는 내지 않는다:
     # 하네스가 파일에서 직접 읽는다(지어낸 코드가 화면에 오르지 않게).
     TUTOR_CODE = "TUTOR_CODE"
+    # 리포트용 다이어그램 — `vision` 스킬로 그린다. **격리된 임시 디렉토리**에서만
+    # 돌아서 쓰기를 줘도 사용자 repo가 더러워지지 않는다.
+    TUTOR_VIS = "TUTOR_VIS"
 
 
 class InstanceStatus(str, enum.Enum):

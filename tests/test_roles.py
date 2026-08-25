@@ -222,3 +222,37 @@ def test_every_bundled_role_actually_has_a_bundle(role):
     assert set(b.schema["required"]) == set(props), \
         f"{role.value}: required가 모든 property를 담지 않았다 (불변조건 5)"
     _assert_strict(b.schema)
+
+
+def test_only_declared_roles_get_skills():
+    """`skills`를 선언한 role만 Skill 도구를 갖는다.
+
+    SDK는 `skills=[이름]`을 받으면 그 스킬만 호출 가능하게 열어 준다 — 전역 스킬 전체를
+    여는 `"all"`은 쓰지 않는다(컨텍스트 낭비 + 의도치 않은 능력). `setting_sources`도
+    넘기지 않는다: 없이도 Skill 호출이 되는 것을 실측했고, 넣으면 사용자 전역 설정이
+    워커에 통째로 딸려 온다.
+    """
+    from devcrew.enforcement import ROLE_POLICY, claude_options_kwargs
+    from devcrew.schema import Role
+
+    assert claude_options_kwargs(Role.TUTOR_VIS, cwd="/tmp/x")["skills"] == ["vision"]
+    for role in (Role.TUTOR, Role.TUTOR_TA, Role.TUTOR_CODE, Role.DEVELOPER):
+        assert "skills" not in claude_options_kwargs(role, cwd="/tmp/x"), role.value
+        assert not ROLE_POLICY[role].skills, role.value
+
+
+def test_tutor_vis_can_write_but_never_into_a_repo():
+    """그리기는 파일을 만들어야 한다 — 그래서 쓰기를 준다.
+
+    대신 **cwd가 사용자 repo가 아니다**(`tutor_vis`가 매번 임시 디렉토리를 만든다).
+    다른 tutor role은 repo를 cwd로 받으므로 쓰기를 주면 사용자 저장소가 더러워진다 —
+    그 둘을 한 role에 섞지 않는 것이 이 분리의 이유다.
+    """
+    from devcrew.enforcement import ROLE_POLICY
+    from devcrew.schema import Role
+
+    p = ROLE_POLICY[Role.TUTOR_VIS]
+    assert "Write" in p.allowed_tools and "Bash" in p.allowed_tools
+    for role in (Role.TUTOR, Role.TUTOR_TA, Role.TUTOR_CODE):
+        assert "Write" not in ROLE_POLICY[role].allowed_tools
+        assert "Bash" not in ROLE_POLICY[role].allowed_tools
