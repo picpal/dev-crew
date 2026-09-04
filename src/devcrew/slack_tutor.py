@@ -166,20 +166,39 @@ def question_blocks(q: Question, idx: int, total: int) -> list[dict]:
     return blocks
 
 
-def research_blocks(topic: str, res, url: str | None) -> list[dict]:
-    """조사 리포트 안내 — 첫 문단 + 📄 링크 + 출제 버튼 (§10.8).
+# 스레드에 남기는 머리말 길이. **핵심만 남기고 나머지는 링크가 받는다** — 여기에
+# 본문을 쏟으면 링크가 "읽고 넘어갈 결론"이라는 신호를 잃고, 스레드는 리포트를
+# 두 번 읽는 자리가 된다. TA 답변의 머리말(400자)과 같은 계열로 잡는다.
+LEAD_LIMIT = 300
 
-    **본문 전체를 스레드에 쏟지 않는다.** 첫 문단은 프롬프트가 요약으로 쓰게 돼 있고,
-    나머지는 리포트가 받는다 — 링크는 "읽고 넘어갈 결론"이라는 신호이기도 하다.
+
+def lead(text: str, limit: int = LEAD_LIMIT) -> str:
+    """첫 문단에서 **문장 경계로** 잘라낸 머리말.
+
+    글자 수로만 자르면 문장 한가운데서 끊겨 무슨 말인지 알 수 없는 줄이 남는다.
+    한도 안에 문장 끝이 있으면 거기서 끊고, 없으면 그때만 글자 수로 자른다."""
+    head = (text or "").strip().split("\n\n")[0].strip()
+    if len(head) <= limit:
+        return head
+    cut = max(head.rfind(m, 0, limit + 1) for m in (". ", "다. ", "다.\n", "다."))
+    return (head[:cut + 1] if cut > limit // 3 else head[:limit].rstrip()) + " …"
+
+
+def research_blocks(topic: str, res, url: str | None) -> list[dict]:
+    """조사 리포트 안내 — 핵심 한 줄 + 📄 링크 + 출제 버튼 (§10.8).
+
+    **본문을 스레드에 쏟지 않는다.** 메시지는 무엇에 대한 조사인지만 알리고, 상세는
+    리포트가 받는다 — 링크가 "읽고 넘어갈 결론"이라는 신호를 유지하려면 여기가
+    짧아야 한다 (사용자 결정 2026-09-04).
 
     출제 버튼은 자료가 실제로 남았을 때만 붙인다. 자료가 없으면 눌러도 근거 없는
     회차가 되므로, 누를 수 있는 것처럼 보이게 두지 않는다.
     """
-    head = (res.report or "").strip().split("\n\n")[0].strip()
     blocks = [
         {"type": "header", "text": {"type": "plain_text",
                                     "text": plain(f"🎓 {topic}", 150), "emoji": True}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": rich(head, 2500)}},
+        {"type": "section", "text": {"type": "mrkdwn",
+                                     "text": rich(lead(res.report), 1200)}},
     ]
     notes = list(res.notes)
     if res.sources:
@@ -189,7 +208,7 @@ def research_blocks(topic: str, res, url: str | None) -> list[dict]:
                        "elements": [{"type": "mrkdwn", "text": "\n".join(notes)}]})
     if url:
         blocks.append({"type": "section", "text": {"type": "mrkdwn",
-                       "text": f"📄 <{url}|전체 리포트 열기>"}})
+                       "text": f"📄 <{url}|리포트에서 자세히 보기>"}})
     if res.files:
         blocks.append({"type": "actions", "block_id": "tutor_start_quiz", "elements": [
             {"type": "button", "action_id": "tutor_answer_start_quiz", "style": "primary",
@@ -202,8 +221,7 @@ def research_blocks(topic: str, res, url: str | None) -> list[dict]:
 
 def research_text(topic: str, res, url: str | None) -> str:
     """블록을 못 그리는 클라이언트·알림 미리보기용 대체 텍스트."""
-    head = (res.report or "").strip().split("\n\n")[0].strip()
-    out = f"🎓 {topic}\n{head}"
+    out = f"🎓 {topic}\n{lead(res.report)}"
     if url:
         out += f"\n📄 {url}"
     return out

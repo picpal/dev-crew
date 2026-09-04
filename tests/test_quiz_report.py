@@ -202,3 +202,81 @@ def test_ta_answer_report_does_not_mangle_double_star_bold():
 
     html = render_ta_answer(question="q", answer="**표준**도 굵게", citations=[], repo=None)
     assert "<strong>표준</strong>" in html and "**" not in html
+
+
+# ── 업로드 재시도 (2026-09-04 실측) ─────────────────────────────────────────
+def test_upload_retries_after_a_transient_auth_failure(monkeypatch, tmp_path):
+    """wrangler는 만료된 OAuth 토큰을 **요청이 한 번 실패한 뒤에** 갱신한다.
+
+    실측(18:48:32): 토큰 만료 2초 뒤의 업로드가 `Authentication error [10000]`으로
+    죽었고 같은 명령을 다시 돌리자 성공했다. 한 번의 실패로 포기하면 토큰이 만료될
+    때마다 리포트 링크를 잃는다.
+    """
+    import subprocess
+
+    import devcrew.report.uploader as up
+
+    monkeypatch.setattr(up, "UPLOAD_BACKOFF", 0)
+    monkeypatch.setenv("REPORT_BASE_URL", "https://reports.example")
+    calls = []
+
+    class R:
+        def __init__(self, code, err=""):
+            self.returncode, self.stderr = code, err
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return R(1, "\x1b[31m✘ Authentication error [code: 10000]\x1b[0m") \
+            if len(calls) == 1 else R(0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    url = up.publish_report("study-abc", "<h1>x</h1>")
+    assert url == "https://reports.example/tasks/study-abc"
+    assert len(calls) == 2
+
+
+def test_upload_gives_up_with_a_readable_reason(monkeypatch):
+    """색 코드를 걷어낸 사유를 올린다 — 그대로 두면 trace에서 읽히지 않는다."""
+    import subprocess
+
+    import devcrew.report.uploader as up
+
+    monkeypatch.setattr(up, "UPLOAD_BACKOFF", 0)
+    monkeypatch.setenv("REPORT_BASE_URL", "https://reports.example")
+
+    class R:
+        returncode = 1
+        stderr = "\x1b[31m✘ \x1b[41;31mAuthentication error [code: 10000]\x1b[0m"
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: R())
+    with pytest.raises(up.ReportUploadError) as ei:
+        up.publish_report("study-abc", "<h1>x</h1>")
+    assert "Authentication error [code: 10000]" in str(ei.value)
+    assert "\x1b" not in str(ei.value)
+    assert "3회 시도" in str(ei.value)
+
+
+def test_upload_retries_a_timeout_too(monkeypatch):
+    """60초가 실제로 모자랐다 (`npx` 콜드 스타트 추정) — 상한을 올리고 재시도한다."""
+    import subprocess
+
+    import devcrew.report.uploader as up
+
+    monkeypatch.setattr(up, "UPLOAD_BACKOFF", 0)
+    monkeypatch.setenv("REPORT_BASE_URL", "https://reports.example")
+    n = {"i": 0}
+
+    class R:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        assert kw["timeout"] == up.UPLOAD_TIMEOUT
+        n["i"] += 1
+        if n["i"] == 1:
+            raise subprocess.TimeoutExpired(cmd, up.UPLOAD_TIMEOUT)
+        return R()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert up.publish_report("study-abc", "<h1>x</h1>")
+    assert n["i"] == 2

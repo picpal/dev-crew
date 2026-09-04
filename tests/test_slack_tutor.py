@@ -1851,3 +1851,39 @@ async def test_heartbeat_shows_elapsed_and_material_count(tmp_path, repo, monkey
     assert any("초" in b for b in beats)
     # 마지막 갱신은 결과 카드다 — 하트비트가 그걸 되돌리지 않는다
     assert h.update.calls[-1]["text"].startswith("🎓")
+
+
+def test_lead_cuts_at_a_sentence_not_mid_word():
+    """스레드 머리말은 핵심만 남긴다 — 상세는 링크가 받는다 (사용자 결정 2026-09-04).
+
+    글자 수로만 자르면 문장 한가운데서 끊겨 무슨 말인지 알 수 없는 줄이 남는다."""
+    from devcrew.slack_tutor import lead
+
+    short = "리밸런싱은 컨슈머가 떠날 때 일어난다."
+    assert lead(short) == short                       # 짧으면 그대로
+
+    long = ("리밸런싱은 컨슈머 그룹의 멤버가 바뀔 때 파티션을 다시 나누는 과정이다. "
+            + "두 번째 문장이 이어진다. " * 20)
+    out = lead(long, limit=80)
+    assert out.endswith("…")
+    assert out.rstrip(" …").endswith("다.")           # 문장 경계에서 끊었다
+    assert len(out) < 120
+
+    # 문단 둘째부터는 리포트 몫이다
+    assert lead("첫 문단.\n\n둘째 문단.") == "첫 문단."
+
+
+@pytest.mark.asyncio
+async def test_thread_message_stays_short_and_defers_to_the_link(tmp_path, repo):
+    """메시지는 무엇에 대한 조사인지만 알리고 상세는 리포트가 받는다."""
+    body = "핵심 한 줄 요약이다. " + "본문이 아주 길게 이어진다. " * 60
+    h, _, _ = make_topic_handler(tmp_path, repo, report=body)
+    seed_corpus(h)
+    say = SaySpy()
+
+    await h.on_mention(mention(text="<@U1> 주제"), say)
+
+    text = say.messages[-1]["text"]
+    assert "핵심 한 줄 요약이다." in text
+    assert len(text) < 500                            # 본문을 쏟지 않는다
+    assert "자세히 보기" in str(say.messages[-1]["blocks"])
