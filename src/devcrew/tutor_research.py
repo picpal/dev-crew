@@ -14,6 +14,7 @@ repo에 쌓으면 최신화되지 않는 스냅샷만 늘고 다음 회차는 �
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,6 +31,10 @@ TURN_TIMEOUT = 900.0
 # 저장된 자료 중 몇 개까지 화면에 나열할지. 자료 목록은 "무엇을 근거로 읽었나"를
 # 보여주는 것이지 파일 탐색기가 아니다.
 MAX_LISTED_FILES = 12
+
+# 자료 파일 머리의 출처 표시. role prompt가 이 형식을 지시하고, **하네스가 파일을 열어
+# 확인한다** — 지시만 하고 검사하지 않으면 그건 강제가 아니라 부탁이다.
+SOURCE_LINE_RE = re.compile(r"^\s*>\s*출처\s*[:：]\s*(https?://\S+)", re.M)
 
 INTRO = (
     "학습자가 배우고 싶어 하는 주제다. " + NOTE + "\n{topic}\n"
@@ -64,12 +69,37 @@ def corpus_files(corpus_dir: str | Path) -> list[str]:
 
     모델에게 "무슨 파일을 만들었냐"고 묻지 않는다. 그건 이미 하네스가 아는 값이고,
     모델 주장과 실제가 갈리면 화면이 거짓말을 한다 (lessons C2·C5).
+
+    확장자를 가리지 않는다. `.md`만 세면 출처 검사도 `.md`만 보게 되고, 모델이
+    `.txt`로 저장한 자료가 목록에도 검사에도 안 잡힌 채 **출제 근거로는 쓰인다** —
+    인용 대조는 디렉토리 안의 아무 파일이나 열기 때문이다. 숨김 파일만 뺀다.
     """
     root = Path(corpus_dir)
     if not root.is_dir():
         return []
-    return sorted(p.relative_to(root).as_posix()
-                  for p in root.rglob("*.md") if p.is_file())
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*")
+                  if p.is_file() and not any(part.startswith(".")
+                                             for part in p.relative_to(root).parts))
+
+
+def verify_sources(corpus_dir: str | Path) -> tuple[list[str], list[str]]:
+    """자료 파일마다 출처 URL이 실제로 박혀 있는지 연다 → `(있는 파일, 없는 파일)`.
+
+    LLM 판단이 아니라 결정적 검사다 — 인용 대조(`verify_evidence`)와 같은 성격이고,
+    같은 이유로 존재한다. 출처 없는 자료는 모델이 지어낸 것과 화면에서 구분되지 않고,
+    이 자료는 그대로 출제 근거가 되므로 그 거짓이 문항으로 굳는다.
+    """
+    root = Path(corpus_dir)
+    with_src: list[str] = []
+    without: list[str] = []
+    for name in corpus_files(root):
+        try:
+            text = (root / name).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            without.append(name)
+            continue
+        (with_src if SOURCE_LINE_RE.search(text) else without).append(name)
+    return with_src, without
 
 
 def parse_sources(raw) -> list[dict]:
@@ -186,18 +216,46 @@ async def research(orch, cfg, *, exec_id: str, topic: str, corpus_dir: str | Pat
     body, kept, dropped = clean_report(raw.get("report"),
                                        parse_citations(raw.get("citations")), str(root))
     files = corpus_files(root)
-    notes: list[str] = []
+    sources = parse_sources(raw.get("sources"))
+    cited, no_source = verify_sources(root)
+
+    # ── 신뢰도 관문 ─────────────────────────────────────────────────────────
+    # **통과 조건을 쓴다.** "무엇을 막을까"로 쓰면 응답이 비었을 때 전부 통과한다
+    # (lessons C8). 아래 넷이 모두 갖춰져야 리포트가 학습자에게 간다.
+    #
+    # 프롬프트에도 같은 규칙이 적혀 있지만 그건 부탁이다 — 지키지 않아도 화면에는
+    # 성실한 리포트로 보이고, 그 자료가 그대로 출제 근거가 되어 거짓이 문항으로 굳는다.
+    missing = []
     if not files:
-        # 자료가 없으면 출제도 후속 질문도 근거를 잃는다. 리포트만 남는 상태를
-        # 조용히 넘기지 않고 사실대로 적는다.
-        notes.append("자료 파일이 저장되지 않아 이 회차로는 문항을 낼 수 없습니다")
+        missing.append("자료 파일이 하나도 저장되지 않았습니다")
+    elif no_source:
+        # 일부만 없어도 거절한다. 출처 없는 파일도 출제 근거로 쓰이므로, 남겨 두면
+        # 그 문항의 출처를 학습자가 추적할 방법이 없다.
+        missing.append("출처 표시가 없는 자료 파일: " + ", ".join(no_source[:5]))
+    if not sources:
+        missing.append("출처 목록이 비어 있습니다")
+    if not kept:
+        missing.append("자료에 대조되는 인용이 하나도 없습니다")
+    if not body:
+        missing.append("리포트 본문이 비어 있습니다")
+    if missing:
+        reason = "근거를 갖추지 못해 리포트를 내지 않았습니다 — " + " / ".join(missing)
+        try:
+            orch.trace.append(AUTHOR_FAILED_EVENT, task_id=exec_id, execution_id=exec_id,
+                              payload={"role": Role.TUTOR_RESEARCH.value,
+                                       "node": "research-gate", "reason": reason,
+                                       "files": files, "no_source": no_source,
+                                       "sources": len(sources), "citations": len(kept)})
+        except Exception:
+            pass
+        raise ResearchError(reason)
+
+    notes: list[str] = []
     if dropped:
         notes.append(f"근거 {dropped}건은 대조에 실패해 제외했습니다")
-    if not body:
-        raise ResearchError("리포트 본문이 비어 있습니다")
     return ResearchResult(
         topic=topic, corpus_dir=str(root), report=body, citations=kept,
-        sources=parse_sources(raw.get("sources")), files=files, dropped=dropped,
+        sources=sources, files=files, dropped=dropped,
         diagram=raw.get("diagram") if isinstance(raw.get("diagram"), str) else None,
         status=str(raw.get("status") or ""), summary=str(raw.get("summary") or ""),
         notes=notes)

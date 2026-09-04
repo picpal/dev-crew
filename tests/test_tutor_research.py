@@ -46,7 +46,9 @@ def _corpus(tmp_path):
     (d / "01-basics.md").write_text(
         "# 기초\n\n> 출처: https://example.org/spec\n> 수집: 2026-09-04\n\n"
         "리밸런싱은 컨슈머가 떠날 때 일어난다\n")
-    (d / "02-detail.md").write_text("# 상세\n\n두 번째 자료 문장\n")
+    (d / "02-detail.md").write_text(
+        "# 상세\n\n> 출처: https://example.org/detail\n> 수집: 2026-09-04\n\n"
+        "두 번째 자료 문장\n")
     return d
 
 
@@ -103,20 +105,19 @@ async def test_bad_citation_is_dropped_but_the_report_survives(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_no_saved_material_is_reported_not_swallowed(tmp_path):
-    """자료가 없으면 출제도 후속 질문도 근거를 잃는다 — 조용히 넘기지 않는다."""
-    from devcrew.tutor_research import research
+async def test_corpus_dir_is_created_before_the_worker_runs(tmp_path):
+    """워커의 cwd가 될 자리다 — 없으면 `spawn`이 존재하지 않는 디렉토리를 받는다.
+    (자료가 안 남았을 때의 처분은 아래 신뢰도 관문 테스트가 본다.)"""
+    from devcrew.tutor_research import ResearchError, research
 
     empty = tmp_path / "corpus"
     ad = Scripted([_payload(citations=[])])
     orch, _t, _r = make_orch(tmp_path, ad)
 
-    res = await research(orch, load_config(), exec_id="QUIZ-1", topic="주제",
-                         corpus_dir=empty)
-
-    assert empty.is_dir()                          # 없으면 만든다
-    assert res.files == []
-    assert any("문항을 낼 수 없" in n for n in res.notes)
+    with pytest.raises(ResearchError):
+        await research(orch, load_config(), exec_id="QUIZ-1", topic="주제",
+                       corpus_dir=empty)
+    assert empty.is_dir()
 
 
 @pytest.mark.asyncio
@@ -186,12 +187,70 @@ def test_parse_sources_rejects_non_http_urls():
     assert out[1]["title"] == "http://ok2.example"   # 빈 제목은 URL로 대체
 
 
-def test_corpus_files_lists_only_markdown_recursively(tmp_path):
+def test_corpus_files_counts_every_file_not_just_markdown(tmp_path):
+    """확장자를 가리면 `.txt`로 저장한 자료가 출처 검사를 피한 채 출제 근거가 된다 —
+    인용 대조는 디렉토리 안의 아무 파일이나 열기 때문이다."""
     from devcrew.tutor_research import corpus_files
 
     (tmp_path / "sub").mkdir()
     (tmp_path / "a.md").write_text("x")
     (tmp_path / "sub" / "b.md").write_text("x")
     (tmp_path / "c.txt").write_text("x")
-    assert corpus_files(tmp_path) == ["a.md", "sub/b.md"]
+    (tmp_path / ".hidden").write_text("x")
+    assert corpus_files(tmp_path) == ["a.md", "c.txt", "sub/b.md"]
     assert corpus_files(tmp_path / "없음") == []
+
+
+# ── 신뢰도 관문 (통과 조건, lessons C8) ──────────────────────────────────────
+@pytest.mark.asyncio
+@pytest.mark.parametrize("break_it,expect", [
+    ("no_files", "저장되지 않았"),
+    ("no_source_header", "출처 표시가 없는"),
+    ("no_sources", "출처 목록이 비어"),
+    ("no_citations", "대조되는 인용이"),
+    ("empty_report", "본문이 비어"),
+])
+async def test_gate_refuses_a_report_without_grounding(tmp_path, break_it, expect):
+    """출처·근거가 갖춰졌을 때만 리포트가 학습자에게 간다.
+
+    프롬프트에도 같은 규칙이 있지만 그건 부탁이다 — 지키지 않아도 화면에는 성실한
+    리포트로 보이고, 그 자료가 그대로 출제 근거가 되어 거짓이 문항으로 굳는다.
+    """
+    from devcrew.tutor_research import ResearchError, research
+
+    d = tmp_path / "corpus"
+    if break_it != "no_files":
+        d = _corpus(tmp_path)
+    if break_it == "no_source_header":
+        (d / "03-nosrc.md").write_text("출처 없는 자료\n")
+    kw = {}
+    if break_it == "no_sources":
+        kw["sources"] = []
+    if break_it == "no_citations":
+        kw["citations"] = [{"path": "01-basics.md", "start_line": 1, "end_line": 1,
+                            "quote": "파일에 없는 문장"}]
+    if break_it == "empty_report":
+        kw["report"] = "   "
+    ad = Scripted([_payload(**kw)])
+    orch, trace, _r = make_orch(tmp_path, ad)
+
+    with pytest.raises(ResearchError, match=expect):
+        await research(orch, load_config(), exec_id="QUIZ-1", topic="주제", corpus_dir=d)
+
+    # 관문에 걸린 사유도 trace에 남는다 — 화면 문구만으로는 나중에 못 되짚는다
+    from devcrew.quiz import AUTHOR_FAILED_EVENT
+    evs = trace.events(event_type=AUTHOR_FAILED_EVENT, execution_id="QUIZ-1")
+    assert evs and evs[-1]["payload"]["node"] == "research-gate"
+
+
+def test_verify_sources_reads_the_header_from_disk(tmp_path):
+    """출처 검사는 LLM 판단이 아니라 파일을 여는 결정적 검사다."""
+    from devcrew.tutor_research import verify_sources
+
+    (tmp_path / "ok.md").write_text("# 제목\n\n> 출처: https://example.org/a\n\n본문\n")
+    (tmp_path / "full.md").write_text("> 출처： https://example.org/b\n")   # 전각 콜론
+    (tmp_path / "bad.md").write_text("# 제목\n\n출처를 산문으로만 언급\n")
+    (tmp_path / "noturl.md").write_text("> 출처: 내 기억\n")
+    with_src, without = verify_sources(tmp_path)
+    assert with_src == ["full.md", "ok.md"]
+    assert without == ["bad.md", "noturl.md"]

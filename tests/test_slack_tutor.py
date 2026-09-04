@@ -1561,12 +1561,22 @@ def make_topic_handler(tmp_path, repo, *, n=12, report="핵심 요약 문단.\n\
     return h, trace, pub
 
 
-def seed_corpus(h, thread_ts="100.1", *, lines=40):
-    """워커가 저장했을 자료. 출제 evidence(`a.py`)와 조사 인용(`01.md`) 양쪽을 채운다."""
+def seed_corpus(h, thread_ts="100.1", *, lines=40, source=True):
+    """워커가 저장했을 자료. **출처 머리글까지** 넣는다 — 하네스가 파일을 열어 확인하고,
+    없으면 리포트 자체를 거절한다 (신뢰도 관문).
+
+    `01.md`는 조사 인용 대상, `a.py`는 출제 evidence 대상이다. 관문은 확장자를 가리지
+    않으므로 둘 다 출처가 있어야 한다.
+    """
     d = h.corpus_dir_for(thread_ts)
     d.mkdir(parents=True, exist_ok=True)
-    (d / "01.md").write_text("\n".join(f"자료 문장 {i}" for i in range(1, 10)) + "\n")
-    (d / "a.py").write_text("\n".join(f"line{i}" for i in range(1, lines)) + "\n")
+    # 출처 줄을 **끝에** 붙인다 — 앞에 두면 줄 번호가 밀려 evidence(`파일:N` = `lineN`)와
+    # 어긋난다. 검사는 파일 어디에 있든 찾는다.
+    tail = "\n> 출처: https://example.org/doc\n" if source else "\n"
+    (d / "01.md").write_text(
+        "\n".join(f"자료 문장 {i}" for i in range(1, 10)) + tail)
+    (d / "a.py").write_text(
+        "\n".join(f"line{i}" for i in range(1, lines)) + tail)
     return d
 
 
@@ -1711,3 +1721,22 @@ def test_sweep_corpus_removes_expired_but_keeps_busy_rounds(tmp_path, repo):
 
     assert removed == ["QUIZ-300.1"]
     assert fresh.is_dir() and busy.is_dir() and not stale.exists()
+
+
+@pytest.mark.asyncio
+async def test_material_without_a_source_never_reaches_the_learner(tmp_path, repo):
+    """출처 없는 자료로는 리포트도 회차도 열리지 않는다 — 사유는 그대로 스레드에.
+
+    화면에 "성실한 리포트"로 보이는 순간 그 자료는 출제 근거가 되고, 거짓이 문항으로
+    굳는다. 막는 자리는 학습자에게 보이기 **전**이어야 한다.
+    """
+    h, _, pub = make_topic_handler(tmp_path, repo)
+    seed_corpus(h, source=False)
+    say = SaySpy()
+
+    await h.on_mention(mention(text="<@U1> 주제"), say)
+
+    text = say.messages[-1]["text"]
+    assert "출처 표시가 없는" in text          # 무엇이 없어서 거절했는지 말한다
+    assert pub == []                            # 리포트를 발행하지 않았다
+    assert h.topics == {} and h.sessions == {}  # 버튼도 회차도 남기지 않는다
