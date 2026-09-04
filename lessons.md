@@ -30,8 +30,23 @@
   `_amain` 안에서 만들던 `crew_dispatch`를 옛 구현으로 되돌려도 테스트가 전부 통과했다.
   → 막은 방법: `slack_posters`/`make_crew_dispatch`로 클로저 밖에 꺼내 테스트 대상으로.
 
+- **2026-09-04 · registry를 재바인딩해 핸들러들이 옛 사본에 갇힘** (`slack_engine.py`)
+  `create_repo_now`는 `self.repos = load_repos()`로 갱신하면서 docstring에 "registry를
+  **즉시** 갱신한다"고 적고, 만든 repo가 안 잡히면 예외까지 던지는 가드를 뒀다. 그런데
+  그 dict는 기동 시 `BrainHandler`·`TutorHandler` 생성자에 **그대로 넘어간 객체**였다.
+  재바인딩은 러너의 이름만 새 dict로 옮기고 핸들러 둘은 기동 시점 사본을 계속 들고 있었다
+  — crew가 만든 repo가 `@tutor`·`@brain`에는 **브리지를 재시작할 때까지** 보이지 않았다.
+  → 왜: 갱신의 정확성을 `self.repos` 안에서만 확인했다. 그 객체를 **누가 같이 들고
+    있는지**는 생성자 인자 목록에만 있었고, 테스트도 러너 안에서 끝났다.
+  → 막은 방법: `repos.SharedRegistry`(제자리 갱신 `replace_all`)로 공유를 이름 있는
+    것으로 만들고, 테스트가 **실제 두 핸들러를 생성해** 그 안까지 값이 도달하는지 본다
+    (`test_created_repo_reaches_handlers_that_took_the_registry_at_boot`).
+    고치기 전 상태로 되돌려 빨간불을 확인했다.
+
 **규칙**: 기능을 "됐다"고 말하기 전에 **호출자 → 피호출자** 방향으로 값이 흐르는 걸
 검증하는 테스트가 하나라도 있는지 확인한다. 순수 함수 테스트는 배선을 증명하지 않는다.
+가변 상태를 남에게 넘겼으면 **갱신은 제자리에서** 한다 — 재바인딩은 넘겨받은 쪽에서
+조용히 시간이 멈추게 만든다.
 
 ---
 

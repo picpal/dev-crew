@@ -29,8 +29,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .repos import (RepoRegistryError, UnknownRepoError, create_repo,
-                    format_repo_names, load_repo_bases, load_repos,
+from .repos import (RepoRegistryError, SharedRegistry, UnknownRepoError,
+                    create_repo, format_repo_names, load_repo_bases, load_repos,
                     split_repo_target, workspace_roots)
 from .usage import context_badge, measure
 from .worktree import WorktreeManager
@@ -261,8 +261,10 @@ class EngineRunner:
         self.cfg = cfg
         self.mcp = {"harness": build_harness_mcp(self.trace)}
         self.timeout = float(os.environ.get("DEVCREW_TASK_TIMEOUT", "600"))
-        self.repos = load_repos()
-        self.repo_bases = load_repo_bases()
+        # **재바인딩하지 않는다.** 이 두 객체는 그대로 brain·tutor 핸들러에 넘어간다
+        # (`SharedRegistry` 참고) — 갱신은 `replace_all`로 제자리에서 한다.
+        self.repos = SharedRegistry(load_repos())
+        self.repo_bases = SharedRegistry(load_repo_bases())
         self._locks: dict[str, asyncio.Lock] = {}
         # execution_id는 프로세스 재시작 때 1부터 리셋되면 trace에서 과거 실행과
         # 충돌한다 — 기존 trace의 최대 번호 다음부터 이어 붙인다.
@@ -348,10 +350,13 @@ class EngineRunner:
 
         `self.repos`는 기동 시 1회만 로드된다 — 갱신하지 않으면 방금 만든 repo가
         다음 파싱에서도 미등록이라 무한히 같은 질문을 하게 된다.
+
+        갱신은 **제자리에서** 한다. 같은 객체를 brain·tutor 핸들러가 기동 시점에
+        받아 들고 있어서, 재바인딩하면 러너만 새 목록을 보고 그 둘은 못 본다.
         """
         path = create_repo(name, workspace_roots())
-        self.repos = load_repos()
-        self.repo_bases = load_repo_bases()
+        self.repos.replace_all(load_repos())
+        self.repo_bases.replace_all(load_repo_bases())
         if name not in self.repos:                  # 만들었는데 안 잡히면 조용히 넘기지 않는다
             raise RepoRegistryError(
                 f"repo {name!r}를 {path}에 만들었지만 registry에 잡히지 않았다 "

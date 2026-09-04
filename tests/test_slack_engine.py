@@ -1192,6 +1192,36 @@ async def test_abort_decision_creates_nothing(tmp_path, monkeypatch):
     assert list(ws.iterdir()) == []
 
 
+def test_created_repo_reaches_handlers_that_took_the_registry_at_boot(tmp_path, monkeypatch):
+    """`create_repo_now`가 만든 repo가 **brain·tutor에도 보여야** 한다.
+
+    두 핸들러는 기동 시점에 `runner.repos` 객체를 받아 들고 있다. 러너가 갱신을
+    재바인딩으로 하면 자기만 새 목록을 보고 핸들러들은 옛 사본에 갇힌다 — crew로
+    만든 repo가 `@tutor`에는 브리지 재시작 전까지 안 보였다 (2026-09-04).
+    러너 안만 보는 테스트는 이걸 못 잡으므로 **실제 핸들러까지** 값을 흘린다.
+    """
+    from devcrew.slack_brain import BrainHandler
+    from devcrew.slack_engine import EngineRunner
+    from devcrew.slack_tutor import TutorHandler
+
+    _repo_env(tmp_path, monkeypatch)
+    runner = EngineRunner(runtime_dir=tmp_path / "rt")
+    brain = BrainHandler(runner.orch, runner.cfg, runner.repos, _noop_dispatch)
+    tutor = TutorHandler(runner.orch, runner.cfg, runner.repos)
+    assert "todo-web" not in tutor.repos
+
+    runner.create_repo_now("todo-web")
+
+    assert "todo-web" in runner.repos
+    assert "todo-web" in tutor.repos          # 재바인딩이면 여기서 실패한다
+    assert "todo-web" in brain.repos
+    assert runner.repo_bases["todo-web"] == "HEAD"
+
+
+async def _noop_dispatch(task, channel, interview_link):
+    return None
+
+
 # ── 생성 버튼 클릭 ───────────────────────────────────────────────────────────
 class _ClickRunner:
     """handle_create_repo_click이 러너에게 기대하는 표면만 가진 대역."""

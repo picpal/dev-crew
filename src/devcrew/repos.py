@@ -122,6 +122,24 @@ def _registry(path: str | Path | None = None) -> dict[str, tuple[Path, str]]:
     return dict(sorted(reg.items()))
 
 
+class SharedRegistry(dict):
+    """여러 곳이 **같은 객체를 들고 있는** registry 뷰. 갱신은 제자리에서 한다.
+
+    브리지는 registry를 기동 시 한 번 로드해 `EngineRunner`가 들고, 그 dict를
+    `BrainHandler`·`TutorHandler` 생성자에 그대로 넘긴다. 그래서 갱신을
+    `self.repos = load_repos()`(재바인딩)로 하면 **러너만 새 dict를 보고 핸들러들은
+    기동 시점 사본을 계속 들고 있다** — crew가 `CREATE_REPO`로 만든 repo가 `@tutor`·
+    `@brain`에는 브리지를 재시작할 때까지 보이지 않았다 (2026-09-04).
+
+    `replace_all`은 **이미 로드된** 매핑을 받는다. 로드가 실패하면 이 메서드에
+    닿기 전에 예외가 나므로, 읽다 만 결과로 기존 목록을 비우는 경우가 없다.
+    """
+
+    def replace_all(self, fresh) -> None:
+        self.clear()
+        self.update(fresh)
+
+
 def load_repos(path: str | Path | None = None) -> dict[str, Path]:
     return {n: v[0] for n, v in _registry(path).items()}
 

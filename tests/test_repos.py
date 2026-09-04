@@ -274,3 +274,16 @@ def test_create_repo_needs_a_workspace_root(tmp_path):
     from devcrew.repos import create_repo
     with pytest.raises(RepoRegistryError, match="workspace_root"):
         create_repo("todo-web", [])
+
+
+def test_shared_registry_updates_in_place_so_other_holders_see_it():
+    """갱신해도 **객체가 바뀌지 않는다** — 사본을 들고 있는 쪽이 옛 목록에 갇히지 않게."""
+    from devcrew.repos import SharedRegistry
+    reg = SharedRegistry({"a": Path("/ws/a")})
+    holder = reg                                   # 기동 시 핸들러에 넘어간 그 객체
+    reg.replace_all({"a": Path("/ws/a"), "b": Path("/ws/b")})
+    assert holder is reg
+    assert set(holder) == {"a", "b"}
+    # 사라진 repo는 사라진다 — 합치기가 아니라 교체다
+    reg.replace_all({"b": Path("/ws/b")})
+    assert set(holder) == {"b"}
