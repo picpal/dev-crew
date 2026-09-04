@@ -182,3 +182,30 @@ async def test_draw_applies_the_theme(tmp_path):
     ad = Drawing(f"<html>{svg}</html>")
     out = await draw(make_orch(tmp_path, ad), load_config(), exec_id="E", spec="s")
     assert out and "var(--ink-1" in out
+
+
+def test_real_skill_output_survives_extraction():
+    """`vision` 스킬이 실제로 낸 HTML(2026-09-04 실측)에서 SVG가 온전히 나오는지.
+
+    상한을 올리기 전에 확인할 것은 "시간만 주면 쓸 수 있는 결과가 나오는가"였다.
+    파이프라인이 실물 산출물을 못 다루면 상한을 올려도 소용이 없다.
+    """
+    from devcrew.tutor_vis import MAX_SVG, extract_svg
+
+    html = ('<!doctype html><html><head><style>.n{fill:#123}</style></head><body>'
+            '<svg viewBox="0 0 504 276" xmlns="http://www.w3.org/2000/svg" '
+            'role="img" aria-labelledby="t d"><title id="t">리밸런싱</title>'
+            '<g class="n"><rect x="1" y="2" width="3" height="4"/>'
+            '<text x="5" y="6">이탈 감지</text></g></svg>'
+            '<script>console.log(1)</script></body></html>')
+    svg = extract_svg(html)
+    assert svg and svg.startswith("<svg")
+    assert "이탈 감지" in svg and "console.log" not in svg
+    assert len(svg) < MAX_SVG
+
+
+def test_timeout_has_headroom_over_the_measured_run():
+    """상한은 실측 뒤에 정한다 (lessons C3). 그리기 실측은 408초였다."""
+    from devcrew.tutor_vis import TURN_TIMEOUT
+
+    assert TURN_TIMEOUT >= 408 * 2

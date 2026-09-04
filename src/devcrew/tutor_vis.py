@@ -18,7 +18,13 @@ from pathlib import Path
 
 from .schema import Role
 
-TURN_TIMEOUT = 420.0
+# **실측(2026-09-04): 그리기 한 번이 6분 48초(408초)다.** 상한이 420초였으니 여유가
+# 12초뿐이었고, 하네스 경로는 spawn과 제출 turn이 더 붙어 매번 상한에 걸렸다 —
+# trace에 남은 TUTOR_VIS 3회 중 측정 가능한 1회가 429초(= 잘린 값)이고 성공 기록이
+# 없었다. 7분을 쓰고 그림 없이 끝나는 실행이 조사 리포트마다 반복됐다.
+# `vision` 스킬은 SKILL.md만 46KB에 references가 56개다 — 읽고, 고르고, 그리고,
+# 검증 스크립트까지 도는 과업이라 이 시간이 정상이다. 관측값의 2배를 상한으로 둔다.
+TURN_TIMEOUT = 900.0
 MAX_SVG = 120_000          # 리포트 한 장에 들어갈 만한 상한
 
 INTRO = ("아래 설명을 다이어그램 하나로 그려라. vision 스킬을 Skill 도구로 호출해서 "
