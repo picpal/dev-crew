@@ -30,7 +30,7 @@ from .repos import RepoRegistryError, format_repo_names, split_repo_prefix
 from .slack_brain import to_mrkdwn
 from .tutor import issue_quiz
 from .tutor_code import trace_code
-from .tutor_research import ResearchError, research
+from .tutor_research import ResearchError, corpus_files, research
 from .tutor_vis import draw
 from .tutor_ta import (SLACK_LIMIT, TRUNCATED_NOTE, TutorTAError, ask,
                        round_context, slack_head)
@@ -54,6 +54,10 @@ REGRADE_VALUE = "__REGRADE__"   # 채점 실패 후 다시 채점하는 버튼�
 START_QUIZ_VALUE = "__START_QUIZ__"
 # 회차 전용 자료가 사는 곳. repo가 아니므로 registry·worktree·병합과 무관하다.
 DEFAULT_CORPUS_ROOT = Path(".devcrew-runtime") / "corpus"
+# 조사 중 진행 표시를 다시 그리는 주기. 조사 한 단계가 실측 10분인데 그동안 글자가
+# 한 번도 안 바뀌면 **멈춘 것과 구분되지 않는다** (2026-09-04: 사용자가 두 번 그렇게
+# 읽었다). 경과 시간과 저장된 자료 수는 하네스가 직접 세므로 워커를 방해하지 않는다.
+HEARTBEAT_INTERVAL = 20.0
 LETTERS = "ABCDEFGH"
 BAR_FULL, BAR_EMPTY = "▰", "▱"
 TYPE_HINT = {"CORRECT": ("✅", "옳은 것"), "INCORRECT": ("⛔", "틀린 것")}
@@ -668,19 +672,39 @@ class TutorHandler:
 
     # ── 회차 ────────────────────────────────────────────────────────────────
     # ── 주제 모드 (§10.8) ───────────────────────────────────────────────────
-    def _progress(self, channel: str, thread_ts: str, say):
+    def _progress(self, channel: str, thread_ts: str, say, corpus=None):
         """진행 표시 — **한 메시지를 갱신한다.**
 
         단계마다 새 메시지를 쌓으면 스레드가 회차 내용보다 진행 로그로 길어지고,
         끝난 뒤에도 남는다. 마지막에는 이 메시지가 그대로 결과 카드가 된다.
 
+        `refresh=True`는 **같은 단계를 다시 그린다** — 경과 시간과 지금까지 저장된
+        자료 수를 붙여서. 조사 한 단계가 10분인데 글자가 안 바뀌면 멈춘 것과
+        구분되지 않는다. 이 수치는 하네스가 시계와 디렉토리에서 직접 읽으므로
+        워커에게 묻지 않는다 (모델 주장과 실제가 갈릴 여지도 없다).
+
         `update`가 없거나 실패하면 새 메시지를 올리는 종전 동작으로 떨어진다 —
         진행이 안 보이는 것이 중복보다 나쁘다 (침묵은 고장과 구분되지 않는다).
         """
-        state: dict = {"ts": None}
+        state: dict = {"ts": None, "stage": "", "at": time.monotonic()}
 
-        async def tick(stage: str = "", *, text: str = "", blocks=None) -> None:
-            body = text or f"⏳ {stage}"
+        def _detail() -> str:
+            secs = int(time.monotonic() - state["at"])
+            out = f"{secs // 60}분 {secs % 60}초" if secs >= 60 else f"{secs}초"
+            n = len(corpus_files(corpus)) if corpus else 0
+            return f"{out} · 자료 {n}개" if n else out
+
+        async def tick(stage: str = "", *, text: str = "", blocks=None,
+                       refresh: bool = False) -> None:
+            if refresh:
+                if not state["stage"]:
+                    return          # 최종 렌더 뒤 — 하트비트가 카드를 되돌리면 안 된다
+                stage = state["stage"]
+            elif text:
+                state["stage"] = ""     # 결과 카드를 그렸다. 이제 갱신할 단계는 없다
+            elif stage:
+                state["stage"] = stage
+            body = text or f"⏳ {stage}  _{_detail()}_"
             if stage:
                 await self._set_status(channel, thread_ts, stage)
             if state["ts"] and self.update:
@@ -695,20 +719,46 @@ class TutorHandler:
 
         return tick
 
-    async def _research(self, thread_ts, channel, user, topic, say) -> None:
-        """주제를 조사해 자료를 남기고 학습 리포트를 낸다. **출제는 하지 않는다.**
+    async def _beat(self, tick, interval: float = HEARTBEAT_INTERVAL) -> None:
+        """진행 표시를 주기적으로 다시 그린다. 취소될 때까지 돈다.
 
-        읽지 않은 자료로 시험을 보게 하지 않으려고 버튼으로 갈라 둔다 (§10.8 D2).
+        갱신 실패는 삼킨다 — 곁다리가 본 작업을 죽이면 안 된다."""
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await tick(refresh=True)
+            except Exception:
+                pass
+
+    async def _research(self, thread_ts, channel, user, topic, say) -> None:
+        """주제 조사 — 진행 표시를 살려 둔 채 본 작업을 돌린다.
+
+        하트비트는 **조사부터 리포트까지 전 구간**을 덮는다. 조사만 덮으면 그다음
+        긴 구간(다이어그램 최대 7분 + 업로드)에서 다시 표시가 굳는데, 사용자가
+        "멈췄다"고 읽은 자리가 실제로 거기였다 (2026-09-04).
         """
         # **보이는 곳에 적는다.** `_set_status`는 AI 어시스턴트 스레드 전용이라 일반
         # 채널에서는 조용히 실패한다 — 조사는 웹을 오가느라 길고, 그 침묵은 고장과
         # 구분되지 않는다 (2026-08-24 출제에서 겪은 것과 같은 문제).
-        _tick = self._progress(channel, thread_ts, say)
+        corpus = self.corpus_dir_for(thread_ts)
+        tick = self._progress(channel, thread_ts, say, corpus=corpus)
+        beat = asyncio.create_task(self._beat(tick))
+        try:
+            await self._research_body(thread_ts, channel, user, topic, say,
+                                      corpus=corpus, tick=tick)
+        finally:
+            beat.cancel()
 
+    async def _research_body(self, thread_ts, channel, user, topic, say, *,
+                             corpus, tick) -> None:
+        """주제를 조사해 자료를 남기고 학습 리포트를 낸다. **출제는 하지 않는다.**
+
+        읽지 않은 자료로 시험을 보게 하지 않으려고 버튼으로 갈라 둔다 (§10.8 D2).
+        """
+        _tick = tick
         if self._lock.locked():
             await say(text="⏳ 다른 요청을 처리하는 중입니다. 끝나면 이어서 시작합니다.",
                       thread_ts=thread_ts)
-        corpus = self.corpus_dir_for(thread_ts)
         try:
             async with self._lock:
                 res = await research(self.orch, self.cfg, exec_id=round_id(thread_ts),

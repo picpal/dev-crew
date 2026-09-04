@@ -1818,3 +1818,36 @@ async def test_upload_failure_keeps_the_research_and_the_button(tmp_path, repo):
     assert h.topics["100.1"]["corpus_dir"]                     # 대상도 남았다
     evs = trace.events(event_type=REPORT_FAILED_EVENT)
     assert evs and evs[-1]["payload"]["kind"] == "research"    # 사유는 trace에
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_shows_elapsed_and_material_count(tmp_path, repo, monkeypatch):
+    """조사 한 단계가 실측 10분이다 — 그동안 글자가 안 바뀌면 멈춘 것과 구분되지 않는다.
+
+    경과 시간과 저장된 자료 수는 **하네스가 시계와 디렉토리에서 직접 읽는다.**
+    워커에게 묻지 않으므로 모델 주장과 실제가 갈릴 여지도 없다.
+    """
+    import devcrew.slack_tutor as st
+
+    monkeypatch.setattr(st, "HEARTBEAT_INTERVAL", 0.01)
+    h, _, _ = make_topic_handler(tmp_path, repo)
+    seed_corpus(h)
+    h.update = UpdateSpy()
+    say = SaySpy()
+
+    real = st.research          # **패치 전에** 붙잡는다 — 안 그러면 자기를 다시 부른다
+
+    async def slow_research(*a, **kw):
+        await kw["progress"]("자료 조사 중…")
+        await asyncio.sleep(0.06)          # 하트비트가 여러 번 돌 시간
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(st, "research", slow_research)
+    await h.on_mention(mention(text="<@U1> 주제"), say)
+
+    beats = [u["text"] for u in h.update.calls if u["text"].startswith("⏳")]
+    assert beats, "하트비트가 한 번도 안 돌았다"
+    assert any("자료 조사 중…" in b and "자료 2개" in b for b in beats)
+    assert any("초" in b for b in beats)
+    # 마지막 갱신은 결과 카드다 — 하트비트가 그걸 되돌리지 않는다
+    assert h.update.calls[-1]["text"].startswith("🎓")
