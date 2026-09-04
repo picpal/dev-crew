@@ -320,7 +320,8 @@ class TutorHandler:
     `publish`는 리포트 업로드 함수 (테스트에서 대역으로 바꾼다)."""
 
     def __init__(self, orch, cfg, repos: dict, *, react=None, status=None,
-                 publish=publish_report, max_seen: int = 1000, corpus_root=None):
+                 update=None, publish=publish_report, max_seen: int = 1000,
+                 corpus_root=None):
         self.orch = orch
         self.cfg = cfg
         self.repos = repos
@@ -329,6 +330,7 @@ class TutorHandler:
         self.corpus_root = Path(corpus_root or DEFAULT_CORPUS_ROOT)
         self.react = react
         self.status = status
+        self.update = update      # async (channel, ts, text, blocks) — 진행 표시 갱신
         self.publish = publish
         self.sessions: dict[str, QuizSession] = {}
         self.last_questions: list[Question] = []   # 최근 회차 (운영·테스트 편의)
@@ -666,17 +668,42 @@ class TutorHandler:
 
     # ── 회차 ────────────────────────────────────────────────────────────────
     # ── 주제 모드 (§10.8) ───────────────────────────────────────────────────
+    def _progress(self, channel: str, thread_ts: str, say):
+        """진행 표시 — **한 메시지를 갱신한다.**
+
+        단계마다 새 메시지를 쌓으면 스레드가 회차 내용보다 진행 로그로 길어지고,
+        끝난 뒤에도 남는다. 마지막에는 이 메시지가 그대로 결과 카드가 된다.
+
+        `update`가 없거나 실패하면 새 메시지를 올리는 종전 동작으로 떨어진다 —
+        진행이 안 보이는 것이 중복보다 나쁘다 (침묵은 고장과 구분되지 않는다).
+        """
+        state: dict = {"ts": None}
+
+        async def tick(stage: str = "", *, text: str = "", blocks=None) -> None:
+            body = text or f"⏳ {stage}"
+            if stage:
+                await self._set_status(channel, thread_ts, stage)
+            if state["ts"] and self.update:
+                try:
+                    await self.update(channel, state["ts"], body, blocks)
+                    return
+                except Exception:
+                    pass
+            res = await self._say_blocks(say, thread_ts, body, blocks)
+            if state["ts"] is None and isinstance(res, dict):
+                state["ts"] = res.get("ts")
+
+        return tick
+
     async def _research(self, thread_ts, channel, user, topic, say) -> None:
         """주제를 조사해 자료를 남기고 학습 리포트를 낸다. **출제는 하지 않는다.**
 
         읽지 않은 자료로 시험을 보게 하지 않으려고 버튼으로 갈라 둔다 (§10.8 D2).
         """
-        async def _tick(stage: str) -> None:
-            # **보이는 곳에 적는다.** `_set_status`는 AI 어시스턴트 스레드 전용이라
-            # 일반 채널에서는 조용히 실패한다 — 조사는 웹을 오가느라 길고, 그 침묵은
-            # 고장과 구분되지 않는다 (2026-08-24 출제에서 겪은 것과 같은 문제).
-            await self._set_status(channel, thread_ts, stage)
-            await say(text=f"⏳ {stage}", thread_ts=thread_ts)
+        # **보이는 곳에 적는다.** `_set_status`는 AI 어시스턴트 스레드 전용이라 일반
+        # 채널에서는 조용히 실패한다 — 조사는 웹을 오가느라 길고, 그 침묵은 고장과
+        # 구분되지 않는다 (2026-08-24 출제에서 겪은 것과 같은 문제).
+        _tick = self._progress(channel, thread_ts, say)
 
         if self._lock.locked():
             await say(text="⏳ 다른 요청을 처리하는 중입니다. 끝나면 이어서 시작합니다.",
@@ -699,8 +726,23 @@ class TutorHandler:
             topic=topic, report=res.report, citations=res.citations,
             sources=res.sources, files=res.files,
             diagram=await self._diagram(thread_ts, res.diagram))
-        url = await asyncio.to_thread(self.publish, self._research_report_id(thread_ts),
-                                      html)
+        try:
+            url = await asyncio.to_thread(self.publish,
+                                          self._research_report_id(thread_ts), html)
+        except Exception as e:
+            # **발행 실패가 조사를 통째로 날리면 안 된다.** 자료는 이미 디스크에 있고
+            # 본문도 손에 있다 — 링크만 없을 뿐이다. 링크 하나 때문에 10분짜리 조사와
+            # 출제 버튼까지 잃는 것이 실제로 일어났다 (2026-09-04: wrangler 60초 상한).
+            # TA 답변 경로가 이미 같은 처분을 하고 있었는데 이 경로만 빠져 있었다.
+            try:
+                self.orch.trace.append(REPORT_FAILED_EVENT, task_id=round_id(thread_ts),
+                                       execution_id=round_id(thread_ts),
+                                       payload={"reason": f"{type(e).__name__}: {e}",
+                                                "kind": "research"})
+            except Exception:
+                pass
+            url = None
+            res.notes.append("리포트 발행에 실패해 링크가 없습니다 — 본문은 아래에 있습니다")
         # **기록이 먼저다.** 안내를 먼저 보내고 기록에 실패하면 버튼이 대상을 못 찾는다
         # (프로세스가 재시작되면 메모리 상태도 없다) — lessons C7.
         try:
@@ -715,9 +757,10 @@ class TutorHandler:
             return
         self.topics[thread_ts] = {"topic": topic, "corpus_dir": str(corpus),
                                   "owner": user, "channel": channel}
-        await self._say_blocks(say, thread_ts,
-                               research_text(topic, res, url),
-                               research_blocks(topic, res, url))
+        # 진행 메시지를 결과로 **갈아 끼운다** — 끝난 뒤에도 "⏳ 리포트 만드는 중…"이
+        # 남아 있으면 무엇이 끝난 건지 알 수 없다.
+        await _tick(text=research_text(topic, res, url),
+                    blocks=research_blocks(topic, res, url))
 
     async def _start_from_topic(self, thread_ts, channel, user, say) -> bool:
         """조사한 자료로 회차를 연다 (출제 버튼). 대상을 못 찾으면 False.
@@ -848,11 +891,12 @@ class TutorHandler:
         await self._post_question(sess, 0, say)
 
     @staticmethod
-    async def _say_blocks(say, thread_ts, text: str, blocks: list[dict]) -> None:
+    async def _say_blocks(say, thread_ts, text: str, blocks: list[dict] | None = None):
+        """블록 게시. **응답을 돌려준다** — 진행 표시가 갱신할 `ts`를 알아야 한다."""
         try:
-            await say(text=text, thread_ts=thread_ts, blocks=blocks)
+            return await say(text=text, thread_ts=thread_ts, blocks=blocks)
         except TypeError:
-            await say(text=text, thread_ts=thread_ts)
+            return await say(text=text, thread_ts=thread_ts)
 
     async def _post_question(self, sess: QuizSession, idx: int, say) -> None:
         q = sess.questions[idx]

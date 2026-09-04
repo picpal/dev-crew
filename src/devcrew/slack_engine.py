@@ -584,7 +584,7 @@ def make_tutor_say(client, channel: str, thread):
     return say
 
 
-def build_tutor_handler(runner, *, react=None, status=None):
+def build_tutor_handler(runner, *, react=None, status=None, update=None):
     """러너 → TutorHandler. **클로저 밖**에 둔다 — `_amain` 안에서 조립하면 인자
     하나가 빠져도 테스트가 닿지 않아 전부 초록이다 (lessons C1: `slack_posters`·
     `make_crew_dispatch`를 같은 이유로 꺼냈다).
@@ -594,7 +594,7 @@ def build_tutor_handler(runner, *, react=None, status=None):
     """
     from .slack_tutor import TutorHandler
     return TutorHandler(runner.orch, runner.cfg, runner.repos,
-                        react=react, status=status,
+                        react=react, status=status, update=update,
                         corpus_root=runner.corpus_root)
 
 
@@ -1031,7 +1031,13 @@ async def _amain() -> None:
             await tutor_app.client.assistant_threads_setStatus(
                 channel_id=channel, thread_ts=thread_ts, status=text)
 
-        tutor = build_tutor_handler(runner, react=tutor_react, status=tutor_status)
+        async def tutor_update(channel: str, ts: str, text: str, blocks=None) -> None:
+            # 진행 메시지를 제자리에서 고쳐 쓴다. 단계마다 새 메시지를 쌓지 않는다.
+            await tutor_app.client.chat_update(channel=channel, ts=ts, text=text,
+                                               blocks=blocks or [])
+
+        tutor = build_tutor_handler(runner, react=tutor_react, status=tutor_status,
+                                    update=tutor_update)
         tutor_action = make_tutor_action(tutor, tutor_app.client)
         tutor_question = make_tutor_question(tutor, tutor_app.client)
         # 같은 라우터 인스턴스를 넘긴다 — 중복 차단 상태를 공유해야 app_mention과

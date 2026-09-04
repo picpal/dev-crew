@@ -28,9 +28,13 @@ class Scripted(FakeAdapter):
 class SaySpy:
     def __init__(self):
         self.messages = []
+        self._n = 0
 
     async def __call__(self, *, text, thread_ts=None, blocks=None):
         self.messages.append({"text": text, "thread_ts": thread_ts, "blocks": blocks})
+        # 실제 `chat_postMessage`처럼 응답을 돌려준다 — 진행 표시가 여기서 `ts`를 얻는다
+        self._n += 1
+        return {"ok": True, "ts": f"msg-{self._n}"}
 
 
 def buttons_of(msg):
@@ -1740,3 +1744,77 @@ async def test_material_without_a_source_never_reaches_the_learner(tmp_path, rep
     assert "출처 표시가 없는" in text          # 무엇이 없어서 거절했는지 말한다
     assert pub == []                            # 리포트를 발행하지 않았다
     assert h.topics == {} and h.sessions == {}  # 버튼도 회차도 남기지 않는다
+
+
+class UpdateSpy:
+    """chat_update 대역 — (ts, text, blocks) 기록."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def __call__(self, channel, ts, text, blocks=None):
+        self.calls.append({"ts": ts, "text": text, "blocks": blocks})
+
+
+@pytest.mark.asyncio
+async def test_progress_edits_one_message_instead_of_stacking(tmp_path, repo):
+    """진행 표시는 **한 메시지를 갱신**한다. 단계마다 새 메시지를 쌓으면 스레드가
+    회차 내용보다 진행 로그로 길어지고, 끝난 뒤에도 남는다."""
+    h, _, _ = make_topic_handler(tmp_path, repo)
+    seed_corpus(h)
+    h.update = UpdateSpy()
+    say = SaySpy()
+
+    await h.on_mention(mention(text="<@U1> 주제"), say)
+
+    # 스레드에 새로 올라간 것은 첫 진행 메시지 하나뿐이다
+    assert len(say.messages) == 1
+    assert say.messages[0]["text"].startswith("⏳")
+    updates = h.update.calls
+    assert all(u["ts"] == "msg-1" for u in updates)          # 같은 메시지를 계속 고친다
+    # 마지막 갱신이 곧 결과 카드다 — "⏳ 리포트 만드는 중…"이 남지 않는다
+    assert "주제" in updates[-1]["text"] and "📄" in updates[-1]["text"]
+    assert [b["value"] for b in buttons_of(updates[-1])] == ["__START_QUIZ__"]
+
+
+@pytest.mark.asyncio
+async def test_progress_falls_back_to_new_messages_without_update(tmp_path, repo):
+    """`update`가 없으면 새 메시지를 올리는 종전 동작으로 떨어진다 —
+    진행이 안 보이는 것이 중복보다 나쁘다 (침묵은 고장과 구분되지 않는다)."""
+    h, _, _ = make_topic_handler(tmp_path, repo)
+    seed_corpus(h)
+    say = SaySpy()
+
+    await h.on_mention(mention(text="<@U1> 주제"), say)
+
+    assert len(say.messages) > 1
+    assert [b["value"] for b in buttons_of(say.messages[-1])] == ["__START_QUIZ__"]
+
+
+@pytest.mark.asyncio
+async def test_upload_failure_keeps_the_research_and_the_button(tmp_path, repo):
+    """발행 실패가 조사를 통째로 날리면 안 된다 (2026-09-04: wrangler 60초 상한).
+
+    자료는 이미 디스크에 있고 본문도 손에 있다 — 없는 것은 링크뿐이다. 링크 하나
+    때문에 10분짜리 조사와 출제 버튼까지 잃었다.
+    """
+    from devcrew.quiz import REPORT_FAILED_EVENT
+
+    h, trace, _ = make_topic_handler(tmp_path, repo)
+    seed_corpus(h)
+
+    def boom(task_id, html):
+        raise TimeoutError("wrangler timed out after 60 seconds")
+
+    h.publish = boom
+    say = SaySpy()
+
+    await h.on_mention(mention(text="<@U1> 주제"), say)
+
+    last = say.messages[-1]
+    assert "핵심 요약 문단" in last["text"]                    # 본문은 살아 있다
+    assert "📄" not in last["text"]                            # 링크만 없다
+    assert [b["value"] for b in buttons_of(last)] == ["__START_QUIZ__"]   # 출제는 가능
+    assert h.topics["100.1"]["corpus_dir"]                     # 대상도 남았다
+    evs = trace.events(event_type=REPORT_FAILED_EVENT)
+    assert evs and evs[-1]["payload"]["kind"] == "research"    # 사유는 trace에
