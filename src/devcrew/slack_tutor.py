@@ -13,20 +13,24 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .quiz import (ANSWER_EVENT, ISSUED_EVENT, QUESTION_EVENT,
-                   REPORT_FAILED_EVENT, ROUND_GRADED_EVENT,
+                   REPORT_FAILED_EVENT, ROUND_GRADED_EVENT, TOPIC_EVENT,
                    TA_ANSWER_EVENT, NoteUnavailable, Question, Scorecard,
                    from_raw, grade, note_id, open_misses, record_scorecard, to_raw)
 from .report.code_report import render_code_report
-from .report.quiz_report import render_quiz_report, render_ta_answer
+from .report.quiz_report import (render_quiz_report, render_research_report,
+                                 render_ta_answer)
 from .report.uploader import publish_report
 from .repos import RepoRegistryError, format_repo_names, split_repo_prefix
 from .slack_brain import to_mrkdwn
 from .tutor import issue_quiz
 from .tutor_code import trace_code
+from .tutor_research import ResearchError, research
 from .tutor_vis import draw
 from .tutor_ta import (SLACK_LIMIT, TRUNCATED_NOTE, TutorTAError, ask,
                        round_context, slack_head)
@@ -45,12 +49,23 @@ MAX_TA_SESSIONS = 50        # 초과 시 가장 오래 방치된 회차부터 �
 SWEEP_INTERVAL = 600.0
 ANSWER_RE = re.compile(r"^(\d+):([0-3])$")
 REGRADE_VALUE = "__REGRADE__"   # 채점 실패 후 다시 채점하는 버튼의 sentinel
+# 주제 조사 리포트 아래의 출제 버튼 (§10.8). **기본 산출물은 리포트이고 출제는 선택**이다
+# — 조사 직후 자동으로 문항을 내면 학습자는 읽지도 않은 자료로 시험을 본다.
+START_QUIZ_VALUE = "__START_QUIZ__"
+# 회차 전용 자료가 사는 곳. repo가 아니므로 registry·worktree·병합과 무관하다.
+DEFAULT_CORPUS_ROOT = Path(".devcrew-runtime") / "corpus"
 LETTERS = "ABCDEFGH"
 BAR_FULL, BAR_EMPTY = "▰", "▱"
 TYPE_HINT = {"CORRECT": ("✅", "옳은 것"), "INCORRECT": ("⛔", "틀린 것")}
 AREA_LINES = 12          # 채점 결과에 펼치는 영역 줄 수 상한
 NEED_REPO = ("⚠️ 대상 repo를 지정해 주세요 — `@tutor <repo명>: ` 형식입니다.\n"
              "등록된 repo: {repos}")
+# 멘션만 하고 아무것도 안 적었을 때. **두 모드를 다 알려준다** — 접두 없는 문장은
+# 이제 오류가 아니라 주제 학습이다 (§10.8).
+NEED_INPUT = ("🎓 무엇을 학습할까요?\n"
+              "• 주제를 적으면 조사해서 학습 리포트를 만듭니다 — `@tutor Kafka 리밸런싱`\n"
+              "• 코드 이해도를 보려면 repo를 지정하세요 — `@tutor <repo명>: `\n"
+              "등록된 repo: {repos}")
 STALE_MSG = ("⚠️ 이 회차는 하루가 지나 이어서 풀 수 없습니다. "
              "`@tutor <repo명>:` 로 다시 시작해 주세요.")
 NOT_OWNER = "⚠️ 이 회차를 시작한 사람만 답할 수 있습니다."
@@ -73,6 +88,9 @@ class QuizSession:
     owner: str
     repo_name: str
     questions: list[Question]
+    # 주제 모드(§10.8)의 자료 디렉토리. repo가 아니라 회차에 매달린 임시 공간이라
+    # registry로 풀 수 없다 — 근거 경로를 여기서 직접 들고 있어야 한다.
+    corpus_dir: str | None = None
     answers: dict[int, int] = field(default_factory=dict)
     done: bool = False
     ta_session_id: str | None = None    # 후속 질문 대화 세션 (#19)
@@ -142,6 +160,49 @@ def question_blocks(q: Question, idx: int, total: int) -> list[dict]:
          "text": "_채점과 해설은 회차를 마친 뒤 리포트에서 한 번에 봅니다_"}]},
     ]
     return blocks
+
+
+def research_blocks(topic: str, res, url: str | None) -> list[dict]:
+    """조사 리포트 안내 — 첫 문단 + 📄 링크 + 출제 버튼 (§10.8).
+
+    **본문 전체를 스레드에 쏟지 않는다.** 첫 문단은 프롬프트가 요약으로 쓰게 돼 있고,
+    나머지는 리포트가 받는다 — 링크는 "읽고 넘어갈 결론"이라는 신호이기도 하다.
+
+    출제 버튼은 자료가 실제로 남았을 때만 붙인다. 자료가 없으면 눌러도 근거 없는
+    회차가 되므로, 누를 수 있는 것처럼 보이게 두지 않는다.
+    """
+    head = (res.report or "").strip().split("\n\n")[0].strip()
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text",
+                                    "text": plain(f"🎓 {topic}", 150), "emoji": True}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": rich(head, 2500)}},
+    ]
+    notes = list(res.notes)
+    if res.sources:
+        notes.append(f"🔗 출처 {len(res.sources)}건 · 자료 {len(res.files)}개")
+    if notes:
+        blocks.append({"type": "context",
+                       "elements": [{"type": "mrkdwn", "text": "\n".join(notes)}]})
+    if url:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                       "text": f"📄 <{url}|전체 리포트 열기>"}})
+    if res.files:
+        blocks.append({"type": "actions", "block_id": "tutor_start_quiz", "elements": [
+            {"type": "button", "action_id": "tutor_answer_start_quiz", "style": "primary",
+             "text": {"type": "plain_text", "text": "🎯 이해도 확인", "emoji": True},
+             "value": START_QUIZ_VALUE}]})
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+                       "text": "_리포트를 읽고 나서 눌러 주세요 — 이 자료로 10문항을 냅니다_"}]})
+    return blocks
+
+
+def research_text(topic: str, res, url: str | None) -> str:
+    """블록을 못 그리는 클라이언트·알림 미리보기용 대체 텍스트."""
+    head = (res.report or "").strip().split("\n\n")[0].strip()
+    out = f"🎓 {topic}\n{head}"
+    if url:
+        out += f"\n📄 {url}"
+    return out
 
 
 def opening_blocks(repo_name: str, total: int, *, shortfall: bool, misses: int) -> list[dict]:
@@ -259,10 +320,13 @@ class TutorHandler:
     `publish`는 리포트 업로드 함수 (테스트에서 대역으로 바꾼다)."""
 
     def __init__(self, orch, cfg, repos: dict, *, react=None, status=None,
-                 publish=publish_report, max_seen: int = 1000):
+                 publish=publish_report, max_seen: int = 1000, corpus_root=None):
         self.orch = orch
         self.cfg = cfg
         self.repos = repos
+        # 회차 전용 자료가 사는 뿌리. **본체 저장소 아래**여야 한다 — worktree처럼
+        # 회수되는 공간에 두면 회차보다 자료가 먼저 사라진다 (lessons C13).
+        self.corpus_root = Path(corpus_root or DEFAULT_CORPUS_ROOT)
         self.react = react
         self.status = status
         self.publish = publish
@@ -274,6 +338,9 @@ class TutorHandler:
         self._lock = asyncio.Lock()
         self._ta_locks: dict[str, asyncio.Lock] = {}
         self._expired: set[str] = set()      # 만료 안내를 이미 보낸 스레드
+        # 조사만 끝나고 아직 출제하지 않은 스레드 (§10.8). 출제 버튼이 대상을 찾는
+        # 자리이고, 프로세스가 죽어도 `TOPIC_EVENT`로 되살린다.
+        self.topics: dict[str, dict] = {}
 
     # ── 진입점 ──────────────────────────────────────────────────────────────
     async def on_mention(self, body: dict, say) -> None:
@@ -288,11 +355,22 @@ class TutorHandler:
         except RepoRegistryError as e:
             await say(text=f"⚠️ {e}", thread_ts=thread_ts)
             return
-        if not repo_name:
-            await say(text=NEED_REPO.format(repos=format_repo_names(self.repos)),
-                      thread_ts=thread_ts)
-            return
         if thread_ts in self.sessions or thread_ts in self._opening:
+            return
+        if not repo_name:
+            # **주제 모드** (§10.8). 접두가 없으면 repo가 아니라 배우고 싶은 주제다 —
+            # 조사해서 학습 리포트를 내고, 출제는 그다음에 버튼으로 고르게 한다.
+            topic = _rest.strip()
+            if not topic:
+                await say(text=NEED_INPUT.format(repos=format_repo_names(self.repos)),
+                          thread_ts=thread_ts)
+                return
+            self._opening.add(thread_ts)
+            try:
+                await self._ack(event)
+                await self._research(thread_ts, channel, user, topic, say)
+            finally:
+                self._opening.discard(thread_ts)
             return
         self._opening.add(thread_ts)
         try:
@@ -304,6 +382,23 @@ class TutorHandler:
 
     async def on_answer(self, *, thread_ts: str, value: str, say, strip=None,
                         channel: str = "", user: str = "") -> None:
+        if value == START_QUIZ_VALUE:
+            # 조사 리포트의 출제 버튼 — 아직 회차가 없으므로 세션 조회보다 **앞**이다.
+            # 버튼은 먼저 걷는다: 출제는 수 분이 걸리고, 그동안 다시 눌리면 같은
+            # 스레드에 회차가 둘 열린다.
+            if thread_ts in self.sessions or thread_ts in self._opening:
+                return
+            self._opening.add(thread_ts)
+            try:
+                if strip:
+                    try:
+                        await strip()
+                    except Exception:
+                        pass
+                await self._start_from_topic(thread_ts, channel, user, say)
+            finally:
+                self._opening.discard(thread_ts)
+            return
         regrade = value == REGRADE_VALUE
         m = ANSWER_RE.match(value or "")
         if not m and not regrade:
@@ -395,7 +490,7 @@ class TutorHandler:
             # 틀린 설명이 된다. 메모리 세션이 살아 있어도 같은 규칙을 쓴다.
             await self._expire(thread_ts, say, sess=sess)
             return
-        repo_path = str(self.repos.get(sess.repo_name) or "")
+        repo_path = self.evidence_root(sess)
         if not repo_path:
             # 빈 경로는 조용히 넘어가지 않는다: `spawn(worktree="")`는 작업 디렉토리
             # 고정 블록을 건너뛰어 워커가 **엔진 프로세스의 cwd**(= 하네스 자기 repo)에서
@@ -523,7 +618,7 @@ class TutorHandler:
         추적은 별도 세션(TUTOR_CODE)이다 — TA 스키마에 스텝까지 담으면 큰 필드가 둘이
         되어 C15가 돌아오고, 실행 추적은 질문 답변과 다른 과업이라 프롬프트도 갈려야 한다.
         """
-        repo_path = str(self.repos.get(sess.repo_name) or "")
+        repo_path = self.evidence_root(sess)
         if not repo_path:
             return None
         try:
@@ -570,7 +665,122 @@ class TutorHandler:
         return "ta-" + hashlib.sha256(seed.encode()).hexdigest()[:10]
 
     # ── 회차 ────────────────────────────────────────────────────────────────
-    async def _start(self, thread_ts, channel, user, repo_name, say) -> None:
+    # ── 주제 모드 (§10.8) ───────────────────────────────────────────────────
+    async def _research(self, thread_ts, channel, user, topic, say) -> None:
+        """주제를 조사해 자료를 남기고 학습 리포트를 낸다. **출제는 하지 않는다.**
+
+        읽지 않은 자료로 시험을 보게 하지 않으려고 버튼으로 갈라 둔다 (§10.8 D2).
+        """
+        async def _tick(stage: str) -> None:
+            # **보이는 곳에 적는다.** `_set_status`는 AI 어시스턴트 스레드 전용이라
+            # 일반 채널에서는 조용히 실패한다 — 조사는 웹을 오가느라 길고, 그 침묵은
+            # 고장과 구분되지 않는다 (2026-08-24 출제에서 겪은 것과 같은 문제).
+            await self._set_status(channel, thread_ts, stage)
+            await say(text=f"⏳ {stage}", thread_ts=thread_ts)
+
+        if self._lock.locked():
+            await say(text="⏳ 다른 요청을 처리하는 중입니다. 끝나면 이어서 시작합니다.",
+                      thread_ts=thread_ts)
+        corpus = self.corpus_dir_for(thread_ts)
+        try:
+            async with self._lock:
+                res = await research(self.orch, self.cfg, exec_id=round_id(thread_ts),
+                                     topic=topic, corpus_dir=corpus, progress=_tick)
+        except ResearchError as e:
+            await say(text=f"💥 조사에 실패했습니다: {e}", thread_ts=thread_ts)
+            return
+        except Exception as e:
+            await say(text=f"💥 조사에 실패했습니다: {type(e).__name__}: {e}",
+                      thread_ts=thread_ts)
+            return
+
+        await _tick("리포트 만드는 중…")
+        html = render_research_report(
+            topic=topic, report=res.report, citations=res.citations,
+            sources=res.sources, files=res.files,
+            diagram=await self._diagram(thread_ts, res.diagram))
+        url = await asyncio.to_thread(self.publish, self._research_report_id(thread_ts),
+                                      html)
+        # **기록이 먼저다.** 안내를 먼저 보내고 기록에 실패하면 버튼이 대상을 못 찾는다
+        # (프로세스가 재시작되면 메모리 상태도 없다) — lessons C7.
+        try:
+            self.orch.trace.append(TOPIC_EVENT, task_id=round_id(thread_ts),
+                                   execution_id=round_id(thread_ts),
+                                   payload={"topic": topic, "corpus_dir": str(corpus),
+                                            "owner": user, "channel": channel,
+                                            "files": res.files, "url": url})
+        except Exception as e:
+            await say(text=f"💥 조사 결과 기록에 실패했습니다: {type(e).__name__}",
+                      thread_ts=thread_ts)
+            return
+        self.topics[thread_ts] = {"topic": topic, "corpus_dir": str(corpus),
+                                  "owner": user, "channel": channel}
+        await self._say_blocks(say, thread_ts,
+                               research_text(topic, res, url),
+                               research_blocks(topic, res, url))
+
+    async def _start_from_topic(self, thread_ts, channel, user, say) -> bool:
+        """조사한 자료로 회차를 연다 (출제 버튼). 대상을 못 찾으면 False.
+
+        메모리에 없으면 trace에서 되살린다 — 리포트를 읽는 동안 브리지가 재시작되면
+        버튼이 死문자가 되는데, 그건 사용자에게 "눌러도 아무 일이 없다"로만 보인다.
+        """
+        info = self.topics.get(thread_ts) or self._topic_from_trace(thread_ts)
+        if not info:
+            await say(text="⚠️ 이 스레드의 조사 자료를 찾지 못했습니다 — "
+                           "주제를 다시 알려주시면 새로 조사하겠습니다.", thread_ts=thread_ts)
+            return False
+        if info.get("owner") and user != info["owner"]:
+            await say(text=NOT_OWNER, thread_ts=thread_ts)
+            return False
+        corpus = info.get("corpus_dir") or ""
+        if not corpus or not Path(corpus).is_dir():
+            # 자료가 회수된 뒤다. 빈 경로로 출제하면 워커가 하네스 repo에서 뜨고
+            # 엉뚱한 인용이 '대조 통과'로 표시된다 — 그럴 바에는 열지 않는다.
+            await say(text="⚠️ 이 회차의 자료가 만료되어 문항을 낼 수 없습니다 — "
+                           "같은 주제로 새로 물어봐 주세요.", thread_ts=thread_ts)
+            return False
+        await self._set_status(channel, thread_ts, "출제 중…")
+        await self._start(thread_ts, channel, user, info["topic"], say,
+                          corpus_dir=corpus)
+        return True
+
+    def _topic_from_trace(self, thread_ts: str) -> dict | None:
+        try:
+            evs = self.orch.trace.events(event_type=TOPIC_EVENT,
+                                         execution_id=round_id(thread_ts))
+        except Exception:
+            return None
+        if not evs:
+            return None
+        last = evs[-1]
+        if time.time() - last["ts"] > ROUND_TTL:
+            return None
+        return last["payload"]
+
+    @staticmethod
+    def _research_report_id(thread_ts: str) -> str:
+        import hashlib
+        return "study-" + hashlib.sha256(f"study:{thread_ts}".encode()).hexdigest()[:10]
+
+    def corpus_dir_for(self, thread_ts: str) -> Path:
+        """이 회차의 자료 디렉토리. 회차 id와 1:1이라 정리도 이 이름으로 한다."""
+        return self.corpus_root / round_id(thread_ts)
+
+    def evidence_root(self, sess: QuizSession) -> str:
+        """이 회차의 근거가 사는 곳 — 주제 모드면 corpus, repo 모드면 registry.
+
+        **없으면 빈 문자열이다.** 빈 경로를 그대로 흘리면 `spawn(worktree="")`가
+        작업 디렉토리 고정을 건너뛰어 워커가 엔진 프로세스의 cwd(= 하네스 자기 repo)
+        에서 뜨고, 인용 대조까지 그 기준이 된다 — 틀린 근거가 '대조 통과'로 표시된다.
+        그래서 호출자는 빈 값을 반드시 거절 경로로 처리한다.
+        """
+        if sess.corpus_dir:
+            return sess.corpus_dir if Path(sess.corpus_dir).is_dir() else ""
+        return str(self.repos.get(sess.repo_name) or "")
+
+    async def _start(self, thread_ts, channel, user, repo_name, say,
+                     corpus_dir: str | None = None) -> None:
         note = note_id(user, repo_name)
         try:
             misses = open_misses(self.orch.trace, note)
@@ -596,7 +806,7 @@ class TutorHandler:
         try:
             async with self._lock:
                 res = await issue_quiz(self.orch, self.cfg, repo_name=repo_name,
-                                       repo_path=str(self.repos[repo_name]),
+                                       repo_path=corpus_dir or str(self.repos[repo_name]),
                                        exec_id=round_id(thread_ts), misses=misses,
                                        progress=_tick)
         except Exception as e:
@@ -619,7 +829,8 @@ class TutorHandler:
                                    execution_id=round_id(thread_ts),
                                    payload={"questions": [to_raw(q) for q in res.questions],
                                             "owner": user, "repo_name": repo_name,
-                                            "channel": channel})
+                                            "channel": channel,
+                                            "corpus_dir": corpus_dir})
         except Exception as e:
             await say(text=f"💥 회차 기록에 실패해 시작하지 않았습니다: {type(e).__name__}",
                       thread_ts=thread_ts)
@@ -630,7 +841,8 @@ class TutorHandler:
                                opening_text(repo_name, total, **opening),
                                opening_blocks(repo_name, total, **opening))
         sess = QuizSession(channel=channel, thread_ts=thread_ts, owner=user,
-                           repo_name=repo_name, questions=res.questions)
+                           repo_name=repo_name, questions=res.questions,
+                           corpus_dir=corpus_dir)
         self.sessions[thread_ts] = sess
         self.last_questions = res.questions
         await self._post_question(sess, 0, say)
@@ -786,6 +998,36 @@ class TutorHandler:
         "마지막 질문 뒤 아무도 안 묻는" 흔한 경우에 TTL이 무의미해진다.
         """
         await self._evict_ta()
+        self.sweep_corpus()
+
+    def sweep_corpus(self) -> list[str]:
+        """만료된 회차의 자료를 회수한다 → 지운 디렉토리 이름들 (§10.8).
+
+        **일회성이 전제다.** 주제 학습은 대개 한 번 읽고 끝이라, 안 지우면 최신화되지
+        않는 스냅샷만 무한히 쌓인다. 회차 자체가 `ROUND_TTL`에 닫히므로 자료의 수명도
+        거기 맞춘다 — 그 뒤 재출제를 시도하면 `verify_citations`가 근거를 폐기하고
+        새 문항이 나온다(fail-safe).
+
+        답변 중인 회차는 건드리지 않는다. TA는 이 자료를 근거로 읽고 있다.
+        """
+        if not self.corpus_root.is_dir():
+            return []
+        busy = {Path(s.corpus_dir).name for s in self.sessions.values()
+                if s.corpus_dir and s.ta_busy}
+        removed: list[str] = []
+        cutoff = time.time() - ROUND_TTL
+        for d in sorted(self.corpus_root.iterdir()):
+            if not d.is_dir() or d.name in busy:
+                continue
+            try:
+                if d.stat().st_mtime > cutoff:
+                    continue
+                shutil.rmtree(d)
+            except OSError:
+                # 정리 실패가 답변 경로를 죽이면 안 된다. 다음 주기에 다시 만난다.
+                continue
+            removed.append(d.name)
+        return removed
 
     async def _expire(self, thread_ts: str, say, sess: QuizSession | None = None) -> None:
         """만료된 회차를 닫는다 — 세션을 반납하고, 안내는 **회차당 한 번만**.
@@ -836,6 +1078,7 @@ class TutorHandler:
                            owner=payload.get("owner", ""),
                            repo_name=payload.get("repo_name", ""),
                            questions=questions, answers=answers,
+                           corpus_dir=payload.get("corpus_dir") or None,
                            started_at=last["ts"])
         # ROUND_GRADED_EVENT가 있으면 끝난 회차다. 이걸 복원하지 않으면 재시작 뒤에는
         # 채점이 끝난 스레드가 "진행 중"으로 보여 후속 질문이 거절된다.

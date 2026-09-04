@@ -78,7 +78,8 @@ def make_handler(tmp_path, repo, *, n=12, published=None, ta_answers=3):
         pub.append((task_id, html))
         return f"https://reports.example/{task_id}"
 
-    h = TutorHandler(orch, load_config(), {"myrepo": repo}, publish=publish)
+    h = TutorHandler(orch, load_config(), {"myrepo": repo}, publish=publish,
+                     corpus_root=tmp_path / "corpus")
     return h, trace, pub
 
 
@@ -184,11 +185,14 @@ async def test_stale_round_is_not_resumed(tmp_path, repo, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_repo_is_required(tmp_path, repo):
+async def test_bare_mention_explains_both_modes(tmp_path, repo):
+    """멘션만 하면 두 모드를 다 알려준다 — 접두 없는 문장은 이제 오류가 아니라
+    주제 학습이므로(§10.8), "repo를 지정하라"만 말하면 거짓 안내가 된다."""
     h, _, _ = make_handler(tmp_path, repo)
     say = SaySpy()
-    await h.on_mention(mention(text="<@U1> 아무 주제"), say)
-    assert "repo" in say.messages[-1]["text"]
+    await h.on_mention(mention(text="<@U1>   "), say)
+    text = say.messages[-1]["text"]
+    assert "주제" in text and "repo" in text
     assert h.sessions == {}
 
 
@@ -1527,3 +1531,183 @@ async def test_sweep_loop_survives_a_failing_sweep(tmp_path, repo):
     except asyncio.CancelledError:
         pass
     assert alive and len(calls) >= 2, f"루프가 죽었다 ({len(calls)}회 호출)"
+
+
+# ── 주제 모드 (§10.8) ────────────────────────────────────────────────────────
+def make_topic_handler(tmp_path, repo, *, n=12, report="핵심 요약 문단.\n\n본문 이어짐."):
+    """조사 → 출제 순서로 응답을 깔아 둔 핸들러. 자료 파일은 워커 대신 테스트가 쓴다
+    (FakeAdapter는 파일을 만들지 않는다)."""
+    trace = TraceStore(tmp_path / "t.db")
+    author = Scripted([
+        {"status": "PASS", "summary": "조사", "report": report,
+         "sources": [{"url": "https://example.org/spec", "title": "스펙"}],
+         "citations": [{"path": "01.md", "start_line": 1, "end_line": 1,
+                        "quote": "자료 문장 1"}], "diagram": None},
+        {"status": "PASS", "summary": "s",
+         "questions": [_q(i, start=i + 1) for i in range(n)]},
+        {"answer": "후속 답변.", "citations": []},
+    ])
+    verifier = Scripted([{"status": "PASS", "summary": "v",
+                          "verdicts": [{"index": i, "verdict": "PASS", "reason": "ok"}
+                                       for i in range(n)]}])
+    orch = Orchestrator(trace, SessionRegistry(tmp_path / "h.db"),
+                        {Provider.CLAUDE_CODE: author, Provider.CODEX: verifier})
+    from devcrew.slack_tutor import TutorHandler
+    pub = []
+    h = TutorHandler(orch, load_config(), {"myrepo": repo},
+                     publish=lambda tid, html: (pub.append((tid, html)),
+                                                f"https://reports.example/{tid}")[1],
+                     corpus_root=tmp_path / "corpus")
+    return h, trace, pub
+
+
+def seed_corpus(h, thread_ts="100.1", *, lines=40):
+    """워커가 저장했을 자료. 출제 evidence(`a.py`)와 조사 인용(`01.md`) 양쪽을 채운다."""
+    d = h.corpus_dir_for(thread_ts)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "01.md").write_text("\n".join(f"자료 문장 {i}" for i in range(1, 10)) + "\n")
+    (d / "a.py").write_text("\n".join(f"line{i}" for i in range(1, lines)) + "\n")
+    return d
+
+
+@pytest.mark.asyncio
+async def test_topic_mention_researches_and_offers_the_quiz_button(tmp_path, repo):
+    """접두 없는 문장 = 주제 학습. **출제는 하지 않고** 리포트와 버튼을 낸다 (D2)."""
+    h, _, pub = make_topic_handler(tmp_path, repo)
+    seed_corpus(h)
+    say = SaySpy()
+
+    await h.on_mention(mention(text="<@U1> Kafka 리밸런싱"), say)
+
+    last = say.messages[-1]
+    assert "핵심 요약 문단" in last["text"]           # 첫 문단만 스레드에 남는다
+    assert "본문 이어짐" not in last["text"]          # 나머지는 리포트로
+    assert "https://reports.example/" in last["text"]
+    assert [b["value"] for b in buttons_of(last)] == ["__START_QUIZ__"]
+    assert h.sessions == {}                            # 아직 회차가 아니다
+    assert pub and "출처" in pub[-1][1]                # 리포트에 출처 절이 있다
+
+
+@pytest.mark.asyncio
+async def test_quiz_button_issues_from_the_corpus_not_a_repo(tmp_path, repo, monkeypatch):
+    """**배선 테스트** — 버튼이 누른 회차의 근거가 corpus 디렉토리여야 한다.
+
+    여기서 registry 경로가 새면 학습자는 방금 조사한 주제 대신 엉뚱한 repo로 시험을
+    본다. 값이 러너→핸들러→파이프라인으로 흐르는지 실제 호출 인자로 고정한다.
+    """
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_topic_handler(tmp_path, repo)
+    corpus = seed_corpus(h)
+    say = SaySpy()
+    await h.on_mention(mention(text="<@U1> Kafka 리밸런싱"), say)
+
+    seen = {}
+    real = st.issue_quiz
+
+    async def spy(*a, **kw):
+        seen.update(kw)
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(st, "issue_quiz", spy)
+    await h.on_answer(thread_ts="100.1", value="__START_QUIZ__", say=say,
+                      user="U-OWNER", channel="C1")
+
+    assert seen["repo_path"] == str(corpus)            # registry가 아니라 corpus
+    assert "1 / 10" in say.messages[-1]["text"]        # 회차가 실제로 열렸다
+    assert h.sessions["100.1"].corpus_dir == str(corpus)
+
+
+@pytest.mark.asyncio
+async def test_quiz_button_is_owner_only(tmp_path, repo):
+    h, _, _ = make_topic_handler(tmp_path, repo)
+    seed_corpus(h)
+    say = SaySpy()
+    await h.on_mention(mention(text="<@U1> 주제"), say)
+    await h.on_answer(thread_ts="100.1", value="__START_QUIZ__", say=say,
+                      user="U-STRANGER", channel="C1")
+    assert "시작한 사람만" in say.messages[-1]["text"]
+    assert h.sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_quiz_button_refuses_when_the_corpus_is_gone(tmp_path, repo):
+    """자료가 회수된 뒤 빈 경로로 출제하면 워커가 하네스 repo에서 뜨고 엉뚱한 인용이
+    '대조 통과'로 표시된다 — 그럴 바에는 열지 않는다."""
+    import shutil
+
+    h, _, _ = make_topic_handler(tmp_path, repo)
+    corpus = seed_corpus(h)
+    say = SaySpy()
+    await h.on_mention(mention(text="<@U1> 주제"), say)
+    shutil.rmtree(corpus)
+
+    await h.on_answer(thread_ts="100.1", value="__START_QUIZ__", say=say,
+                      user="U-OWNER", channel="C1")
+    assert "만료" in say.messages[-1]["text"]
+    assert h.sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_quiz_button_survives_a_restart_via_trace(tmp_path, repo):
+    """리포트를 읽는 동안 브리지가 재시작되면 메모리 상태가 없다 — 버튼이 死문자가
+    되면 사용자에게는 '눌러도 아무 일이 없다'로만 보인다."""
+    h, _, _ = make_topic_handler(tmp_path, repo)
+    corpus = seed_corpus(h)
+    say = SaySpy()
+    await h.on_mention(mention(text="<@U1> 주제"), say)
+
+    h.topics.clear()                                   # 프로세스 재시작 흉내
+    await h.on_answer(thread_ts="100.1", value="__START_QUIZ__", say=say,
+                      user="U-OWNER", channel="C1")
+    assert h.sessions["100.1"].corpus_dir == str(corpus)
+
+
+@pytest.mark.asyncio
+async def test_followup_answers_from_the_corpus(tmp_path, repo, monkeypatch):
+    """채점 뒤 후속 질문의 근거도 corpus다 — registry로 풀면 대상이 통째로 바뀐다."""
+    import devcrew.slack_tutor as st
+
+    h, _, _ = make_topic_handler(tmp_path, repo)
+    corpus = seed_corpus(h)
+    say = SaySpy()
+    await h.on_mention(mention(text="<@U1> 주제"), say)
+    await h.on_answer(thread_ts="100.1", value="__START_QUIZ__", say=say,
+                      user="U-OWNER", channel="C1")
+    await answer_all(h, say, correct=10)
+
+    seen = {}
+    real = st.ask
+
+    async def spy(*a, **kw):
+        seen.update(kw)
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(st, "ask", spy)
+    await h.on_question(thread_ts="100.1", text="왜 그런가?", say=say,
+                        user="U-OWNER", channel="C1")
+    assert seen["repo_path"] == str(corpus)
+
+
+def test_sweep_corpus_removes_expired_but_keeps_busy_rounds(tmp_path, repo):
+    """일회성이 전제다 — 안 지우면 최신화되지 않는 스냅샷만 쌓인다. 다만 답변 중인
+    회차의 자료는 TA가 지금 읽고 있으므로 건드리지 않는다."""
+    import os
+
+    from devcrew.slack_tutor import QuizSession
+
+    h, _, _ = make_topic_handler(tmp_path, repo)
+    fresh = seed_corpus(h, "200.1")
+    stale = seed_corpus(h, "300.1")
+    busy = seed_corpus(h, "400.1")
+    old = time.time() - 30 * 3600
+    for d in (stale, busy):
+        os.utime(d, (old, old))
+    h.sessions["400.1"] = QuizSession(channel="C1", thread_ts="400.1", owner="U",
+                                      repo_name="주제", questions=[],
+                                      corpus_dir=str(busy), ta_busy=True)
+
+    removed = h.sweep_corpus()
+
+    assert removed == ["QUIZ-300.1"]
+    assert fresh.is_dir() and busy.is_dir() and not stale.exists()

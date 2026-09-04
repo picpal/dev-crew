@@ -1,0 +1,84 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "sources",
+    "citations",
+    "diagram",
+    "report"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "NOT_PASS",
+        "NEED_REPLAN",
+        "BLOCKED",
+        "INSUFFICIENT_CAPABILITY"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "sources": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "url",
+          "title"
+        ],
+        "properties": {
+          "url": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "citations": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "start_line",
+          "end_line",
+          "quote"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "start_line": {
+            "type": "integer"
+          },
+          "end_line": {
+            "type": "integer"
+          },
+          "quote": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "diagram": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "report": {
+      "type": "string"
+    }
+  }
+}

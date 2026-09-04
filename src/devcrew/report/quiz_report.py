@@ -310,6 +310,17 @@ _TA_CSS = """
    꽉 차면 흰 덩어리가 테두리에 붙는다. 여백을 줘 도판처럼 앉힌다. */
 .fig{margin:0;padding:6px}
 .fig svg{display:block;width:100%;height:auto;max-width:100%;border-radius:6px}
+/* 조사 리포트 — 출처와 자료 목록 */
+.src{margin:0;padding:0;list-style:none}
+.src li{margin:.35em 0;line-height:1.5}
+.src a{color:var(--accent);text-decoration:none;overflow-wrap:anywhere}
+.src a:hover{text-decoration:underline}
+.src .host{color:var(--ink-3);font-size:.86rem}
+.files{margin:0;padding:0;list-style:none;
+  display:flex;flex-wrap:wrap;gap:.4em}
+.files li{font-size:.86rem;color:var(--ink-2);background:var(--surface-2);
+  border:1px solid var(--line);border-radius:6px;padding:.15em .6em}
+.caveat{margin:0;color:var(--ink-3);font-size:.9rem;line-height:1.6}
 """
 
 
@@ -354,5 +365,78 @@ def render_ta_answer(*, question: str, answer: str,
 {fig}
 <section class="card"><div class="ta-prose">{body}</div></section>
 {cites}
+</main>
+</body></html>"""
+
+
+# 하네스가 무엇을 보증하고 무엇을 보증하지 못하는지 화면에 적는다 (§10.8 D4).
+# 근거가 코드였을 때는 코드가 곧 사실이었지만, 수집 자료는 **파일에 있다 ≠ 참이다** —
+# 이걸 안 적으면 기계 대조를 통과한 인용이 사실 검증을 통과한 것처럼 읽힌다.
+RESEARCH_CAVEAT = ("하네스는 인용한 문장이 수집 자료에 <strong>실재하는지</strong>만 "
+                   "기계로 대조한다. 자료 내용 자체가 참인지는 검증하지 못하므로, "
+                   "중요한 판단은 아래 출처에서 직접 확인하라.")
+
+
+def _host(url: str) -> str:
+    """URL의 호스트만 — 링크 옆에 출처를 한눈에 보이게. 파싱 실패는 빈 문자열."""
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).netloc or ""
+    except ValueError:
+        return ""
+
+
+def render_research_report(*, topic: str, report: str, citations, sources,
+                           files=None, diagram: str | None = None) -> str:
+    """주제 조사 리포트 → 단일 파일 HTML (§10.8).
+
+    `render_ta_answer`와 같은 뼈대를 쓰되 두 가지가 다르다: **출처**를 싣고,
+    하네스가 무엇을 보증하지 않는지 명시한다. 근거가 repo 코드가 아니라 웹에서
+    모은 자료이기 때문이다.
+
+    `sources`의 URL은 `tutor_research.parse_sources`가 http(s)로 이미 걸렀다 —
+    여기서는 escape만 한다(이중 방어).
+    """
+    body = md_lite(_SINGLE_BOLD_RE.sub(r"**\1**", report or "")) \
+        or '<p class="empty">리포트 본문이 비어 있습니다.</p>'
+    evi = "".join(
+        f'<div class="evi"><div class="evi-at">'
+        f'{_e(c.path)}:{c.start_line}–{c.end_line}</div>'
+        f'<div class="evi-quote{_prose(c.path)}">{_e(c.quote)}</div></div>'
+        for c in (citations or []))
+    cites = (f'<section class="card"><h2 class="panel-title">근거</h2>{evi}</section>'
+             if evi else "")
+    links = "".join(
+        f'<li><a href="{_e(s["url"])}" target="_blank" rel="noopener noreferrer">'
+        f'{_e(s["title"])}</a>'
+        + (f' <span class="host">{_e(_host(s["url"]))}</span>' if _host(s["url"]) else "")
+        + "</li>"
+        for s in (sources or []) if isinstance(s, dict) and s.get("url"))
+    src = (f'<section class="card"><h2 class="panel-title">출처</h2>'
+           f'<ul class="src">{links}</ul>'
+           f'<p class="caveat">{RESEARCH_CAVEAT}</p></section>'
+           if links else
+           f'<section class="card"><p class="caveat">{RESEARCH_CAVEAT}</p></section>')
+    kept = "".join(f"<li>{_e(f)}</li>" for f in (files or []))
+    corpus = (f'<section class="card"><h2 class="panel-title">이 회차의 자료</h2>'
+              f'<ul class="files">{kept}</ul></section>' if kept else "")
+    # **이미 살균된 SVG만 온다** (`tutor_vis.extract_svg`) — escape하면 날문자가 된다.
+    fig = (f'<section class="card"><figure class="fig">{diagram}</figure></section>'
+           if diagram else "")
+    return f"""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>학습 조사</title><style>{_CSS}{_TA_CSS}</style></head><body>
+<main class="page">
+<header class="masthead">
+  <p class="eyebrow">dev-crew · 학습 조사</p>
+  <h1>{_e(topic)}</h1>
+</header>
+{fig}
+<section class="card"><div class="ta-prose">{body}</div></section>
+{cites}
+{corpus}
+{src}
 </main>
 </body></html>"""

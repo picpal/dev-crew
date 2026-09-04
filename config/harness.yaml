@@ -26,6 +26,9 @@ roleDefaults:
   TUTOR_CODE:     { tier: HIGH_CAPABILITY }
   # 무엇을 그릴지는 이미 정해져서 온다 — 그리기 자체는 어려운 과업이 아니다.
   TUTOR_VIS:      { tier: DEFAULT }
+  # 조사 + 자료 재구성 + 리포트 집필이 한 세션이다. 출제만큼 무거운 과업이고,
+  # 여기서 나온 자료가 이후 모든 근거라 품질이 아래로 전파된다 (§10.8).
+  TUTOR_RESEARCH: { tier: HIGH_CAPABILITY }
 
 # §10.3 loop guard — Task 실패가 아니라 결정 지점 진입 조건
 loopPolicy:

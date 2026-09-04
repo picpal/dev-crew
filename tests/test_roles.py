@@ -184,7 +184,10 @@ def test_long_text_field_is_last_property():
     longest = {Role.TUTOR_TA: "answer", Role.EXPLORER: "findings",
                Role.DEVELOPER: "tests", Role.REVIEWER: "findings",
                Role.QA: "results", Role.TUTOR: "questions",
-               Role.TUTOR_VERIFIER: "verdicts", Role.ORCHESTRATOR: "report"}
+               Role.TUTOR_VERIFIER: "verdicts", Role.ORCHESTRATOR: "report",
+               # 조사 리포트는 본문이 수천 자다 — sources·citations가 뒤에 있으면
+               # 통째로 흡수돼 출처와 근거를 잃는다.
+               Role.TUTOR_RESEARCH: "report"}
     for role, field in longest.items():
         props = list(load_bundle(role).schema["properties"])
         assert props[-1] == field, (
@@ -266,3 +269,44 @@ def test_tutor_vis_can_write_but_never_into_a_repo():
         assert not pol.scoped_write_tools
         assert "Write" not in pol.allowed_tools
         assert "Bash" not in pol.allowed_tools
+
+
+# ── TUTOR_RESEARCH ──────────────────────────────────────────────────────────
+def test_only_the_research_role_can_reach_the_web():
+    """웹 접근은 **한 role에만** 있다 (§10.8).
+
+    web 도구는 경로 게이트가 볼 인자가 없어 allowlist에 통째로 들어간다 — 즉 준
+    role은 무엇이든 가져올 수 있고, 가져온 내용은 다음 role의 프롬프트로 흘러간다.
+    role을 늘리다 실수로 퍼지면 신뢰 경계가 조용히 사라지므로 enum 전수로 고정한다.
+    """
+    from devcrew.enforcement import ROLE_POLICY
+    from devcrew.schema import Role
+
+    web = {"WebSearch", "WebFetch"}
+    with_web = {r for r in Role if web & set(ROLE_POLICY[r].allowed_tools)}
+    assert with_web == {Role.TUTOR_RESEARCH}
+
+
+def test_research_role_writes_but_gets_no_shell():
+    """자료를 파일로 남겨야 하므로 쓰기는 필요하다. Bash는 필요 없다 —
+    cwd가 하네스가 만든 corpus 디렉토리라 쓰기는 거기 갇히지만, Bash는
+    경로 게이트가 걸리지 않아(콜백이 인자를 못 본다) 격리를 통째로 무른다."""
+    from devcrew.enforcement import ROLE_POLICY
+    from devcrew.schema import Role
+
+    p = ROLE_POLICY[Role.TUTOR_RESEARCH]
+    assert set(p.scoped_write_tools) == {"Write", "Edit"}
+    assert not any(t.startswith("Bash") for t in p.allowed_tools)
+    assert p.skills == []          # 스킬 없음 → setting_sources는 []
+
+
+def test_research_schema_carries_sources_and_citations():
+    from devcrew.roles import load_bundle
+    from devcrew.schema import Role
+
+    schema = load_bundle(Role.TUTOR_RESEARCH).schema
+    assert set(schema["required"]) == set(schema["properties"])
+    src = schema["properties"]["sources"]["items"]
+    assert set(src["required"]) == {"url", "title"}
+    cit = schema["properties"]["citations"]["items"]
+    assert set(cit["required"]) == {"path", "start_line", "end_line", "quote"}

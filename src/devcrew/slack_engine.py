@@ -261,6 +261,9 @@ class EngineRunner:
         self.cfg = cfg
         self.mcp = {"harness": build_harness_mcp(self.trace)}
         self.timeout = float(os.environ.get("DEVCREW_TASK_TIMEOUT", "600"))
+        # 주제 학습(§10.8)의 회차 전용 자료. **runtime 디렉토리 아래**다 — repo도
+        # worktree도 아니라서 registry·병합과 무관하고, 회차가 만료되면 회수된다.
+        self.corpus_root = rt / "corpus"
         # **재바인딩하지 않는다.** 이 두 객체는 그대로 brain·tutor 핸들러에 넘어간다
         # (`SharedRegistry` 참고) — 갱신은 `replace_all`로 제자리에서 한다.
         self.repos = SharedRegistry(load_repos())
@@ -581,12 +584,28 @@ def make_tutor_say(client, channel: str, thread):
     return say
 
 
+def build_tutor_handler(runner, *, react=None, status=None):
+    """러너 → TutorHandler. **클로저 밖**에 둔다 — `_amain` 안에서 조립하면 인자
+    하나가 빠져도 테스트가 닿지 않아 전부 초록이다 (lessons C1: `slack_posters`·
+    `make_crew_dispatch`를 같은 이유로 꺼냈다).
+
+    `corpus_root`가 빠지면 주제 학습 자료가 기본값(상대경로)대로 브리지의 cwd에
+    쌓인다 — 조용히 틀린 자리에 쌓이고 정리도 그 기준으로 돈다.
+    """
+    from .slack_tutor import TutorHandler
+    return TutorHandler(runner.orch, runner.cfg, runner.repos,
+                        react=react, status=status,
+                        corpus_root=runner.corpus_root)
+
+
 def make_tutor_action(tutor, client):
     """@tutor 버튼 클릭 핸들러. **클로저 밖**에 둔다 — `_amain` 안에 두면 배선이
     통째로 사라져도 테스트가 전부 초록이다 (lessons.md C1).
 
     고른 보기를 원 메시지에 남기고 버튼은 걷는다. 정오는 표시하지 않는다 —
     채점은 회차 끝에 한 번에 한다."""
+    from .slack_tutor import START_QUIZ_VALUE      # 지연 import — 모듈 최상단은 slack 의존을 늦춘다
+
     async def on_action(body: dict) -> None:
         ch = body["channel"]["id"]
         msg = body.get("message") or {}
@@ -598,6 +617,8 @@ def make_tutor_action(tutor, client):
         async def strip():
             if ":" in value:
                 mark = f"✅ 선택: {chr(65 + int(value.split(':')[1]))}"
+            elif value == START_QUIZ_VALUE:
+                mark = "🎯 이해도 확인 — 출제 중…"   # 조사 리포트의 출제 버튼 (§10.8)
             else:
                 mark = "🔁 다시 채점 중"        # 재채점은 보기 선택이 아니다
             await client.chat_update(
@@ -998,7 +1019,7 @@ async def _amain() -> None:
     tutor_bot = _real_token(os.environ.get("TUTOR_BOT_TOKEN"), "xoxb-")
     tutor_app_token = _real_token(os.environ.get("TUTOR_APP_TOKEN"), "xapp-")
     if tutor_bot and tutor_app_token:
-        from .slack_tutor import TutorHandler, sweep_loop
+        from .slack_tutor import sweep_loop
 
         tutor_app = AsyncApp(token=tutor_bot)
 
@@ -1010,8 +1031,7 @@ async def _amain() -> None:
             await tutor_app.client.assistant_threads_setStatus(
                 channel_id=channel, thread_ts=thread_ts, status=text)
 
-        tutor = TutorHandler(runner.orch, runner.cfg, runner.repos,
-                             react=tutor_react, status=tutor_status)
+        tutor = build_tutor_handler(runner, react=tutor_react, status=tutor_status)
         tutor_action = make_tutor_action(tutor, tutor_app.client)
         tutor_question = make_tutor_question(tutor, tutor_app.client)
         # 같은 라우터 인스턴스를 넘긴다 — 중복 차단 상태를 공유해야 app_mention과

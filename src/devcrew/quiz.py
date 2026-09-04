@@ -262,6 +262,9 @@ ROUND_GRADED_EVENT = "QuizRoundGradedEvent"
 AUTHOR_FAILED_EVENT = "QuizAuthorFailedEvent"
 # 리포트 발행이 실패한 사유. 같은 이유로 남긴다 (2026-08-24 16:29 실제 실패).
 REPORT_FAILED_EVENT = "QuizReportFailedEvent"
+# 주제 조사가 끝나 자료가 corpus 디렉토리에 남았다 (§10.8). 출제 버튼은 이 이벤트로
+# 대상을 찾으므로, 남기지 않으면 프로세스가 재시작된 뒤 버튼이 死문자가 된다.
+TOPIC_EVENT = "TutorTopicResearchedEvent"
 
 
 def note_id(user: str, repo: str) -> str:

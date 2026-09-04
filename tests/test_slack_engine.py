@@ -1222,6 +1222,23 @@ async def _noop_dispatch(task, channel, interview_link):
     return None
 
 
+def test_corpus_root_reaches_the_tutor_handler(tmp_path, monkeypatch):
+    """주제 학습 자료는 **runtime 디렉토리 아래**여야 한다 (§10.8).
+
+    기본값은 상대경로 `.devcrew-runtime/corpus`라, 러너가 안 넘기면 브리지의 cwd에
+    따라 자료가 엉뚱한 곳(worktree일 수도 있다 — lessons C13)에 쌓이고 정리도 그
+    기준으로 돈다. 생성자 인자 하나가 빠져도 테스트는 전부 초록이므로 여기서 고정한다.
+    """
+    from devcrew.slack_engine import EngineRunner, build_tutor_handler
+
+    _repo_env(tmp_path, monkeypatch)
+    runner = EngineRunner(runtime_dir=tmp_path / "rt")
+    tutor = build_tutor_handler(runner)      # 브리지가 실제로 부르는 그 함수
+
+    assert runner.corpus_root == tmp_path / "rt" / "corpus"
+    assert tutor.corpus_dir_for("100.1") == tmp_path / "rt" / "corpus" / "QUIZ-100.1"
+
+
 # ── 생성 버튼 클릭 ───────────────────────────────────────────────────────────
 class _ClickRunner:
     """handle_create_repo_click이 러너에게 기대하는 표면만 가진 대역."""

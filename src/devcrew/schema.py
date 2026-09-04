@@ -39,6 +39,9 @@ class Role(str, enum.Enum):
     # 리포트용 다이어그램 — `vision` 스킬로 그린다. **격리된 임시 디렉토리**에서만
     # 돌아서 쓰기를 줘도 사용자 repo가 더러워지지 않는다.
     TUTOR_VIS = "TUTOR_VIS"
+    # 주제 조사 — 유일하게 **웹에 나가는** role (§10.8). repo가 아니라 회차 전용
+    # corpus 디렉토리에 자료를 저장하고, 그 자료에 근거한 학습 리포트를 쓴다.
+    TUTOR_RESEARCH = "TUTOR_RESEARCH"
 
 
 class InstanceStatus(str, enum.Enum):

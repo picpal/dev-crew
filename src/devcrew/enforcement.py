@@ -63,6 +63,15 @@ ROLE_POLICY: dict[Role, RolePolicy] = {
         allowed_tools=["Bash"], scoped_read_tools=list(_READ_TOOLS),
         scoped_write_tools=list(_WRITE_TOOLS),
         permission_mode="acceptEdits", skills=["vision"]),
+    # 유일하게 **웹에 나가는** role (§10.8). `WebSearch`/`WebFetch`는 경로 인자가
+    # 없어 경로 게이트가 볼 것이 없다 — allowlist에 통째로 적는 것이 맞다.
+    # 쓰기를 주지만 **cwd가 사용자 repo가 아니다**: 하네스가 회차마다 만든 corpus
+    # 디렉토리를 cwd·workspace_root으로 받는다 (TUTOR_VIS와 같은 격리, 불변조건 3).
+    Role.TUTOR_RESEARCH: RolePolicy(
+        allowed_tools=["WebSearch", "WebFetch"],
+        scoped_read_tools=list(_READ_TOOLS),
+        scoped_write_tools=list(_WRITE_TOOLS),
+        permission_mode="acceptEdits"),
 }
 
 

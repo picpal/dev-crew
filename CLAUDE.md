@@ -63,6 +63,7 @@ resolve_unknown_repo`)이 처리한다. `이름:` 접두가 registry에 없을 �
 | `slack_tutor.py` | tutor 봇 — 학습 회차, 문항 진행, 채점 발행 |
 | `quiz.py` `tutor.py` | 문항 모델·인용 대조·채점·오답 노트 / 출제 파이프라인 |
 | `tutor_ta.py` `tutor_code.py` | 후속 질문 답변 / 코드 실행 흐름 추적 (좌우 분할 리포트) |
+| `tutor_research.py` | 주제 조사 — 웹에서 자료를 모아 **회차 전용 corpus**에 저장하고 학습 리포트를 쓴다 (§10.8) |
 | `tutor_vis.py` | 리포트 다이어그램 — `vision` 스킬 호출, SVG 추출·살균·**테마 토큰 매핑** |
 | `store/trace.py` | append-only 이벤트(진실) + projection. `store/registry.py` = 세션 레지스트리 |
 | `usage.py` | 컨텍스트 점유 실측/표기 |
@@ -88,7 +89,9 @@ resolve_unknown_repo`)이 처리한다. `이름:` 접두가 registry에 없을 �
    `.claude/settings.json`(훅 포함)과 CLAUDE.md가 role 프롬프트를 덮어쓰는 주입
    표면이 된다. **쓰기가 필요한 스킬을 쓰는 role은 cwd가 repo면 안 된다** —
    tutor role은 worktree가 아니라 사용자의 **실제 repo**를 cwd로 받기 때문에,
-   `TUTOR_VIS`만 임시 디렉토리에서 돌린다(`tutor_vis.draw`).
+   `TUTOR_VIS`만 임시 디렉토리에서 돌린다(`tutor_vis.draw`). `TUTOR_RESEARCH`도
+   같은 이유로 repo가 아니라 **회차 전용 corpus 디렉토리**를 cwd로 받는다 — 쓰기와
+   웹 접근을 동시에 가진 유일한 role이라 격리가 더 중요하다.
 
 4. **워커의 읽기·쓰기는 자기 작업 공간 안으로 제한.** `enforcement.make_can_use_tool`의
    경로 게이트. **`allowed_tools`에 통째로 적은 도구는 콜백을 건너뛴다** — SDK가 그
@@ -195,6 +198,7 @@ uv run python -u -m devcrew.slack_engine   # 브리지 (env 필요)
 | *🛠 crew에 전달* 버튼 | brain이 "남은 결정 없음"을 선언한 turn에만 뜬다. 타이핑 `전달`과 같은 경로 |
 | `@brain /clear` | 인터뷰 세션 정리 |
 | `@tutor <repo>:` | 그 repo에 대한 10문항 학습 회차 시작 (버튼으로 응답) |
+| `@tutor <주제 문장>` | **주제 학습** — 웹을 조사해 자료를 모으고 학습 리포트를 낸다. 출제는 리포트 아래 *🎯 이해도 확인* 버튼으로 (§10.8) |
 | `@tutor` 스레드에 답글·멘션 | 채점 후 후속 질문. `TUTOR_TA`가 repo를 읽고 근거를 달아 답한다 |
 | 그중 **코드 실행** 질문 | `TUTOR_CODE`가 좌: 코드 / 우: 스텝별 변수 상태 리포트를 만든다 (2초에 한 칸) |
 | 그림이 말이 되는 질문 | tutor가 `diagram`에 무엇을 그릴지 적으면 `TUTOR_VIS`가 `vision` 스킬로 그려 리포트에 싣는다 |
