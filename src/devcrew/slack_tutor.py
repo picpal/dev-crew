@@ -54,10 +54,6 @@ REGRADE_VALUE = "__REGRADE__"   # 채점 실패 후 다시 채점하는 버튼�
 START_QUIZ_VALUE = "__START_QUIZ__"
 # 회차 전용 자료가 사는 곳. repo가 아니므로 registry·worktree·병합과 무관하다.
 DEFAULT_CORPUS_ROOT = Path(".devcrew-runtime") / "corpus"
-# 조사 중 진행 표시를 다시 그리는 주기. 조사 한 단계가 실측 10분인데 그동안 글자가
-# 한 번도 안 바뀌면 **멈춘 것과 구분되지 않는다** (2026-09-04: 사용자가 두 번 그렇게
-# 읽었다). 경과 시간과 저장된 자료 수는 하네스가 직접 세므로 워커를 방해하지 않는다.
-HEARTBEAT_INTERVAL = 20.0
 LETTERS = "ABCDEFGH"
 BAR_FULL, BAR_EMPTY = "▰", "▱"
 TYPE_HINT = {"CORRECT": ("✅", "옳은 것"), "INCORRECT": ("⛔", "틀린 것")}
@@ -78,6 +74,23 @@ TA_BUSY = "⏳ 앞선 질문에 답하는 중입니다. 끝나면 이어서 답�
 TA_FAIL = "💥 답변에 실패했습니다: {reason}. 같은 질문을 다시 물어봐 주세요."
 NO_REPO = ("⚠️ 이 회차의 repo `{repo}` 를 더 이상 찾을 수 없어 답하지 않습니다 — "
            "다른 repo의 코드를 근거로 답하게 됩니다.\n등록된 repo: {repos}")
+
+
+def response_ts(res) -> str | None:
+    """Slack 게시 응답에서 메시지 `ts`를 꺼낸다. 못 꺼내면 None.
+
+    `chat_postMessage`가 돌려주는 것은 dict가 아니라 `AsyncSlackResponse`다 —
+    `isinstance(res, dict)`로 거르면 **항상 거짓**이라 갱신 경로가 통째로 죽고
+    단계마다 새 메시지가 쌓인다. 테스트 대역이 dict를 돌려주면 그 결함이 초록으로
+    남는다 (2026-09-04, lessons C1: 대역이 실물 계약과 달랐다).
+    """
+    data = getattr(res, "data", res)
+    if isinstance(data, dict):
+        return data.get("ts")
+    try:
+        return res["ts"]
+    except Exception:
+        return None
 
 
 def round_id(thread_ts: str) -> str:
@@ -696,10 +709,10 @@ class TutorHandler:
         단계마다 새 메시지를 쌓으면 스레드가 회차 내용보다 진행 로그로 길어지고,
         끝난 뒤에도 남는다. 마지막에는 이 메시지가 그대로 결과 카드가 된다.
 
-        `refresh=True`는 **같은 단계를 다시 그린다** — 경과 시간과 지금까지 저장된
-        자료 수를 붙여서. 조사 한 단계가 10분인데 글자가 안 바뀌면 멈춘 것과
-        구분되지 않는다. 이 수치는 하네스가 시계와 디렉토리에서 직접 읽으므로
-        워커에게 묻지 않는다 (모델 주장과 실제가 갈릴 여지도 없다).
+        갱신은 **단계가 바뀔 때만** 한다. 주기적으로 다시 그려 봤지만 사용자에게는
+        잡음이었다 (2026-09-04 사용자 결정) — 진행 표시는 지금 무엇을 하는 중인지
+        한 줄이면 족하다. 경과 시간과 저장된 자료 수는 하네스가 시계와 디렉토리에서
+        직접 읽어 붙인다(모델 주장과 실제가 갈릴 여지가 없다).
 
         `update`가 없거나 실패하면 새 메시지를 올리는 종전 동작으로 떨어진다 —
         진행이 안 보이는 것이 중복보다 나쁘다 (침묵은 고장과 구분되지 않는다).
@@ -732,21 +745,10 @@ class TutorHandler:
                 except Exception:
                     pass
             res = await self._say_blocks(say, thread_ts, body, blocks)
-            if state["ts"] is None and isinstance(res, dict):
-                state["ts"] = res.get("ts")
+            if state["ts"] is None:
+                state["ts"] = response_ts(res)
 
         return tick
-
-    async def _beat(self, tick, interval: float = HEARTBEAT_INTERVAL) -> None:
-        """진행 표시를 주기적으로 다시 그린다. 취소될 때까지 돈다.
-
-        갱신 실패는 삼킨다 — 곁다리가 본 작업을 죽이면 안 된다."""
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await tick(refresh=True)
-            except Exception:
-                pass
 
     async def _research(self, thread_ts, channel, user, topic, say) -> None:
         """주제 조사 — 진행 표시를 살려 둔 채 본 작업을 돌린다.
@@ -760,12 +762,8 @@ class TutorHandler:
         # 구분되지 않는다 (2026-08-24 출제에서 겪은 것과 같은 문제).
         corpus = self.corpus_dir_for(thread_ts)
         tick = self._progress(channel, thread_ts, say, corpus=corpus)
-        beat = asyncio.create_task(self._beat(tick))
-        try:
-            await self._research_body(thread_ts, channel, user, topic, say,
-                                      corpus=corpus, tick=tick)
-        finally:
-            beat.cancel()
+        await self._research_body(thread_ts, channel, user, topic, say,
+                                  corpus=corpus, tick=tick)
 
     async def _research_body(self, thread_ts, channel, user, topic, say, *,
                              corpus, tick) -> None:

@@ -25,6 +25,21 @@ class Scripted(FakeAdapter):
         return self.queue.pop(0) if self.queue else super()._next_structured(session_id, n)
 
 
+class FakeSlackResponse:
+    """`AsyncSlackResponse` 대역 — **dict가 아니다.**
+
+    실물이 dict를 돌려준다고 가정한 코드가 `isinstance(res, dict)`로 `ts`를 놓쳐
+    진행 표시가 매번 새 메시지로 떨어졌다. 대역이 dict였던 탓에 테스트는 초록이었다
+    (2026-09-04, lessons C1). 이제 대역도 `.data` + `__getitem__`만 준다.
+    """
+
+    def __init__(self, data):
+        self.data = data
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+
 class SaySpy:
     def __init__(self):
         self.messages = []
@@ -32,9 +47,8 @@ class SaySpy:
 
     async def __call__(self, *, text, thread_ts=None, blocks=None):
         self.messages.append({"text": text, "thread_ts": thread_ts, "blocks": blocks})
-        # 실제 `chat_postMessage`처럼 응답을 돌려준다 — 진행 표시가 여기서 `ts`를 얻는다
         self._n += 1
-        return {"ok": True, "ts": f"msg-{self._n}"}
+        return FakeSlackResponse({"ok": True, "ts": f"msg-{self._n}"})
 
 
 def buttons_of(msg):
@@ -1821,35 +1835,23 @@ async def test_upload_failure_keeps_the_research_and_the_button(tmp_path, repo):
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_shows_elapsed_and_material_count(tmp_path, repo, monkeypatch):
-    """조사 한 단계가 실측 10분이다 — 그동안 글자가 안 바뀌면 멈춘 것과 구분되지 않는다.
+async def test_progress_updates_only_on_stage_changes(tmp_path, repo):
+    """진행 표시는 **단계가 바뀔 때만** 고쳐 쓴다.
 
-    경과 시간과 저장된 자료 수는 **하네스가 시계와 디렉토리에서 직접 읽는다.**
-    워커에게 묻지 않으므로 모델 주장과 실제가 갈릴 여지도 없다.
+    주기적으로 다시 그리자 사용자에게는 잡음이었다 (2026-09-04 사용자 결정) —
+    한 줄이 지금 무엇을 하는 중인지만 말하면 된다.
     """
-    import devcrew.slack_tutor as st
-
-    monkeypatch.setattr(st, "HEARTBEAT_INTERVAL", 0.01)
     h, _, _ = make_topic_handler(tmp_path, repo)
     seed_corpus(h)
     h.update = UpdateSpy()
     say = SaySpy()
 
-    real = st.research          # **패치 전에** 붙잡는다 — 안 그러면 자기를 다시 부른다
-
-    async def slow_research(*a, **kw):
-        await kw["progress"]("자료 조사 중…")
-        await asyncio.sleep(0.06)          # 하트비트가 여러 번 돌 시간
-        return await real(*a, **kw)
-
-    monkeypatch.setattr(st, "research", slow_research)
     await h.on_mention(mention(text="<@U1> 주제"), say)
 
-    beats = [u["text"] for u in h.update.calls if u["text"].startswith("⏳")]
-    assert beats, "하트비트가 한 번도 안 돌았다"
-    assert any("자료 조사 중…" in b and "자료 2개" in b for b in beats)
-    assert any("초" in b for b in beats)
-    # 마지막 갱신은 결과 카드다 — 하트비트가 그걸 되돌리지 않는다
+    stages = [u["text"] for u in h.update.calls if u["text"].startswith("⏳")]
+    assert len(stages) <= 3                      # 조사·대조·리포트, 그 이상은 잡음이다
+    assert len(set(stages)) == len(stages)       # 같은 문구를 반복해 보내지 않는다
+    assert any("자료 2개" in t for t in stages)   # 진행의 근거는 하네스가 센 값이다
     assert h.update.calls[-1]["text"].startswith("🎓")
 
 
@@ -1887,3 +1889,16 @@ async def test_thread_message_stays_short_and_defers_to_the_link(tmp_path, repo)
     assert "핵심 한 줄 요약이다." in text
     assert len(text) < 500                            # 본문을 쏟지 않는다
     assert "자세히 보기" in str(say.messages[-1]["blocks"])
+
+
+def test_response_ts_reads_the_slack_sdk_shape_not_just_dicts():
+    """`chat_postMessage`는 dict가 아니라 `AsyncSlackResponse`를 돌려준다.
+
+    `isinstance(res, dict)`로 거르면 항상 거짓이라 갱신 경로가 통째로 죽고 단계마다
+    새 메시지가 쌓인다 — 실제로 그렇게 돌고 있었다 (2026-09-04)."""
+    from devcrew.slack_tutor import response_ts
+
+    assert response_ts(FakeSlackResponse({"ok": True, "ts": "1.2"})) == "1.2"
+    assert response_ts({"ok": True, "ts": "1.2"}) == "1.2"      # dict도 받는다
+    assert response_ts(None) is None
+    assert response_ts(object()) is None                        # 모르는 모양은 조용히 포기
